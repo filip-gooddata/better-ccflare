@@ -9,6 +9,20 @@ export enum StrategyName {
 	// every available account (earliest weekly reset first; an active 5h
 	// session only breaks ties instead of gating position 0).
 	SessionDrainSoonestStrict = "session-drain-soonest-strict",
+	// Sticky per client session; new sessions go to the account furthest
+	// behind its weekly pace, with 5-hour and per-model-family guards.
+	SessionPace = "session-pace",
+}
+
+/**
+ * One usage window as a strategy sees it: utilization in percent (0–100) and
+ * the epoch-ms reset time, or null when the payload carries none. Unlike
+ * {@link StrategyStore.getAccountWeeklyReset}, a reset that has already
+ * passed is returned as-is so the caller can decide what stale means.
+ */
+export interface StrategyUsageWindow {
+	utilization: number;
+	resetsAt: number | null;
 }
 
 /**
@@ -60,4 +74,30 @@ export interface StrategyStore {
 	 * reset has already passed (stale telemetry that hasn't caught up yet).
 	 */
 	getAccountWeeklyReset?(accountId: string, provider: string): number | null;
+
+	/**
+	 * The account's all-models weekly window (`seven_day`, else the
+	 * `weekly_all` entry of `limits[]`). Null when no usage data is cached.
+	 */
+	getAccountWeeklyWindow?(
+		accountId: string,
+		provider: string,
+	): StrategyUsageWindow | null;
+
+	/** The account's `five_hour` window. Null when no usage data is cached. */
+	getAccountFiveHourWindow?(
+		accountId: string,
+		provider: string,
+	): StrategyUsageWindow | null;
+
+	/**
+	 * The account's model-scoped weekly windows (`limits[]` entries of kind
+	 * `weekly_scoped`) whose model belongs to `family` (as resolved by
+	 * `getModelFamily`). Empty when there are none.
+	 */
+	getAccountModelFamilyWindows?(
+		accountId: string,
+		provider: string,
+		family: string,
+	): StrategyUsageWindow[];
 }

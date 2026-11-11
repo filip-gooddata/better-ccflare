@@ -146,6 +146,10 @@ export interface ConfigData {
 	store_payloads?: boolean;
 	auto_vacuum_enabled?: boolean;
 	usage_poll_interval_ms?: number;
+	session_pace_five_hour_guard_pct?: number;
+	session_pace_family_guard_pct?: number;
+	session_pace_tie_band_pct?: number;
+	session_pace_idle_ms?: number;
 	cache_keepalive_ttl_minutes?: number;
 	system_prompt_cache_ttl_1h?: boolean;
 	usage_throttling_five_hour_enabled?: boolean;
@@ -603,6 +607,76 @@ export class Config extends EventEmitter {
 		if (typeof fromFile === "number")
 			return this.clamp(fromFile, 10000, 3600000);
 		return 90000; // default: 90 seconds
+	}
+
+	/**
+	 * Read a numeric session-pace setting: environment variable first, then
+	 * the config file key, then the default; clamped to [min, max].
+	 */
+	private getSessionPaceNumber(
+		envName: string,
+		fileKey:
+			| "session_pace_five_hour_guard_pct"
+			| "session_pace_family_guard_pct"
+			| "session_pace_tie_band_pct"
+			| "session_pace_idle_ms",
+		fallback: number,
+		min: number,
+		max: number,
+	): number {
+		const fromEnv = process.env[envName];
+		if (fromEnv) {
+			const n = Number(fromEnv);
+			if (Number.isFinite(n)) return this.clamp(n, min, max);
+		}
+		const fromFile = this.data[fileKey];
+		if (typeof fromFile === "number" && Number.isFinite(fromFile))
+			return this.clamp(fromFile, min, max);
+		return fallback;
+	}
+
+	/** session-pace: new sessions skip an account at or above this five_hour utilization. Default 90. */
+	getSessionPaceFiveHourGuardPct(): number {
+		return this.getSessionPaceNumber(
+			"SESSION_PACE_FIVE_HOUR_GUARD_PCT",
+			"session_pace_five_hour_guard_pct",
+			90,
+			0,
+			100,
+		);
+	}
+
+	/** session-pace: a request skips an account at or above this model-family weekly utilization. Default 90. */
+	getSessionPaceFamilyGuardPct(): number {
+		return this.getSessionPaceNumber(
+			"SESSION_PACE_FAMILY_GUARD_PCT",
+			"session_pace_family_guard_pct",
+			90,
+			0,
+			100,
+		);
+	}
+
+	/** session-pace: weekly pace deficits within this many points are a near-tie. Default 10. */
+	getSessionPaceTieBandPct(): number {
+		return this.getSessionPaceNumber(
+			"SESSION_PACE_TIE_BAND_PCT",
+			"session_pace_tie_band_pct",
+			10,
+			0,
+			100,
+		);
+	}
+
+	/** session-pace: a session mapping expires after this long without a request. Default 1 hour. */
+	getSessionPaceIdleMs(): number {
+		return this.getSessionPaceNumber(
+			"SESSION_PACE_IDLE_MS",
+			"session_pace_idle_ms",
+			3_600_000,
+			60_000,
+			86_400_000,
+		);
 	}
 
 	setUsagePollIntervalMs(ms: number): void {

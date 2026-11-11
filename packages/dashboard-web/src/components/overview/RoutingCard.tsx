@@ -39,6 +39,10 @@ const STRATEGY_OPTIONS: ReadonlyArray<{ label: string; value: string }> = [
 		label: "Session — drain soonest (strict)",
 		value: StrategyName.SessionDrainSoonestStrict,
 	},
+	{
+		label: "Session — weekly pace",
+		value: StrategyName.SessionPace,
+	},
 ];
 
 export interface StrategySelectItem {

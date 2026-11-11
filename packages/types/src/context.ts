@@ -137,7 +137,15 @@ export interface LoadBalancingStrategy {
 	 * no account is available. MUST NOT mutate any state (no DB writes,
 	 * no resumeAccount, no resetSession, no internal counters).
 	 */
-	peek(accounts: Account[]): string | null;
+	peek(accounts: Account[], meta?: RequestMeta): string | null;
+
+	/**
+	 * Optional: called by the proxy once it has committed to an account's
+	 * response for a request (no further failover can happen), with the
+	 * upstream status. Strategies that keep per-session state use it to learn
+	 * which account actually served a request they routed.
+	 */
+	onRequestServed?(meta: RequestMeta, account: Account, status: number): void;
 
 	/**
 	 * Optional initialization method to inject dependencies

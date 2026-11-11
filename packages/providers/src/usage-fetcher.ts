@@ -1,11 +1,13 @@
 import {
 	type AccountUsageSnapshot,
 	CLAUDE_CLI_VERSION,
+	getModelFamily,
 	isUseExtraUsageEnabled,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
 	type CodexCreditsData,
+	type StrategyUsageWindow,
 	supportsUsageTracking,
 } from "@better-ccflare/types";
 import {
@@ -242,6 +244,92 @@ export function extractWeeklyUtilization(
 			? (d.limits.find((l) => l?.kind === "weekly_all")?.percent ?? null)
 			: null)
 	);
+}
+
+function parseResetMs(resetsAt: string | null | undefined): number | null {
+	if (!resetsAt) return null;
+	const ms = new Date(resetsAt).getTime();
+	return Number.isFinite(ms) ? ms : null;
+}
+
+function windowFrom(
+	flat: UsageWindow | null | undefined,
+	limit: UsageLimit | undefined,
+): StrategyUsageWindow | null {
+	if (flat && typeof flat.utilization === "number") {
+		return {
+			utilization: flat.utilization,
+			resetsAt: parseResetMs(flat.resets_at),
+		};
+	}
+	if (limit && typeof limit.percent === "number") {
+		return {
+			utilization: limit.percent,
+			resetsAt: parseResetMs(limit.resets_at),
+		};
+	}
+	return null;
+}
+
+/**
+ * The all-models weekly window as utilization plus reset (epoch ms), with the
+ * same field precedence as {@link extractWeeklyResetTime}. A reset that has
+ * already passed is returned unchanged. Anthropic and Codex only.
+ */
+export function extractWeeklyWindow(
+	data: AnyUsageData,
+	provider: string,
+): StrategyUsageWindow | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	const d = data as UsageData;
+	const limit = Array.isArray(d.limits)
+		? d.limits.find((l) => l?.kind === "weekly_all")
+		: undefined;
+	return windowFrom(d.seven_day, limit);
+}
+
+/**
+ * The five-hour (session) window as utilization plus reset (epoch ms):
+ * `five_hour`, else the `session` entry of `limits[]`. A reset that has
+ * already passed is returned unchanged. Anthropic and Codex only.
+ */
+export function extractFiveHourWindow(
+	data: AnyUsageData,
+	provider: string,
+): StrategyUsageWindow | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	const d = data as UsageData;
+	const limit = Array.isArray(d.limits)
+		? d.limits.find((l) => l?.kind === "session")
+		: undefined;
+	return windowFrom(d.five_hour, limit);
+}
+
+/**
+ * The model-scoped weekly windows (`limits[]` entries of kind
+ * `weekly_scoped`) whose `scope.model.display_name` resolves to `family`
+ * through `getModelFamily`. Entries without a numeric percent are skipped.
+ */
+export function extractModelFamilyWindows(
+	data: AnyUsageData,
+	provider: string,
+	family: string,
+): StrategyUsageWindow[] {
+	if (provider !== "anthropic" && provider !== "codex") return [];
+	const d = data as UsageData;
+	if (!Array.isArray(d.limits)) return [];
+	const rows: StrategyUsageWindow[] = [];
+	for (const limit of d.limits) {
+		if (limit?.kind !== "weekly_scoped") continue;
+		if (typeof limit.percent !== "number") continue;
+		const name = limit.scope?.model?.display_name;
+		if (typeof name !== "string" || getModelFamily(name) !== family) continue;
+		rows.push({
+			utilization: limit.percent,
+			resetsAt: parseResetMs(limit.resets_at),
+		});
+	}
+	return rows;
 }
 
 /**

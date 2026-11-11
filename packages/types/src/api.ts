@@ -47,6 +47,11 @@ export interface RequestMeta {
 	visionRejected?: boolean;
 	/** Per-client session id (from request body metadata.user_id) for session-affinity routing. */
 	clientSessionId?: string | null;
+	/**
+	 * Model that drives account routing for this request (post-rewrite model,
+	 * else the requested one). Set by account selection before the strategy runs.
+	 */
+	routingModel?: string | null;
 	/** Model the client originally requested, before any agent-preference rewrite. */
 	originalModel?: string | null;
 	/** Model actually forwarded upstream after an agent-preference rewrite (equal to originalModel when none occurred). */

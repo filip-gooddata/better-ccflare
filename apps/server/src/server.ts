@@ -38,6 +38,8 @@ import {
 	LeastUsedStrategy,
 	SessionAffinityStrategy,
 	SessionDrainSoonestStrategy,
+	type SessionPaceOptions,
+	SessionPaceStrategy,
 	SessionStrategy,
 } from "@better-ccflare/load-balancer";
 import { Logger, setConsoleLogging } from "@better-ccflare/logger";
@@ -46,7 +48,10 @@ import {
 	CODEX_DEFAULT_ENDPOINT,
 	CODEX_PING_MODEL,
 	extractChatgptAccountId,
+	extractFiveHourWindow,
+	extractModelFamilyWindows,
 	extractWeeklyResetTime,
+	extractWeeklyWindow,
 	fetchCodexUsageData,
 	fetchCodexUsageOnDemand,
 	getProvider,
@@ -112,6 +117,7 @@ import { createVacuumScheduler, runVacuumBootstrap } from "./vacuum-scheduler";
 function buildStrategy(
 	name: StrategyName,
 	sessionDurationMs: number,
+	paceOptions?: Partial<SessionPaceOptions>,
 ): LoadBalancingStrategy {
 	switch (name) {
 		case StrategyName.LeastUsed:
@@ -122,9 +128,25 @@ function buildStrategy(
 			return new SessionDrainSoonestStrategy(sessionDurationMs);
 		case StrategyName.SessionDrainSoonestStrict:
 			return new SessionDrainSoonestStrategy(sessionDurationMs, "strict");
+		case StrategyName.SessionPace:
+			return new SessionPaceStrategy(paceOptions);
 		default:
 			return new SessionStrategy(sessionDurationMs);
 	}
+}
+
+function sessionPaceOptionsFrom(config: {
+	getSessionPaceFiveHourGuardPct(): number;
+	getSessionPaceFamilyGuardPct(): number;
+	getSessionPaceTieBandPct(): number;
+	getSessionPaceIdleMs(): number;
+}): SessionPaceOptions {
+	return {
+		fiveHourGuardPct: config.getSessionPaceFiveHourGuardPct(),
+		familyGuardPct: config.getSessionPaceFamilyGuardPct(),
+		tieBandPct: config.getSessionPaceTieBandPct(),
+		idleMs: config.getSessionPaceIdleMs(),
+	};
 }
 
 // Import embedded dashboard assets (will be bundled in compiled binary)
@@ -1700,6 +1722,7 @@ export default async function startServer(options?: {
 	const strategy = buildStrategy(
 		config.getStrategy(),
 		runtimeConfig.sessionDurationMs,
+		sessionPaceOptionsFrom(config),
 	);
 	log.info(`Load-balancing strategy: ${config.getStrategy()}`);
 
@@ -1718,6 +1741,22 @@ export default async function startServer(options?: {
 			const resetAt = extractWeeklyResetTime(data, provider);
 			if (resetAt == null || resetAt <= Date.now()) return null;
 			return resetAt;
+		},
+		getAccountWeeklyWindow(accountId: string, provider: string) {
+			const data = usageCache.get(accountId);
+			return data ? extractWeeklyWindow(data, provider) : null;
+		},
+		getAccountFiveHourWindow(accountId: string, provider: string) {
+			const data = usageCache.get(accountId);
+			return data ? extractFiveHourWindow(data, provider) : null;
+		},
+		getAccountModelFamilyWindows(
+			accountId: string,
+			provider: string,
+			family: string,
+		) {
+			const data = usageCache.get(accountId);
+			return data ? extractModelFamilyWindows(data, provider, family) : [];
 		},
 	});
 
@@ -1858,6 +1897,7 @@ export default async function startServer(options?: {
 			const strategy = buildStrategy(
 				newStrategyName,
 				runtimeConfig.sessionDurationMs,
+				sessionPaceOptionsFrom(config),
 			);
 			strategy.initialize?.(strategyStore);
 			proxyContext.strategy = strategy;

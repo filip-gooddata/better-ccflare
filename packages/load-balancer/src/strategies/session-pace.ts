@@ -1,0 +1,518 @@
+import {
+	getModelFamily,
+	isAccountAvailable,
+	probeBackoffRank,
+} from "@better-ccflare/core";
+import { Logger } from "@better-ccflare/logger";
+import type {
+	Account,
+	LoadBalancingStrategy,
+	RequestMeta,
+	StrategyStore,
+	StrategyUsageWindow,
+} from "@better-ccflare/types";
+import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
+
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Two new sessions that start this close together alternate between
+ * near-tied accounts. Same window as SessionAffinityStrategy's recent-pick
+ * spread.
+ */
+export const SESSION_PACE_RECENT_PICK_WINDOW_MS = 500;
+
+const MAX_SESSIONS = 10_000;
+
+export interface SessionPaceOptions {
+	/** New sessions skip an account whose five_hour utilization is at or above this. */
+	fiveHourGuardPct: number;
+	/** A request skips an account whose weekly window for the request's model family is at or above this. */
+	familyGuardPct: number;
+	/** Deficits this close (in points) count as a near-tie. */
+	tieBandPct: number;
+	/** A session mapping expires after this long without a request. */
+	idleMs: number;
+}
+
+export const SESSION_PACE_DEFAULTS: Readonly<SessionPaceOptions> = {
+	fiveHourGuardPct: 90,
+	familyGuardPct: 90,
+	tieBandPct: 10,
+	idleMs: 60 * 60 * 1000,
+};
+
+/**
+ * How far an account is behind (positive) or ahead of (negative) an even
+ * spend of its all-models weekly window: the share of the window that has
+ * elapsed minus the share that has been used.
+ */
+export function weeklyPaceDeficit(
+	window: StrategyUsageWindow | null,
+	now: number,
+): number {
+	if (!window || window.resetsAt === null) return 0;
+	const windowStart = window.resetsAt - WEEK_MS;
+	const elapsedPct = Math.min(
+		100,
+		Math.max(0, ((now - windowStart) / WEEK_MS) * 100),
+	);
+	return elapsedPct - window.utilization;
+}
+
+/**
+ * First 8 characters of the session id inside a `metadata.user_id` value.
+ * Claude Code sends either a JSON object with `session_id` or a
+ * `user_…_account_…_session_<id>` string; anything else is treated as a bare
+ * session id. Never returns the account part.
+ */
+export function sessionLogTag(clientSessionId: string): string {
+	let sessionPart = clientSessionId;
+	const trimmed = clientSessionId.trim();
+	if (trimmed.startsWith("{")) {
+		try {
+			const parsed = JSON.parse(trimmed) as { session_id?: unknown };
+			sessionPart =
+				typeof parsed.session_id === "string" ? parsed.session_id : "";
+		} catch {
+			sessionPart = "";
+		}
+	} else {
+		const match = /_session_([^_]+)$/.exec(clientSessionId);
+		if (match) sessionPart = match[1];
+		else if (clientSessionId.includes("_account_")) sessionPart = "";
+	}
+	return sessionPart ? sessionPart.slice(0, 8) : "unknown";
+}
+
+interface Candidate {
+	account: Account;
+	probeRank: number;
+	deficit: number;
+	fiveHourUtil: number | null;
+	fiveHourGuarded: boolean;
+	familyUtil: number | null;
+	familyGuarded: boolean;
+	hasUsage: boolean;
+}
+
+interface Mapping {
+	accountId: string;
+	accountName: string;
+	lastSeenAt: number;
+}
+
+type Rule =
+	| "only-candidate"
+	| "probe-backoff"
+	| "family-guard"
+	| "family-guard-all-guarded"
+	| "five-hour-guard"
+	| "priority"
+	| "pace-deficit"
+	| "near-tie-alternation"
+	| "cold-start"
+	| "account-id";
+
+interface Plan {
+	ordered: Account[];
+	/** Set when this request places the session fresh (no live mapping used). */
+	placement: { rule: Rule; reason: string } | null;
+	/** Set when the family guard demoted the session's mapped account. */
+	familyMove: { fromName: string } | null;
+	family: string | null;
+	candidates: Candidate[];
+}
+
+interface RoutedRequest {
+	clientId: string;
+	family: string | null;
+	familyMove: boolean;
+	candidates: Candidate[];
+}
+
+/**
+ * Session-pace strategy ("weekly pace with a 5-hour guard").
+ *
+ * Each client session (`metadata.user_id`) sticks to one account. A new
+ * session goes to the available account that is furthest behind an even
+ * spend of its all-models weekly window. Placement order, highest first:
+ * availability; probe-backoff rank; the model-family guard, then the 5-hour
+ * guard; configured priority; weekly pace deficit; near-tie alternation.
+ *
+ * When another account serves a request this strategy routed (failover or a
+ * family-guard move), the session rebinds to it and stays there. A mapping
+ * expires after `idleMs` without a request.
+ */
+export class SessionPaceStrategy implements LoadBalancingStrategy {
+	readonly options: SessionPaceOptions;
+	private store: StrategyStore | null = null;
+	private log = new Logger("SessionPaceStrategy");
+	private sessions = new Map<string, Mapping>();
+	private lastPickedAt = new Map<string, number>();
+	private routed = new WeakMap<RequestMeta, RoutedRequest>();
+
+	constructor(options: Partial<SessionPaceOptions> = {}) {
+		this.options = { ...SESSION_PACE_DEFAULTS, ...options };
+	}
+
+	initialize(store: StrategyStore): void {
+		this.store = store;
+	}
+
+	peek(accounts: Account[], meta?: RequestMeta): string | null {
+		const now = Date.now();
+		const available = accounts.filter((a) => isPeekAvailable(a, now));
+		if (available.length === 0) return null;
+		const plan = this.plan(available, meta ?? null, now);
+		return plan.ordered[0]?.id ?? null;
+	}
+
+	select(accounts: Account[], meta: RequestMeta): Account[] {
+		const now = Date.now();
+		this.autoUnpauseElapsedAccounts(accounts, now);
+		const available = accounts.filter((a) => isAccountAvailable(a, now));
+		if (available.length === 0) return [];
+
+		const plan = this.plan(available, meta, now);
+		const clientId = meta.clientSessionId || null;
+		const first = plan.ordered[0];
+
+		if (plan.placement) {
+			this.lastPickedAt.set(first.id, now);
+			if (clientId !== null) {
+				const previous = this.sessions.get(clientId);
+				const live = previous && !this.isExpired(previous, now);
+				if (!live) {
+					this.sessions.delete(clientId);
+					this.evictOldestIfFull();
+					this.sessions.set(clientId, {
+						accountId: first.id,
+						accountName: first.name,
+						lastSeenAt: now,
+					});
+					this.log.info(
+						`session-pace place session=${sessionLogTag(clientId)} account=${first.name} rule=${plan.placement.rule} reason=${plan.placement.reason} ${this.describe(plan.candidates, plan.family)}`,
+					);
+				} else {
+					// Mapped account unavailable: order a failover, keep the
+					// mapping until another account serves (onRequestServed).
+					this.touch(clientId, previous, now);
+					this.log.info(
+						`session-pace failover-order session=${sessionLogTag(clientId)} mapped=${previous.accountName} unavailable next=${first.name} rule=${plan.placement.rule} ${this.describe(plan.candidates, plan.family)}`,
+					);
+				}
+			}
+		} else if (clientId !== null) {
+			const mapping = this.sessions.get(clientId);
+			if (mapping) this.touch(clientId, mapping, now);
+			if (plan.familyMove) {
+				this.log.info(
+					`session-pace family-guard demotes session=${sessionLogTag(clientId)} from=${plan.familyMove.fromName} next=${first.name} family=${plan.family} ${this.describe(plan.candidates, plan.family)}`,
+				);
+			}
+		}
+
+		if (clientId !== null) {
+			this.routed.set(meta, {
+				clientId,
+				family: plan.family,
+				familyMove: plan.familyMove !== null,
+				candidates: plan.candidates,
+			});
+		}
+		return plan.ordered;
+	}
+
+	onRequestServed(meta: RequestMeta, account: Account, status: number): void {
+		const routed = this.routed.get(meta);
+		if (!routed) return;
+		this.routed.delete(meta);
+		if (status < 200 || status >= 400) return;
+
+		const now = Date.now();
+		const mapping = this.sessions.get(routed.clientId);
+		if (mapping && mapping.accountId === account.id) {
+			this.touch(routed.clientId, mapping, now);
+			return;
+		}
+		const fromName = mapping?.accountName ?? "none";
+		this.sessions.delete(routed.clientId);
+		this.evictOldestIfFull();
+		this.sessions.set(routed.clientId, {
+			accountId: account.id,
+			accountName: account.name,
+			lastSeenAt: now,
+		});
+		const rule = routed.familyMove ? "family-guard" : "failover";
+		this.log.info(
+			`session-pace rebind session=${sessionLogTag(routed.clientId)} from=${fromName} to=${account.name} rule=${rule} ${this.describe(routed.candidates, routed.family)}`,
+		);
+	}
+
+	/**
+	 * Pure ordering for one request: no state is written. select() and peek()
+	 * both use it, so they agree by construction.
+	 */
+	private plan(
+		available: Account[],
+		meta: RequestMeta | null,
+		now: number,
+	): Plan {
+		const model = meta?.routingModel ?? null;
+		const family = model ? getModelFamily(model) : null;
+		const candidates = available.map((a) =>
+			this.describeCandidate(a, family, now),
+		);
+		const byId = new Map(candidates.map((c) => [c.account.id, c]));
+		const sorted = [...candidates].sort((x, y) => this.compareNew(x, y));
+
+		const clientId = meta?.clientSessionId || null;
+		const mapping = clientId !== null ? this.sessions.get(clientId) : undefined;
+		const mapped =
+			mapping && !this.isExpired(mapping, now)
+				? byId.get(mapping.accountId)
+				: undefined;
+
+		if (mapped) {
+			if (family !== null && mapped.familyGuarded) {
+				const movers = sorted.filter(
+					(c) => !c.familyGuarded && c.probeRank <= mapped.probeRank,
+				);
+				if (movers.length > 0) {
+					const moverIds = new Set(movers.map((c) => c.account.id));
+					const rest = sorted.filter((c) => !moverIds.has(c.account.id));
+					return {
+						ordered: [...movers, ...rest].map((c) => c.account),
+						placement: null,
+						familyMove: { fromName: mapped.account.name },
+						family,
+						candidates,
+					};
+				}
+			}
+			return {
+				ordered: [mapped, ...sorted.filter((c) => c !== mapped)].map(
+					(c) => c.account,
+				),
+				placement: null,
+				familyMove: null,
+				family,
+				candidates,
+			};
+		}
+
+		const { order, rule, reason } = this.placeNew(sorted, candidates, now);
+		return {
+			ordered: order.map((c) => c.account),
+			placement: { rule, reason },
+			familyMove: null,
+			family,
+			candidates,
+		};
+	}
+
+	private placeNew(
+		sorted: Candidate[],
+		all: Candidate[],
+		now: number,
+	): { order: Candidate[]; rule: Rule; reason: string } {
+		const leader = sorted[0];
+		if (sorted.length === 1) {
+			return { order: sorted, rule: "only-candidate", reason: "single" };
+		}
+		const sameTier = (c: Candidate) =>
+			c.probeRank === leader.probeRank &&
+			c.familyGuarded === leader.familyGuarded &&
+			c.fiveHourGuarded === leader.fiveHourGuarded &&
+			c.account.priority === leader.account.priority &&
+			(!leader.familyGuarded || c.familyUtil === leader.familyUtil);
+
+		if (!all.some((c) => c.hasUsage)) {
+			// Rule 9: no usage data anywhere — rotate through the leading tier,
+			// least recently picked first, whatever the spacing.
+			const tier = sorted.filter(sameTier);
+			let pick = tier[0];
+			for (const c of tier) {
+				if (this.pickedAt(c) < this.pickedAt(pick)) pick = c;
+			}
+			return {
+				order: [pick, ...sorted.filter((c) => c !== pick)],
+				rule: "cold-start",
+				reason: "no-usage-data",
+			};
+		}
+
+		const runnerUp = sorted[1];
+		if (
+			!leader.familyGuarded &&
+			sameTier(runnerUp) &&
+			Math.abs(leader.deficit - runnerUp.deficit) <= this.options.tieBandPct &&
+			now - this.pickedAt(leader) < SESSION_PACE_RECENT_PICK_WINDOW_MS &&
+			this.pickedAt(runnerUp) < this.pickedAt(leader)
+		) {
+			return {
+				order: [runnerUp, leader, ...sorted.slice(2)],
+				rule: "near-tie-alternation",
+				reason: `leader-${leader.account.name}-picked-${now - this.pickedAt(leader)}ms-ago`,
+			};
+		}
+
+		const { rule, reason } = this.decidingRule(leader, runnerUp);
+		return { order: sorted, rule, reason };
+	}
+
+	/** Which ordering key separated the leader from the runner-up. */
+	private decidingRule(
+		leader: Candidate,
+		runnerUp: Candidate,
+	): { rule: Rule; reason: string } {
+		if (leader.probeRank !== runnerUp.probeRank)
+			return {
+				rule: "probe-backoff",
+				reason: `${runnerUp.account.name}-backed-off`,
+			};
+		if (leader.familyGuarded !== runnerUp.familyGuarded)
+			return {
+				rule: "family-guard",
+				reason: `${runnerUp.account.name}-guarded`,
+			};
+		if (leader.familyGuarded && leader.familyUtil !== runnerUp.familyUtil)
+			return {
+				rule: "family-guard-all-guarded",
+				reason: "lowest-family-utilization",
+			};
+		if (leader.fiveHourGuarded !== runnerUp.fiveHourGuarded)
+			return {
+				rule: "five-hour-guard",
+				reason: `${runnerUp.account.name}-guarded`,
+			};
+		if (leader.account.priority !== runnerUp.account.priority)
+			return { rule: "priority", reason: "higher-priority" };
+		if (leader.deficit !== runnerUp.deficit)
+			return { rule: "pace-deficit", reason: "largest-deficit" };
+		return { rule: "account-id", reason: "full-tie" };
+	}
+
+	/** Placement order for a new session (rules 2, 3 and 8 under the ordering ruling). */
+	private compareNew(x: Candidate, y: Candidate): number {
+		if (x.probeRank !== y.probeRank) return x.probeRank - y.probeRank;
+		if (x.familyGuarded !== y.familyGuarded) return x.familyGuarded ? 1 : -1;
+		if (x.familyGuarded && y.familyGuarded) {
+			const fx = x.familyUtil ?? 0;
+			const fy = y.familyUtil ?? 0;
+			if (fx !== fy) return fx - fy;
+		}
+		if (x.fiveHourGuarded !== y.fiveHourGuarded)
+			return x.fiveHourGuarded ? 1 : -1;
+		if (x.account.priority !== y.account.priority)
+			return x.account.priority - y.account.priority;
+		if (x.deficit !== y.deficit) return y.deficit - x.deficit;
+		return x.account.id < y.account.id
+			? -1
+			: x.account.id > y.account.id
+				? 1
+				: 0;
+	}
+
+	private describeCandidate(
+		account: Account,
+		family: string | null,
+		now: number,
+	): Candidate {
+		const store = this.store;
+		const weekly =
+			store?.getAccountWeeklyWindow?.(account.id, account.provider) ?? null;
+		const fiveHour =
+			store?.getAccountFiveHourWindow?.(account.id, account.provider) ?? null;
+		const fiveHourLive =
+			fiveHour !== null && fiveHour.resetsAt !== null && fiveHour.resetsAt > now
+				? fiveHour.utilization
+				: null;
+
+		let familyUtil: number | null = null;
+		if (family !== null) {
+			const rows =
+				store?.getAccountModelFamilyWindows?.(
+					account.id,
+					account.provider,
+					family,
+				) ?? [];
+			for (const row of rows) {
+				if (row.resetsAt === null || row.resetsAt <= now) continue;
+				familyUtil =
+					familyUtil === null
+						? row.utilization
+						: Math.max(familyUtil, row.utilization);
+			}
+		}
+
+		return {
+			account,
+			probeRank: probeBackoffRank(account.id, now),
+			deficit: weeklyPaceDeficit(weekly, now),
+			fiveHourUtil: fiveHourLive,
+			fiveHourGuarded:
+				fiveHourLive !== null && fiveHourLive >= this.options.fiveHourGuardPct,
+			familyUtil,
+			familyGuarded:
+				familyUtil !== null && familyUtil >= this.options.familyGuardPct,
+			hasUsage: weekly !== null || fiveHour !== null,
+		};
+	}
+
+	private describe(candidates: Candidate[], family: string | null): string {
+		const parts = candidates.map((c) => {
+			const deficit = `${c.deficit >= 0 ? "+" : ""}${c.deficit.toFixed(1)}`;
+			const fiveHour = c.fiveHourUtil === null ? "n/a" : `${c.fiveHourUtil}%`;
+			const fam =
+				family === null
+					? ""
+					: ` ${family}=${c.familyUtil === null ? "n/a" : `${c.familyUtil}%`}`;
+			const flags = [
+				c.probeRank > 0 ? "backoff" : null,
+				c.familyGuarded ? "family-guarded" : null,
+				c.fiveHourGuarded ? "5h-guarded" : null,
+			]
+				.filter(Boolean)
+				.join(",");
+			return `${c.account.name}(deficit=${deficit} 5h=${fiveHour}${fam}${flags ? ` ${flags}` : ""})`;
+		});
+		return `family=${family ?? "-"} candidates=[${parts.join("; ")}]`;
+	}
+
+	private pickedAt(c: Candidate): number {
+		return this.lastPickedAt.get(c.account.id) ?? Number.NEGATIVE_INFINITY;
+	}
+
+	private isExpired(mapping: Mapping, now: number): boolean {
+		return now - mapping.lastSeenAt >= this.options.idleMs;
+	}
+
+	private touch(clientId: string, mapping: Mapping, now: number): void {
+		mapping.lastSeenAt = now;
+		this.sessions.delete(clientId);
+		this.sessions.set(clientId, mapping);
+	}
+
+	private evictOldestIfFull(): void {
+		while (this.sessions.size >= MAX_SESSIONS) {
+			const oldest = this.sessions.keys().next().value;
+			if (oldest === undefined) return;
+			this.sessions.delete(oldest);
+		}
+	}
+
+	/** Mirrors SessionAffinityStrategy.autoUnpauseElapsedAccounts. */
+	private autoUnpauseElapsedAccounts(accounts: Account[], now: number): void {
+		if (!this.store?.resumeAccount) return;
+		for (const account of accounts) {
+			if (!wouldAutoUnpause(account, now)) continue;
+			this.log.info(
+				`Auto-unpausing ${account.name} (pause_reason=${account.pause_reason ?? "null"}) — usage window has reset`,
+			);
+			this.store.resumeAccount(account.id);
+			account.paused = false;
+		}
+	}
+}

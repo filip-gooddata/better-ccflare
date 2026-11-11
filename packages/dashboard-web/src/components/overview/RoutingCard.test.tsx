@@ -144,9 +144,11 @@ describe("getStrategySelectItems", () => {
 			label: "Session — drain soonest (strict)",
 			value: "session-drain-soonest-strict",
 		},
+		{ label: "Session — weekly pace", value: "session-pace" },
 	];
 
-	it("returns only the three listed options when the current strategy is one of them", () => {
+	it("returns only the four listed options when the current strategy is one of them", () => {
+		expect(getStrategySelectItems("session-pace")).toEqual(listed);
 		expect(getStrategySelectItems("session")).toEqual(listed);
 		expect(getStrategySelectItems("session-drain-soonest")).toEqual(listed);
 		expect(getStrategySelectItems("session-drain-soonest-strict")).toEqual(

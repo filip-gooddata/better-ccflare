@@ -610,6 +610,7 @@ export async function selectAccountsForRequest(
 	model?: string,
 	options?: { skipCombo?: boolean },
 ): Promise<Account[]> {
+	meta.routingModel = model ?? null;
 	// Check if a specific account is requested via special header
 	if (meta.headers) {
 		const forcedAccountId = meta.headers.get("x-better-ccflare-account-id");

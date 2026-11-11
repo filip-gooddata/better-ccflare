@@ -503,6 +503,20 @@ async function handleProxyRequest(
 	};
 
 	/**
+	 * The proxy has committed to `account`'s response: no further failover
+	 * happens for this request. Tell the strategy which account served, so a
+	 * session-sticky strategy can follow a failover (session-pace rule 6).
+	 */
+	const recordServedAccount = (account: Account, served: Response) => {
+		recordXaiAffinityIfServed(account);
+		try {
+			ctx.strategy.onRequestServed?.(requestMeta, account, served.status);
+		} catch (error) {
+			log.warn("Strategy onRequestServed hook failed:", error);
+		}
+	};
+
+	/**
 	 * Return a refusal that was decided before any upstream was contacted, and
 	 * record it as a request all the same.
 	 *
@@ -1229,7 +1243,7 @@ async function handleProxyRequest(
 		}
 
 		if (response) {
-			recordXaiAffinityIfServed(accounts[i]);
+			recordServedAccount(accounts[i], response);
 			return response;
 		}
 
@@ -1310,7 +1324,7 @@ async function handleProxyRequest(
 			);
 
 			if (response) {
-				recordXaiAffinityIfServed(accounts[i]);
+				recordServedAccount(accounts[i], response);
 				return response;
 			}
 			if (requestMeta.visionRejected) visionRejections++;
@@ -1457,7 +1471,7 @@ async function handleProxyRequest(
 				}
 
 				if (response) {
-					recordXaiAffinityIfServed(fallbackAccounts[i]);
+					recordServedAccount(fallbackAccounts[i], response);
 					return response;
 				}
 				if (requestMeta.visionRejected) visionRejections++;
@@ -1511,7 +1525,7 @@ async function handleProxyRequest(
 					);
 
 					if (response) {
-						recordXaiAffinityIfServed(fallbackAccounts[i]);
+						recordServedAccount(fallbackAccounts[i], response);
 						return response;
 					}
 					if (requestMeta.visionRejected) visionRejections++;
