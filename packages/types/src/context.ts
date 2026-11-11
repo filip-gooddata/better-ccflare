@@ -143,7 +143,9 @@ export interface LoadBalancingStrategy {
 	 * Optional: called by the proxy once it has committed to an account's
 	 * response for a request (no further failover can happen), with the
 	 * upstream status. Strategies that keep per-session state use it to learn
-	 * which account actually served a request they routed.
+	 * which account actually served a request they routed. It also fires for
+	 * requests the strategy never saw (forced-account and combo routes), so
+	 * implementations must ignore metas they did not select for.
 	 */
 	onRequestServed?(meta: RequestMeta, account: Account, status: number): void;
 

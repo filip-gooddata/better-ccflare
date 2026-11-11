@@ -288,6 +288,15 @@ describe("SessionPaceStrategy", () => {
 			expect([first, second, third]).toEqual(["a", "b", "a"]);
 		});
 
+		it("keeps alternating when several sessions start in the same millisecond", () => {
+			store.setWeeklyDeficit("a", 15);
+			store.setWeeklyDeficit("b", 6);
+			const picks = ["s1", "s2", "s3", "s4"].map(
+				(s) => strategy.select([a, b], meta(s))[0].id,
+			);
+			expect(picks).toEqual(["a", "b", "a", "b"]);
+		});
+
 		it("sends every new session to the leader outside the band", () => {
 			store.setWeeklyDeficit("a", 20);
 			store.setWeeklyDeficit("b", 9);
@@ -522,6 +531,13 @@ describe("SessionPaceStrategy", () => {
 			const picks = ["s1", "s2", "s3", "s4"].map((s) => placeSpaced(s)[0].id);
 			expect(picks).toEqual(["a", "b", "a", "b"]);
 		});
+
+		it("keeps alternating cold-start sessions placed in the same millisecond", () => {
+			const picks = ["s1", "s2", "s3", "s4"].map(
+				(s) => strategy.select([a, b], meta(s))[0].id,
+			);
+			expect(picks).toEqual(["a", "b", "a", "b"]);
+		});
 	});
 
 	describe("rule 10: configurable thresholds", () => {
@@ -614,6 +630,21 @@ describe("SessionPaceStrategy", () => {
 			const paused = makeAccount("a", { paused: true });
 			expect(strategy.peek([paused, b], meta("mapped"))).toBe("b");
 			expect(strategy.peek([paused])).toBeNull();
+		});
+
+		it("does not peek an auto-resumable paused account that select would reject for reauth", () => {
+			const stuck = makeAccount("a", {
+				paused: true,
+				auto_fallback_enabled: true,
+				rate_limit_reset: NOW - 60 * 60_000,
+				requires_reauth: true,
+			});
+			store.setWeeklyDeficit("a", 40);
+			store.setWeeklyDeficit("b", 0);
+			const m = meta("reauth");
+			const peeked = strategy.peek([stuck, b], m);
+			expect(peeked).toBe("b");
+			expect(strategy.select([stuck, b], m)[0].id).toBe(peeked as string);
 		});
 
 		it("does not mutate state", () => {

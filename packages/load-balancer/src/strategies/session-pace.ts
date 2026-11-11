@@ -150,6 +150,8 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 	private log = new Logger("SessionPaceStrategy");
 	private sessions = new Map<string, Mapping>();
 	private lastPickedAt = new Map<string, number>();
+	private lastPickSeq = new Map<string, number>();
+	private pickSeq = 0;
 	private routed = new WeakMap<RequestMeta, RoutedRequest>();
 
 	constructor(options: Partial<SessionPaceOptions> = {}) {
@@ -162,7 +164,12 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 	peek(accounts: Account[], meta?: RequestMeta): string | null {
 		const now = Date.now();
-		const available = accounts.filter((a) => isPeekAvailable(a, now));
+		const available = accounts.filter(
+			(a) =>
+				isAccountAvailable(a, now) ||
+				(isPeekAvailable(a, now) &&
+					isAccountAvailable({ ...a, paused: false }, now)),
+		);
 		if (available.length === 0) return null;
 		const plan = this.plan(available, meta ?? null, now);
 		return plan.ordered[0]?.id ?? null;
@@ -180,6 +187,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 		if (plan.placement) {
 			this.lastPickedAt.set(first.id, now);
+			this.lastPickSeq.set(first.id, ++this.pickSeq);
 			if (clientId !== null) {
 				const previous = this.sessions.get(clientId);
 				const live = previous && !this.isExpired(previous, now);
@@ -334,7 +342,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			const tier = sorted.filter(sameTier);
 			let pick = tier[0];
 			for (const c of tier) {
-				if (this.pickedAt(c) < this.pickedAt(pick)) pick = c;
+				if (this.pickOrder(c) < this.pickOrder(pick)) pick = c;
 			}
 			return {
 				order: [pick, ...sorted.filter((c) => c !== pick)],
@@ -349,7 +357,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			sameTier(runnerUp) &&
 			Math.abs(leader.deficit - runnerUp.deficit) <= this.options.tieBandPct &&
 			now - this.pickedAt(leader) < SESSION_PACE_RECENT_PICK_WINDOW_MS &&
-			this.pickedAt(runnerUp) < this.pickedAt(leader)
+			this.pickOrder(runnerUp) < this.pickOrder(leader)
 		) {
 			return {
 				order: [runnerUp, leader, ...sorted.slice(2)],
@@ -483,6 +491,10 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 	private pickedAt(c: Candidate): number {
 		return this.lastPickedAt.get(c.account.id) ?? Number.NEGATIVE_INFINITY;
+	}
+
+	private pickOrder(c: Candidate): number {
+		return this.lastPickSeq.get(c.account.id) ?? 0;
 	}
 
 	private isExpired(mapping: Mapping, now: number): boolean {
