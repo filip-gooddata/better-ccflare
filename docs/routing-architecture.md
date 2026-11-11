@@ -11,6 +11,7 @@ This document explains how better-ccflare picks an account for each proxied requ
    - [session-drain-soonest](#session-drain-soonest-sessiondrainsoonestrategy)
    - [session-drain-soonest-strict](#session-drain-soonest-strict-sessiondrainsooneststrategy-in-strict-mode)
    - [session-affinity](#session-affinity-sessionaffinitystrategy)
+   - [session-pace](#session-pace-sessionpacestrategy)
    - [least-used](#least-used-leastusedstrategy)
 4. [Usage Throttling](#usage-throttling)
 5. [Model-Capacity Routing](#model-capacity-routing)
@@ -166,6 +167,40 @@ flowchart TD
 ```
 
 *Source: `packages/load-balancer/src/strategies/session-affinity.ts`.*
+
+### session-pace (SessionPaceStrategy)
+
+Per-client-session stickiness keyed on `metadata.user_id` (the whole string, as `session-affinity` keys it), with a placement rule built around the weekly allowance. A new session goes to the available account furthest behind an even spend of its all-models weekly window (`seven_day`, else the `weekly_all` entry of `limits[]`):
+
+- `windowStart = resets_at − 7 days`, `elapsedPct = clamp((now − windowStart) / 7 days × 100, 0, 100)`, `deficit = elapsedPct − utilization`. An account without weekly data has deficit 0. A reset that has already passed is not special-cased: elapsedPct clamps to 100 until the next usage poll brings the new window.
+- Placement order, highest first: availability; probe-backoff rank; the **model-family guard**; the **5-hour guard**; configured priority; deficit (largest first); near-tie alternation.
+- **5-hour guard**: an account whose `five_hour` utilization is at or above `session_pace_five_hour_guard_pct` (default 90) ranks behind accounts below it. A figure whose reset has passed does not guard. If every candidate is guarded the guard changes nothing. It applies only to new placements; a mapped session stays.
+- **Model-family guard**: the request's model is resolved to a family with `getModelFamily` (`fable`, `opus`, `sonnet`, `haiku`, by substring; anything else is unguarded). An account whose `weekly_scoped` row for that family is at or above `session_pace_family_guard_pct` (default 90), with a future reset, ranks behind accounts below the guard: guarded accounts are demoted, not removed, so failover still has somewhere to go. Among guarded accounts the lowest family utilization comes first. A mapped session on a guarded account is ordered onto an unguarded account whose probe-backoff rank is no worse; the mapping moves when that account serves (below). If every candidate is guarded, a mapped session stays where it is. Pace is never computed on a model-scoped window.
+- **Near-ties**: when the two leading candidates in the same tier have deficits within `session_pace_tie_band_pct` (default 10) and the leader was picked within the last 500 ms, the runner-up takes the new session. Outside the band every new session goes to the leader.
+- **Cold start**: when no candidate has weekly or 5-hour data, new sessions rotate through the leading tier, least recently picked first.
+- **Rebind after failover**: the proxy calls `strategy.onRequestServed(meta, account, status)` once it has committed to an account's response (`packages/proxy/src/proxy.ts`, `recordServedAccount`). If a request this strategy routed was served (2xx/3xx) by an account other than the session's mapped one, the session rebinds to it and does not return. Requests that never reach `select()` (force-routed by `x-better-ccflare-account-id`, combo slots) never rebind.
+- **Idle expiry**: a mapping expires after `session_pace_idle_ms` (default 1 hour, the prompt-cache lifetime) without a request; the next request is placed fresh.
+- The paid extra-usage pool plays no part in the ranking.
+
+Usage figures come from the usage cache, refreshed by the usage poller every `usage_poll_interval_ms` (default 90 s, ±20% jitter); a cached entry expires after 10 minutes without a successful poll. Response headers on proxied Anthropic requests do not update this cache.
+
+```mermaid
+flowchart TD
+    A["select(accounts, meta)"] --> B["Auto-unpause eligible accounts,<br/>keep available ones"]
+    B --> C{"Live mapping for<br/>clientSessionId?"}
+    C -->|"Yes, mapped account available,<br/>not family-guarded"| D["Mapped account first"]
+    C -->|"Yes, mapped account family-guarded<br/>and an unguarded account with<br/>no worse probe rank exists"| E["Unguarded accounts first<br/>(placement order), mapped later"]
+    C -->|"No / expired / mapped<br/>account unavailable"| F["Placement order: probe rank, family guard,<br/>5h guard, priority, deficit;<br/>near-tie alternation or cold-start rotation"]
+    D --> H["Return ordered list"]
+    E --> H
+    F --> H
+    H --> I["Proxy serves from some account"]
+    I --> J{"Served account ≠ mapped?"}
+    J -->|"Yes"| K["Rebind session to served account"]
+    J -->|"No"| L["Refresh idle timer"]
+```
+
+*Source: `packages/load-balancer/src/strategies/session-pace.ts`.*
 
 ### least-used (LeastUsedStrategy)
 
