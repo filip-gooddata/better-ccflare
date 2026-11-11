@@ -27,9 +27,9 @@ describe("sailresearch provider registration", () => {
 
 	it("builds the Sail count_tokens URL without duplicating /v1", () => {
 		const provider = getProvider("sailresearch");
-		expect(
-			provider?.buildUrl("/v1/messages/count_tokens", "", undefined),
-		).toBe("https://api.sailresearch.com/v1/messages/count_tokens");
+		expect(provider?.buildUrl("/v1/messages/count_tokens", "", undefined)).toBe(
+			"https://api.sailresearch.com/v1/messages/count_tokens",
+		);
 	});
 
 	it("authenticates with a Bearer Authorization header, not x-api-key", () => {

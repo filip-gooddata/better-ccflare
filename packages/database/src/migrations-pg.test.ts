@@ -31,7 +31,10 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ensureSchema, runMigrations } from "./migrations";
-import { ensureRequestsIndexesPg, NEW_REQUEST_INDEXES_PG } from "./migrations-pg";
+import {
+	ensureRequestsIndexesPg,
+	NEW_REQUEST_INDEXES_PG,
+} from "./migrations-pg";
 
 const PG_SOURCE_PATH = path.join(__dirname, "migrations-pg.ts");
 
@@ -295,12 +298,12 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 	});
 
 	it("spot check: night_window_enabled is on accounts in both backends", () => {
-		expect(sqliteInventory.tables.get("accounts")?.has("night_window_enabled")).toBe(
-			true,
-		);
-		expect(pgInventory.tables.get("accounts")?.has("night_window_enabled")).toBe(
-			true,
-		);
+		expect(
+			sqliteInventory.tables.get("accounts")?.has("night_window_enabled"),
+		).toBe(true);
+		expect(
+			pgInventory.tables.get("accounts")?.has("night_window_enabled"),
+		).toBe(true);
 		// Upgrade path for existing PG databases, not just the CREATE TABLE.
 		expect(parsePgColumnsToAdd(pgSource)).toContainEqual({
 			table: "accounts",
@@ -461,10 +464,9 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 							// Default: every migrated index exists and is valid, so the
 							// gated redundant-drop block runs. Derived from the list so
 							// adding an index doesn't silently disable the gate here.
-							return (opts.validNames ??
-								NEW_REQUEST_INDEXES_PG.map((i) => i.name)).map(
-								(relname) => ({ relname }),
-							);
+							return (
+								opts.validNames ?? NEW_REQUEST_INDEXES_PG.map((i) => i.name)
+							).map((relname) => ({ relname }));
 						return [];
 					},
 					release: () => {

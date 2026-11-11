@@ -162,10 +162,10 @@ export function ComboFlowTab() {
 								</CardHeader>
 								<CardContent>
 									<ComboDetail
-									combo={combo}
-									liveRequests={liveRequests}
-									accountNameById={accountNameById}
-								/>
+										combo={combo}
+										liveRequests={liveRequests}
+										accountNameById={accountNameById}
+									/>
 								</CardContent>
 							</Card>
 						)}

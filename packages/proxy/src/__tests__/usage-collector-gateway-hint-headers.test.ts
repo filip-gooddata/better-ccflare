@@ -140,10 +140,7 @@ describe("UsageCollector - gateway hint headers in the live summary", () => {
 	});
 
 	test("a request with none of the headers is processed normally: fields stay undefined, nothing errors", async () => {
-		const summary = await runRequestAndGetSummary(
-			"gateway-hint-absent",
-			{},
-		);
+		const summary = await runRequestAndGetSummary("gateway-hint-absent", {});
 
 		expect(summary.gatewayHintRequestClass).toBeUndefined();
 		expect(summary.gatewayHintAgentType).toBeUndefined();
