@@ -324,7 +324,13 @@ class DayRun {
 	/** Account for unattached demand at t: preference, then base order (design 4.5); -1 when none. */
 	pick(t: EpochMs): number {
 		const preferred = this.p.plan.preferred;
-		if (this.prefActive && preferred !== null && this.usable(preferred, t))
+		// A preference never routes to an account ahead of its planned opening time.
+		if (
+			this.prefActive &&
+			preferred !== null &&
+			this.usable(preferred, t) &&
+			!(this.openPending[preferred] && this.openAt[preferred] > t)
+		)
 			return preferred;
 		let best = -1;
 		for (let j = 0; j < this.n; j++)

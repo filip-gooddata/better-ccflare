@@ -253,6 +253,33 @@ describe("simulate", () => {
 		});
 	});
 
+	describe("demand before a planned opening never reaches the scheduled account", () => {
+		const now = prague(12, 8);
+		const build = () =>
+			makeCtx({
+				now,
+				days: 1,
+				accounts: [account({ id: "acct-a" }), account({ id: "acct-b" })],
+				k5: { "acct-a": 10, "acct-b": 10 },
+				kW: { "acct-a": 1, "acct-b": 2 },
+				// 0.1 units from 08:00 to 08:10, before acct-a's 09:00 opening.
+				rate: (_m, _w, at) => (at < now + 10 * MIN ? 0.1 : 0),
+			});
+		for (const preferred of [null, 0, 1]) {
+			test(`preferred ${preferred}`, async () => {
+				const ctx = build();
+				const { axis, traces } = await simulate(ctx, {
+					openAt: [now + HOUR, null],
+					preferred,
+					move: null,
+				});
+				// 1 unit served: acct-b's weekly k is 2, acct-a's would be 1.
+				const i = indexAt(axis.times, now + 10 * MIN);
+				expect(traces[0].week[i]).toBeCloseTo(198, 4);
+			});
+		}
+	});
+
 	test("Fable out time is recorded per account", async () => {
 		const now = prague(12, 8);
 		const ctx = makeCtx({
