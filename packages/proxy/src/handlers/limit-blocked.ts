@@ -171,9 +171,29 @@ function familyLimitInForce(
 }
 
 /**
+ * Whether the all-limited rule may route this request: the strategy has
+ * `selectWhenAllLimited` and the request does not own its routing. A request
+ * naming an account (`x-better-ccflare-account-id`, which auto-refresh and
+ * keepalive probes send too) or bypassing session routing must reach only the
+ * account it asked for, so neither selection nor failover path C may send it
+ * anywhere else, and its refusals are not held.
+ */
+export function isAllLimitedRuleEligible(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+): boolean {
+	return (
+		ctx.strategy.selectWhenAllLimited !== undefined &&
+		!meta.headers?.get("x-better-ccflare-account-id") &&
+		meta.headers?.get("x-better-ccflare-bypass-session") !== "true"
+	);
+}
+
+/**
  * The account to forward a request to when every account that could serve it
- * is out only on limits, or null when the strategy has no
- * `selectWhenAllLimited`, nothing is limit-blocked, or the strategy declines.
+ * is out only on limits, or null when the request is not eligible for the rule
+ * ({@link isAllLimitedRuleEligible}), nothing is limit-blocked, or the
+ * strategy declines.
  *
  * `accounts` is the raw account list when the caller already holds it; it is
  * read from the database otherwise.
@@ -185,7 +205,12 @@ export async function selectAllLimitedTarget(
 	now: number = Date.now(),
 	accounts?: Account[],
 ): Promise<Account | null> {
-	if (!ctx.strategy.selectWhenAllLimited) return null;
+	if (
+		!ctx.strategy.selectWhenAllLimited ||
+		!isAllLimitedRuleEligible(ctx, meta)
+	) {
+		return null;
+	}
 	const all = accounts ?? (await ctx.dbOps.getAllAccounts());
 	const blocked = collectLimitBlockedAccounts(all, ctx, meta, model, now);
 	if (blocked.length === 0) return null;

@@ -1268,17 +1268,79 @@ async function readBoundedBytes(
 }
 
 /**
- * An upstream limit refusal kept whole (status, headers, body bytes) while
- * failover goes on. Kept only under a strategy with `selectWhenAllLimited`:
- * when every candidate refuses, the proxy answers with a genuine upstream
- * limit response instead of a composed `pool_exhausted` (failover path C).
+ * Read a held refusal body: its exact bytes when they fit in `maxBytes`, else
+ * a stream that yields the bytes read so far and then the rest of the
+ * upstream body. The stream keeps the upstream connection open until it is
+ * replayed or released ({@link releaseHeldLimitRefusal}), so the request only
+ * ever holds one.
+ */
+async function readHeldBody(
+	body: ReadableStream<Uint8Array> | null,
+	maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>> {
+	if (!body) return new Uint8Array(0);
+	const reader = body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+			total += value.byteLength;
+			if (total > maxBytes) {
+				return new ReadableStream<Uint8Array>({
+					async pull(controller) {
+						const next = chunks.shift();
+						if (next) {
+							controller.enqueue(next);
+							return;
+						}
+						const { done, value } = await reader.read();
+						if (done) controller.close();
+						else controller.enqueue(value);
+					},
+					async cancel(reason) {
+						await reader.cancel(reason).catch(() => {});
+					},
+				});
+			}
+		}
+	} catch (error) {
+		await reader.cancel().catch(() => {});
+		throw error;
+	}
+	reader.releaseLock();
+	const merged = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		merged.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return merged;
+}
+
+/**
+ * An upstream limit refusal kept whole (status, headers, body) while failover
+ * goes on. Kept only under a strategy with `selectWhenAllLimited`: when every
+ * candidate refuses, the proxy answers with a genuine upstream limit response
+ * instead of a composed `pool_exhausted` (failover path C). A body over the
+ * buffer bound stays a stream, replayable once; release it with
+ * {@link releaseHeldLimitRefusal} when it is not replayed.
  */
 export interface HeldLimitRefusal {
 	account: Account;
 	status: number;
 	statusText: string;
 	headers: Headers;
-	body: Uint8Array<ArrayBuffer>;
+	body: Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
+}
+
+/** Close a held refusal that will not be replayed (a no-op for a buffered one). */
+export function releaseHeldLimitRefusal(held: HeldLimitRefusal): void {
+	if (held.body instanceof ReadableStream) {
+		held.body.cancel().catch(() => {});
+	}
 }
 
 /**
@@ -1451,21 +1513,17 @@ export async function proxyWithAccount(
 	/**
 	 * Fail over from an upstream limit refusal: hand it to `onLimitRefusal`
 	 * when the all-limited rule can use it. Returns false when it was not
-	 * held (no receiver, another strategy, or a body over the bound, which is
-	 * no error envelope worth replaying); the caller then drains it.
+	 * held (no receiver, another strategy, or an unreadable body); the caller
+	 * then drains it.
 	 */
 	const holdLimitRefusal = async (rawResponse: Response): Promise<boolean> => {
 		if (!onLimitRefusal || !ctx.strategy.selectWhenAllLimited) return false;
-		let body: Uint8Array<ArrayBuffer> | null = null;
+		let body: HeldLimitRefusal["body"];
 		try {
-			body = await readBoundedBytes(
-				rawResponse.body,
-				MAX_TERMINAL_REJECTION_BYTES,
-			);
+			body = await readHeldBody(rawResponse.body, MAX_TERMINAL_REJECTION_BYTES);
 		} catch {
-			body = null;
+			return false;
 		}
-		if (body === null) return false;
 		onLimitRefusal({
 			account,
 			status: rawResponse.status,

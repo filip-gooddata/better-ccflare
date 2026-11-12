@@ -19,6 +19,7 @@ import type {
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import {
+	isAllLimitedRuleEligible,
 	markAllLimitedSelection,
 	selectAllLimitedTarget,
 } from "./limit-blocked";
@@ -1161,16 +1162,10 @@ export async function selectAccountsForRequest(
 	 * When this selection would end empty and the strategy implements
 	 * `selectWhenAllLimited`, the one account to forward to anyway (marked on
 	 * the request), or null to keep today's empty result. Never for a request
-	 * naming an account or an auto-refresh probe: both own their routing.
+	 * that owns its routing (isAllLimitedRuleEligible).
 	 */
 	const allLimitedSelection = async (): Promise<Account[] | null> => {
-		if (
-			!ctx.strategy.selectWhenAllLimited ||
-			meta.headers?.get("x-better-ccflare-account-id") ||
-			meta.headers?.get("x-better-ccflare-bypass-session") === "true"
-		) {
-			return null;
-		}
+		if (!isAllLimitedRuleEligible(ctx, meta)) return null;
 		const target = await selectAllLimitedTarget(
 			ctx,
 			meta,

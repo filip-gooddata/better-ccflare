@@ -50,11 +50,13 @@ import {
 	validateProviderPath,
 } from "./handlers";
 import {
+	isAllLimitedRuleEligible,
 	markAllLimitedSelection,
 	selectAllLimitedTarget,
 } from "./handlers/limit-blocked";
 import {
 	type HeldLimitRefusal,
+	releaseHeldLimitRefusal,
 	replayLimitRefusal,
 } from "./handlers/proxy-operations";
 import {
@@ -1143,16 +1145,24 @@ async function handleProxyRequest(
 	// erase the explanation.
 	let terminalRejection: (() => Promise<Response | null>) | undefined;
 	// The last upstream limit refusal of this request, kept only when the
-	// strategy has the all-limited rule (proxyWithAccount checks that) and the
-	// route is not a combo. Last-wins: failover path C answers with the refusal
-	// of the account that becomes usable first, which is decided only once every
-	// candidate has refused. See the all-fail branch below.
+	// all-limited rule may route the request (the same eligibility selection
+	// uses) and the route is not a combo. Last-wins: failover path C answers
+	// with the refusal of the account that becomes usable first, which is
+	// decided only once every candidate has refused. See the all-fail branch
+	// below. A refusal held as a stream keeps its upstream connection open, so
+	// one that is replaced or not answered with is released.
 	let heldLimitRefusal: HeldLimitRefusal | undefined;
-	const holdLimitRefusal = filteredComboInfo?.comboName
-		? undefined
-		: (refusal: HeldLimitRefusal) => {
-				heldLimitRefusal = refusal;
-			};
+	const holdLimitRefusal =
+		filteredComboInfo?.comboName || !isAllLimitedRuleEligible(ctx, requestMeta)
+			? undefined
+			: (refusal: HeldLimitRefusal) => {
+					if (heldLimitRefusal) releaseHeldLimitRefusal(heldLimitRefusal);
+					heldLimitRefusal = refusal;
+				};
+	const releaseHeld = () => {
+		if (heldLimitRefusal) releaseHeldLimitRefusal(heldLimitRefusal);
+		heldLimitRefusal = undefined;
+	};
 
 	/**
 	 * How the combo loop resolves the model override for index `index`: the
@@ -1263,6 +1273,7 @@ async function handleProxyRequest(
 		}
 
 		if (response) {
+			releaseHeld();
 			recordServedAccount(accounts[i], response);
 			return response;
 		}
@@ -1345,6 +1356,7 @@ async function handleProxyRequest(
 			);
 
 			if (response) {
+				releaseHeld();
 				recordServedAccount(accounts[i], response);
 				return response;
 			}
@@ -1592,7 +1604,10 @@ async function handleProxyRequest(
 	// `everyEligibleRouteIsBlind` already keeps a reauth-needing account it never
 	// asked holding the verdict open, so this cannot pre-empt a reauth message
 	// that would actually have been the actionable one.
-	if (everyEligibleRouteIsBlind()) return await visionRefusal();
+	if (everyEligibleRouteIsBlind()) {
+		releaseHeld();
+		return await visionRefusal();
+	}
 
 	// Failover path C: every candidate refused, at least one of them for a
 	// limit, under a strategy with the all-limited rule. Answer with a genuine
@@ -1617,21 +1632,29 @@ async function handleProxyRequest(
 		// Cooldown writes go through the async writer, so the stored rows may
 		// not show the refusals this request just received yet. The candidate
 		// objects carry them already: overlay the later cooldown onto each row.
+		// Best effort: a failed lookup answers with the held refusal.
 		const attempted = new Map(allAttemptedAccounts.map((acc) => [acc.id, acc]));
-		const rows = (await ctx.dbOps.getAllAccounts()).map((row) => {
-			const seen = attempted.get(row.id);
-			return seen &&
-				(seen.rate_limited_until ?? 0) > (row.rate_limited_until ?? 0)
-				? { ...row, rate_limited_until: seen.rate_limited_until }
-				: row;
-		});
-		const target = await selectAllLimitedTarget(
-			ctx,
-			requestMeta,
-			effectiveModel ?? undefined,
-			Date.now(),
-			rows,
-		);
+		let target: Account | null = null;
+		try {
+			const rows = (await ctx.dbOps.getAllAccounts()).map((row) => {
+				const seen = attempted.get(row.id);
+				return seen &&
+					(seen.rate_limited_until ?? 0) > (row.rate_limited_until ?? 0)
+					? { ...row, rate_limited_until: seen.rate_limited_until }
+					: row;
+			});
+			target = await selectAllLimitedTarget(
+				ctx,
+				requestMeta,
+				effectiveModel ?? undefined,
+				Date.now(),
+				rows,
+			);
+		} catch (error) {
+			log.warn(
+				`All candidates refused for limits; could not find the account usable first, answering with ${held.account.name}'s refusal: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		if (target && target.id !== held.account.id) {
 			markAllLimitedSelection(requestMeta, target.id);
 			log.info(
@@ -1655,6 +1678,7 @@ async function handleProxyRequest(
 				holdLimitRefusal,
 			);
 			if (extra) {
+				releaseHeld();
 				recordServedAccount(target, extra);
 				return extra;
 			}

@@ -708,3 +708,186 @@ describe("end-to-end ordering", () => {
 		expect(response.headers.get("x-upstream-account")).toBe("five");
 	});
 });
+
+function headerRequest(headers: Record<string, string>): Request {
+	return new Request("https://proxy.local/v1/messages", {
+		method: "POST",
+		headers: { "content-type": "application/json", ...headers },
+		body: JSON.stringify({
+			model: MODEL,
+			messages: [{ role: "user", content: "hello" }],
+			max_tokens: 16,
+		}),
+	});
+}
+
+async function summary(received: Response | Error) {
+	if (!(received instanceof Response)) return { error: String(received) };
+	return { status: received.status, body: await received.text() };
+}
+
+describe("requests that own their routing never reach failover path C", () => {
+	const cases: Array<[string, Record<string, string>]> = [
+		["a forced account", { "x-better-ccflare-account-id": "b" }],
+		[
+			"an auto-refresh or keepalive probe",
+			{
+				"x-better-ccflare-account-id": "b",
+				"x-better-ccflare-bypass-session": "true",
+			},
+		],
+		["a bypass-session request", { "x-better-ccflare-bypass-session": "true" }],
+	];
+	for (const [label, headers] of cases) {
+		it(`answers ${label} that gets a 429 as today, with no second forward`, async () => {
+			const run = async (strategy: LoadBalancingStrategy) => {
+				const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
+				const b = makeAccount("b");
+				const calls = installUpstream((account) =>
+					limit429(NOW + 3 * HOUR, account),
+				);
+				const { ctx } = makeCtx([a, b], strategy);
+				const response = await send(ctx, headerRequest(headers));
+				return { calls, result: await summary(response) };
+			};
+
+			const rule = await run(earliestResetStrategy());
+			const today = await run(plainStrategy());
+
+			expect(rule.calls).toEqual(today.calls);
+			expect(rule.calls).not.toContain("a");
+			expect(rule.result).toEqual(today.result);
+		});
+	}
+});
+
+/** A 429 whose body is larger than the held-refusal buffer, with a cancel probe. */
+function bigLimit429(resetAt: number, account: string, size = 100 * 1024) {
+	const text = JSON.stringify({
+		type: "error",
+		error: { type: "rate_limit_error", message: "x".repeat(size) },
+	});
+	const bytes = new TextEncoder().encode(text);
+	const state = { cancelled: false };
+	const chunk = 8 * 1024;
+	let offset = 0;
+	const body = new ReadableStream<Uint8Array>({
+		pull(controller) {
+			if (offset >= bytes.byteLength) {
+				controller.close();
+				return;
+			}
+			controller.enqueue(bytes.slice(offset, offset + chunk));
+			offset += chunk;
+		},
+		cancel() {
+			state.cancelled = true;
+		},
+	});
+	const response = new Response(body, {
+		status: 429,
+		statusText: "Too Many Requests",
+		headers: limitHeaders(resetAt, account),
+	});
+	return { response, text, state };
+}
+
+describe("a limit refusal larger than the held-refusal buffer", () => {
+	it("reaches the client whole when it is the only answer", async () => {
+		const a = makeAccount("a");
+		const big = bigLimit429(NOW + HOUR, "a");
+		const calls = installUpstream(() => big.response);
+		const { ctx } = makeCtx([a], earliestResetStrategy());
+
+		const response = await send(ctx);
+
+		expect(calls).toEqual(["a"]);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + HOUR, "a"),
+			body: big.text,
+		});
+	});
+
+	it("is forwarded whole when its account resets first, after a later refusal", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const big = bigLimit429(NOW + HOUR, "a");
+		const calls = installUpstream((account, index) =>
+			index === 0 ? big.response : limit429(NOW + 3 * HOUR, account),
+		);
+		const { ctx } = makeCtx([a, b], earliestResetStrategy());
+
+		const response = await send(ctx);
+
+		// a is asked once more on the rule path and answers with a normal 429.
+		expect(calls).toEqual(["a", "b", "a"]);
+		expect(big.state.cancelled).toBe(true);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + 3 * HOUR, "a"),
+			body: limitBody("a"),
+		});
+	});
+
+	it("is released when a later refusal replaces it", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const big = bigLimit429(NOW + 3 * HOUR, "a");
+		const calls = installUpstream((account) =>
+			account === "a" ? big.response : limit429(NOW + HOUR, "b"),
+		);
+		const { ctx } = makeCtx([a, b], earliestResetStrategy());
+
+		const response = await send(ctx);
+
+		expect(calls).toEqual(["a", "b"]);
+		expect(big.state.cancelled).toBe(true);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + HOUR, "b"),
+			body: limitBody("b"),
+		});
+	});
+
+	it("is released when a later candidate succeeds", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const big = bigLimit429(NOW + HOUR, "a");
+		installUpstream((account) => (account === "a" ? big.response : ok200("b")));
+		const { ctx } = makeCtx([a, b], earliestResetStrategy());
+
+		const response = (await send(ctx)) as Response;
+
+		expect(response.status).toBe(200);
+		expect(big.state.cancelled).toBe(true);
+	});
+});
+
+describe("failover path C target discovery", () => {
+	it("answers with the held refusal when reading the accounts fails", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const calls = installUpstream((account) =>
+			account === "a"
+				? limit429(NOW + HOUR, "a")
+				: limit429(NOW + 3 * HOUR, "b"),
+		);
+		const { ctx, dbOps } = makeCtx([a, b], earliestResetStrategy());
+		const ops = dbOps as unknown as Record<string, unknown>;
+		const readRows = ops.getAllAccounts as () => Promise<Account[]>;
+		ops.getAllAccounts = mock(async () => {
+			if (calls.length >= 2) throw new Error("database is locked");
+			return readRows();
+		});
+
+		const response = await send(ctx);
+
+		expect(calls).toEqual(["a", "b"]);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + 3 * HOUR, "b"),
+			body: limitBody("b"),
+		});
+	});
+});
