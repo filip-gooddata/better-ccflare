@@ -22,6 +22,16 @@ import type {
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 const NOW = Date.parse("2026-11-11T15:30:00Z");
+const PRAGUE = "Europe/Prague";
+const PRAGUE_WORKDAYS = { workDays: 5, timeZone: PRAGUE };
+const PRAGUE_CALENDAR = { workDays: 7, timeZone: PRAGUE };
+
+/** The pace formula the strategy used before work days: calendar share of the week elapsed minus utilization. */
+function calendarDeficit(window: StrategyUsageWindow, now: number): number {
+	const start = (window.resetsAt as number) - 7 * DAY;
+	const elapsed = Math.min(100, Math.max(0, ((now - start) / (7 * DAY)) * 100));
+	return elapsed - window.utilization;
+}
 
 function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 	return {
@@ -86,11 +96,12 @@ class FakeUsageStore implements StrategyStore {
 		return this.family.get(`${accountId}:${family}`) ?? [];
 	}
 
-	/** Weekly window whose deficit at NOW is `deficit` (reset 3.5 days out). */
+	/** Weekly window whose deficit at NOW is `deficit` (reset 3.5 days out), work days Mon–Fri in Europe/Prague. */
 	setWeeklyDeficit(accountId: string, deficit: number): void {
-		// reset at NOW + 3.5d → window started NOW - 3.5d → elapsed 50%.
+		// reset at NOW + 3.5d → window started Sun 04:30 local → Mon + Tue +
+		// Wed 16.5 h = 64.5 of 120 work hours elapsed = 53.75%.
 		this.weekly.set(accountId, {
-			utilization: 50 - deficit,
+			utilization: 53.75 - deficit,
 			resetsAt: NOW + 3.5 * DAY,
 		});
 	}
@@ -136,7 +147,7 @@ describe("SessionPaceStrategy", () => {
 		setSystemTime(new Date(NOW));
 		clearAllProbeBackoff();
 		store = new FakeUsageStore();
-		strategy = new SessionPaceStrategy();
+		strategy = new SessionPaceStrategy({}, { timeZone: PRAGUE });
 		strategy.initialize(store);
 		a = makeAccount("a");
 		b = makeAccount("b");
@@ -188,7 +199,7 @@ describe("SessionPaceStrategy", () => {
 	});
 
 	describe("rule 2: largest weekly pace deficit wins a new session", () => {
-		it("matches the live fixture of 2026-11-11T15:30Z", () => {
+		it("matches the live fixture of 2026-11-11T15:30Z (work days Mon–Fri, Europe/Prague)", () => {
 			const gooddata = makeAccount("gd", { name: "gooddata" });
 			const gooddataAi = makeAccount("gdai", { name: "gooddata-ai" });
 			const gdWindow = {
@@ -199,11 +210,20 @@ describe("SessionPaceStrategy", () => {
 				utilization: 50,
 				resetsAt: Date.parse("2026-11-17T02:00:00Z"),
 			};
-			expect(weeklyPaceDeficit(gdWindow, NOW)).toBeCloseTo(41.75, 2);
-			expect(weeklyPaceDeficit(aiWindow, NOW)).toBeCloseTo(-27.68, 2);
+			// gooddata: 64.5 of 120 work hours → 53.75% elapsed.
+			expect(weeklyPaceDeficit(gdWindow, NOW, PRAGUE_WORKDAYS)).toBeCloseTo(
+				51.75,
+				9,
+			);
+			// gooddata-ai: 37.5 of 120 work hours → 31.25% elapsed.
+			expect(weeklyPaceDeficit(aiWindow, NOW, PRAGUE_WORKDAYS)).toBeCloseTo(
+				-18.75,
+				9,
+			);
 
 			store.weekly.set("gd", gdWindow);
 			store.weekly.set("gdai", aiWindow);
+			expect(strategy.peek([gooddataAi, gooddata], meta("s"))).toBe("gd");
 			expect(strategy.select([gooddataAi, gooddata], meta("s"))[0].id).toBe(
 				"gd",
 			);
@@ -211,10 +231,18 @@ describe("SessionPaceStrategy", () => {
 
 		it("clamps elapsed time to 0..100 and follows the formula for a passed reset", () => {
 			expect(
-				weeklyPaceDeficit({ utilization: 10, resetsAt: NOW + 8 * DAY }, NOW),
+				weeklyPaceDeficit(
+					{ utilization: 10, resetsAt: NOW + 8 * DAY },
+					NOW,
+					PRAGUE_WORKDAYS,
+				),
 			).toBe(-10);
 			expect(
-				weeklyPaceDeficit({ utilization: 10, resetsAt: NOW - HOUR }, NOW),
+				weeklyPaceDeficit(
+					{ utilization: 10, resetsAt: NOW - HOUR },
+					NOW,
+					PRAGUE_WORKDAYS,
+				),
 			).toBe(90);
 		});
 
@@ -542,12 +570,15 @@ describe("SessionPaceStrategy", () => {
 
 	describe("rule 10: configurable thresholds", () => {
 		it("honours custom guard, family guard, tie band and idle time", () => {
-			const custom = new SessionPaceStrategy({
-				fiveHourGuardPct: 50,
-				familyGuardPct: 50,
-				tieBandPct: 0,
-				idleMs: 10 * 60_000,
-			});
+			const custom = new SessionPaceStrategy(
+				{
+					fiveHourGuardPct: 50,
+					familyGuardPct: 50,
+					tieBandPct: 0,
+					idleMs: 10 * 60_000,
+				},
+				{ timeZone: PRAGUE },
+			);
 			custom.initialize(store);
 			store.setWeeklyDeficit("a", 40);
 			store.setWeeklyDeficit("b", 39);
@@ -574,12 +605,13 @@ describe("SessionPaceStrategy", () => {
 			expect(custom.select([a, b], meta("s4"))[0].id).toBe("b");
 		});
 
-		it("uses defaults 90, 90, 10 and one hour", () => {
+		it("uses defaults 90, 90, 10, one hour and five work days", () => {
 			expect(new SessionPaceStrategy().options).toEqual({
 				fiveHourGuardPct: 90,
 				familyGuardPct: 90,
 				tieBandPct: 10,
 				idleMs: HOUR,
+				workDays: 5,
 			});
 		});
 	});
@@ -656,6 +688,202 @@ describe("SessionPaceStrategy", () => {
 		});
 	});
 
+	describe("work-day pace", () => {
+		const gdWindow = {
+			utilization: 2,
+			resetsAt: Date.parse("2026-11-15T14:00:00Z"),
+		};
+		const aiWindow = {
+			utilization: 50,
+			resetsAt: Date.parse("2026-11-17T02:00:00Z"),
+		};
+
+		it("holds the elapsed share still over a weekend", () => {
+			// Window from Wed 2026-11-11 11:00 local to Wed 2026-11-18 11:00 local.
+			const w = {
+				utilization: 0,
+				resetsAt: Date.parse("2026-11-18T10:00:00Z"),
+			};
+			const friLate = Date.parse("2026-11-13T22:59:00Z"); // Fri 23:59 local
+			const sat = Date.parse("2026-11-14T10:00:00Z"); // Sat 11:00 local
+			const sun = Date.parse("2026-11-15T20:00:00Z"); // Sun 21:00 local
+			// Wed 13 h + Thu 24 h + Fri 24 h = 61 of 120 work hours.
+			const expected = (61 / 120) * 100;
+			expect(weeklyPaceDeficit(w, sat, PRAGUE_WORKDAYS)).toBeCloseTo(
+				expected,
+				9,
+			);
+			expect(weeklyPaceDeficit(w, sun, PRAGUE_WORKDAYS)).toBe(
+				weeklyPaceDeficit(w, sat, PRAGUE_WORKDAYS),
+			);
+			expect(weeklyPaceDeficit(w, friLate, PRAGUE_WORKDAYS)).toBeCloseTo(
+				expected - (1 / 60 / 120) * 100,
+				9,
+			);
+		});
+
+		it("starts counting on Monday for a window that starts on a weekend", () => {
+			// Window from Sat 2026-11-07 10:00 local to Sat 2026-11-14 10:00 local:
+			// all five work days fall inside it.
+			const w = {
+				utilization: 0,
+				resetsAt: Date.parse("2026-11-14T09:00:00Z"),
+			};
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-11-08T12:00:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBe(0);
+			// Mon 08:00 local: 8 of 120 work hours.
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-11-09T07:00:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBeCloseTo((8 / 120) * 100, 9);
+			// Fri 24:00 local: every work hour of the window has passed.
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-11-13T23:00:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBeCloseTo(100, 9);
+		});
+
+		it("gives the calendar pace with seven work days", () => {
+			expect(weeklyPaceDeficit(gdWindow, NOW, PRAGUE_CALENDAR)).toBeCloseTo(
+				41.75,
+				2,
+			);
+			expect(weeklyPaceDeficit(aiWindow, NOW, PRAGUE_CALENDAR)).toBeCloseTo(
+				-27.68,
+				2,
+			);
+			for (let t = NOW - 7 * DAY; t <= NOW + 7 * DAY; t += 7 * HOUR + 13_000) {
+				expect(weeklyPaceDeficit(gdWindow, t, PRAGUE_CALENDAR)).toBeCloseTo(
+					calendarDeficit(gdWindow, t),
+					9,
+				);
+			}
+
+			const calendar = new SessionPaceStrategy(
+				{ workDays: 7 },
+				{ timeZone: PRAGUE },
+			);
+			calendar.initialize(store);
+			const gd = makeAccount("gd", { name: "gooddata" });
+			const ai = makeAccount("gdai", { name: "gooddata-ai" });
+			store.weekly.set("gd", gdWindow);
+			store.weekly.set("gdai", aiWindow);
+			expect(calendar.select([ai, gd], meta("s"))[0].id).toBe("gd");
+		});
+
+		it("counts the real seconds of each local day across a DST change", () => {
+			// Prague leaves summer time on Sun 2026-10-25 (03:00 CEST → 02:00 CET).
+			// Window from Thu 2026-10-22 12:00 CEST to Thu 2026-10-29 11:00 CET:
+			// Thu 12 + Fri 24 + Mon 24 + Tue 24 + Wed 24 + Thu 11 = 119 work hours.
+			const w = {
+				utilization: 0,
+				resetsAt: Date.parse("2026-10-29T10:00:00Z"),
+			};
+			// Mon 00:30 CET: Thu 12 + Fri 24 + Mon 0.5 = 36.5 h.
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-10-25T23:30:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBeCloseTo((36.5 / 119) * 100, 9);
+			// Sun 23:30 CET is still the weekend: 36 h.
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-10-25T22:30:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBeCloseTo((36 / 119) * 100, 9);
+			// Mon 12:00 CET: 48 h.
+			expect(
+				weeklyPaceDeficit(
+					w,
+					Date.parse("2026-10-26T11:00:00Z"),
+					PRAGUE_WORKDAYS,
+				),
+			).toBeCloseTo((48 / 119) * 100, 9);
+			// Seven work days count the 25-hour Sunday in full: calendar pace.
+			for (
+				let t = Date.parse("2026-10-22T10:00:00Z");
+				t <= Date.parse("2026-10-29T10:00:00Z");
+				t += 5 * HOUR + 17_000
+			) {
+				expect(weeklyPaceDeficit(w, t, PRAGUE_CALENDAR)).toBeCloseTo(
+					calendarDeficit(w, t),
+					9,
+				);
+			}
+		});
+
+		it("falls back to the calendar pace when the window holds no work time", () => {
+			expect(
+				weeklyPaceDeficit(gdWindow, NOW, { workDays: 0, timeZone: PRAGUE }),
+			).toBeCloseTo(calendarDeficit(gdWindow, NOW), 9);
+		});
+
+		it("applies the tie band to work-day deficits", () => {
+			// x: window from Sat 16:30 local — work 53.75%, calendar 57.14%.
+			// y: window from Mon 16:30 local — work 40.00%, calendar 28.57%.
+			const xReset = Date.parse("2026-11-14T15:30:00Z");
+			const yReset = Date.parse("2026-11-16T15:30:00Z");
+			const x = makeAccount("x");
+			const y = makeAccount("y");
+
+			// Work-day deficits 33.75 vs 30 (near-tie); calendar 37.1 vs 18.6.
+			store.weekly.set("x", { utilization: 20, resetsAt: xReset });
+			store.weekly.set("y", { utilization: 10, resetsAt: yReset });
+			setSystemTime(new Date(NOW + 100));
+			expect(strategy.select([x, y], meta("t1"))[0].id).toBe("x");
+			setSystemTime(new Date(NOW + 200));
+			expect(strategy.select([x, y], meta("t2"))[0].id).toBe("y");
+
+			const calendar = new SessionPaceStrategy(
+				{ workDays: 7 },
+				{ timeZone: PRAGUE },
+			);
+			calendar.initialize(store);
+			setSystemTime(new Date(NOW + 100));
+			expect(calendar.select([x, y], meta("c1"))[0].id).toBe("x");
+			setSystemTime(new Date(NOW + 200));
+			expect(calendar.select([x, y], meta("c2"))[0].id).toBe("x");
+
+			// Work-day deficits 23 vs 35 (outside the band); calendar 26.4 vs 23.6.
+			store.weekly.set("x", { utilization: 30.75, resetsAt: xReset });
+			store.weekly.set("y", { utilization: 5, resetsAt: yReset });
+			setSystemTime(new Date(NOW + 2_000));
+			expect(strategy.select([x, y], meta("t3"))[0].id).toBe("y");
+			setSystemTime(new Date(NOW + 2_100));
+			expect(strategy.select([x, y], meta("t4"))[0].id).toBe("y");
+			setSystemTime(new Date(NOW + 2_000));
+			expect(calendar.select([x, y], meta("c3"))[0].id).toBe("x");
+			setSystemTime(new Date(NOW + 2_100));
+			expect(calendar.select([x, y], meta("c4"))[0].id).toBe("y");
+		});
+
+		it("uses the process's local zone unless one is injected", () => {
+			expect(new SessionPaceStrategy().paceBasis).toEqual({
+				workDays: 5,
+				timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+			});
+			expect(
+				new SessionPaceStrategy({ workDays: 6 }, { timeZone: PRAGUE })
+					.paceBasis,
+			).toEqual({ workDays: 6, timeZone: PRAGUE });
+		});
+	});
+
 	describe("INFO logging", () => {
 		it("logs a placement and a rebind with account names, deficits, 5-hour figures and the deciding rule", () => {
 			const lines: string[] = [];
@@ -693,8 +921,9 @@ describe("SessionPaceStrategy", () => {
 			expect(place).toContain("session-pace place session=5e551011");
 			expect(place).toContain("account=gooddata ");
 			expect(place).toContain("rule=pace-deficit");
-			expect(place).toContain("gooddata(deficit=+41.8 5h=12% fable=4%)");
-			expect(place).toContain("gooddata-ai(deficit=-27.7 5h=49% fable=9%)");
+			expect(place).toContain("work_days=5 tz=Europe/Prague ");
+			expect(place).toContain("gooddata(deficit=+51.8 5h=12% fable=4%)");
+			expect(place).toContain("gooddata-ai(deficit=-18.8 5h=49% fable=9%)");
 			expect(rebind).toContain(
 				"session-pace rebind session=5e551011 from=gooddata to=gooddata-ai rule=failover",
 			);

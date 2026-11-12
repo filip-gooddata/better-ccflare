@@ -13,7 +13,8 @@ import type {
 } from "@better-ccflare/types";
 import { isPeekAvailable, wouldAutoUnpause } from "./peek-availability";
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
 
 /**
  * Two new sessions that start this close together alternate between
@@ -33,6 +34,8 @@ export interface SessionPaceOptions {
 	tieBandPct: number;
 	/** A session mapping expires after this long without a request. */
 	idleMs: number;
+	/** Local days with ISO weekday <= this count toward the weekly pace (5 = Monday to Friday, 7 = every day). */
+	workDays: number;
 }
 
 export const SESSION_PACE_DEFAULTS: Readonly<SessionPaceOptions> = {
@@ -40,23 +43,117 @@ export const SESSION_PACE_DEFAULTS: Readonly<SessionPaceOptions> = {
 	familyGuardPct: 90,
 	tieBandPct: 10,
 	idleMs: 60 * 60 * 1000,
+	workDays: 5,
 };
+
+/** What the weekly pace counts: local days with ISO weekday <= workDays, in timeZone. */
+export interface PaceBasis {
+	workDays: number;
+	timeZone: string;
+}
+
+/** The IANA zone this process resolves as local (TZ, else the system zone). */
+function localTimeZone(): string {
+	return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+}
+
+const zoneFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function wallClock(timeZone: string, t: number) {
+	let fmt = zoneFormatters.get(timeZone);
+	if (!fmt) {
+		fmt = new Intl.DateTimeFormat("en-US", {
+			timeZone,
+			hourCycle: "h23",
+			year: "numeric",
+			month: "numeric",
+			day: "numeric",
+			hour: "numeric",
+			minute: "numeric",
+			second: "numeric",
+		});
+		zoneFormatters.set(timeZone, fmt);
+	}
+	const p: Record<string, number> = {};
+	for (const part of fmt.formatToParts(t)) {
+		if (part.type !== "literal") p[part.type] = Number(part.value);
+	}
+	return {
+		year: p.year,
+		month: p.month,
+		day: p.day,
+		hour: p.hour === 24 ? 0 : p.hour,
+		minute: p.minute,
+		second: p.second,
+	};
+}
+
+/** Offset of timeZone from UTC at instant t, in ms (positive east of UTC). */
+function zoneOffsetMs(timeZone: string, t: number): number {
+	const w = wallClock(timeZone, t);
+	const wallAsUtc = Date.UTC(
+		w.year,
+		w.month - 1,
+		w.day,
+		w.hour,
+		w.minute,
+		w.second,
+	);
+	return wallAsUtc - Math.floor(t / 1000) * 1000;
+}
+
+/** The instant of local midnight starting the calendar day dayUtc (a UTC midnight naming that date). */
+function localMidnight(timeZone: string, dayUtc: number): number {
+	const first = dayUtc - zoneOffsetMs(timeZone, dayUtc);
+	const offset = zoneOffsetMs(timeZone, first);
+	return dayUtc - offset;
+}
+
+/** Milliseconds of [from, to) that fall on local work days. */
+function workMs(from: number, to: number, basis: PaceBasis): number {
+	if (to <= from) return 0;
+	const start = wallClock(basis.timeZone, from);
+	let day = Date.UTC(start.year, start.month - 1, start.day);
+	let dayStart = localMidnight(basis.timeZone, day);
+	let total = 0;
+	for (let i = 0; i < 400; i++) {
+		const nextDay = day + DAY_MS;
+		const dayEnd = localMidnight(basis.timeZone, nextDay);
+		const isoWeekday = new Date(day).getUTCDay() || 7;
+		if (isoWeekday <= basis.workDays) {
+			total += Math.max(0, Math.min(to, dayEnd) - Math.max(from, dayStart));
+		}
+		if (dayEnd >= to) break;
+		day = nextDay;
+		dayStart = dayEnd;
+	}
+	return total;
+}
 
 /**
  * How far an account is behind (positive) or ahead of (negative) an even
- * spend of its all-models weekly window: the share of the window that has
- * elapsed minus the share that has been used.
+ * spend of its all-models weekly window: the share of the window's work time
+ * that has elapsed minus the share that has been used. The window starts
+ * `resetsAt` minus 7 days; work time is the part of it on local days whose
+ * ISO weekday is at most `basis.workDays`. A window with no work time falls
+ * back to the calendar share.
  */
 export function weeklyPaceDeficit(
 	window: StrategyUsageWindow | null,
 	now: number,
+	basis: PaceBasis = {
+		workDays: SESSION_PACE_DEFAULTS.workDays,
+		timeZone: localTimeZone(),
+	},
 ): number {
 	if (!window || window.resetsAt === null) return 0;
 	const windowStart = window.resetsAt - WEEK_MS;
-	const elapsedPct = Math.min(
-		100,
-		Math.max(0, ((now - windowStart) / WEEK_MS) * 100),
-	);
+	const total = workMs(windowStart, window.resetsAt, basis);
+	const share =
+		total > 0
+			? (workMs(windowStart, now, basis) * 100) / total
+			: ((now - windowStart) / WEEK_MS) * 100;
+	const elapsedPct = Math.min(100, Math.max(0, share));
 	return elapsedPct - window.utilization;
 }
 
@@ -146,6 +243,8 @@ interface RoutedRequest {
  */
 export class SessionPaceStrategy implements LoadBalancingStrategy {
 	readonly options: SessionPaceOptions;
+	/** Work days from options; the zone is read once, here, unless injected. */
+	readonly paceBasis: PaceBasis;
 	private store: StrategyStore | null = null;
 	private log = new Logger("SessionPaceStrategy");
 	private sessions = new Map<string, Mapping>();
@@ -154,8 +253,16 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 	private pickSeq = 0;
 	private routed = new WeakMap<RequestMeta, RoutedRequest>();
 
-	constructor(options: Partial<SessionPaceOptions> = {}) {
+	/** `internal.timeZone` replaces the process's local zone (tests). */
+	constructor(
+		options: Partial<SessionPaceOptions> = {},
+		internal: { timeZone?: string } = {},
+	) {
 		this.options = { ...SESSION_PACE_DEFAULTS, ...options };
+		this.paceBasis = {
+			workDays: this.options.workDays,
+			timeZone: internal.timeZone ?? localTimeZone(),
+		};
 	}
 
 	initialize(store: StrategyStore): void {
@@ -458,7 +565,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		return {
 			account,
 			probeRank: probeBackoffRank(account.id, now),
-			deficit: weeklyPaceDeficit(weekly, now),
+			deficit: weeklyPaceDeficit(weekly, now, this.paceBasis),
 			fiveHourUtil: fiveHourLive,
 			fiveHourGuarded:
 				fiveHourLive !== null && fiveHourLive >= this.options.fiveHourGuardPct,
@@ -486,7 +593,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 				.join(",");
 			return `${c.account.name}(deficit=${deficit} 5h=${fiveHour}${fam}${flags ? ` ${flags}` : ""})`;
 		});
-		return `family=${family ?? "-"} candidates=[${parts.join("; ")}]`;
+		return `work_days=${this.paceBasis.workDays} tz=${this.paceBasis.timeZone} family=${family ?? "-"} candidates=[${parts.join("; ")}]`;
 	}
 
 	private pickedAt(c: Candidate): number {

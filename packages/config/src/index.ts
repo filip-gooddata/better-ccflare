@@ -150,6 +150,7 @@ export interface ConfigData {
 	session_pace_family_guard_pct?: number;
 	session_pace_tie_band_pct?: number;
 	session_pace_idle_ms?: number;
+	session_pace_work_days?: number;
 	cache_keepalive_ttl_minutes?: number;
 	system_prompt_cache_ttl_1h?: boolean;
 	usage_throttling_five_hour_enabled?: boolean;
@@ -312,6 +313,7 @@ function validateDatabaseConfig(
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};
+	private workDaysWarning: string | null = null;
 
 	constructor(configPath?: string) {
 		super();
@@ -677,6 +679,35 @@ export class Config extends EventEmitter {
 			60_000,
 			86_400_000,
 		);
+	}
+
+	/**
+	 * session-pace: local days with ISO weekday <= this count toward the
+	 * weekly pace. Default 5 (Monday to Friday). Environment variable first,
+	 * then the config file key; anything but an integer from 1 to 7 gives 5
+	 * and one warning.
+	 */
+	getSessionPaceWorkDays(): number {
+		const fromEnv = process.env.SESSION_PACE_WORK_DAYS;
+		const useEnv = fromEnv !== undefined && fromEnv !== "";
+		const raw: unknown = useEnv ? fromEnv : this.data.session_pace_work_days;
+		if (raw === undefined || raw === null) return 5;
+		const n =
+			typeof raw === "number"
+				? raw
+				: useEnv && typeof raw === "string" && raw.trim() !== ""
+					? Number(raw)
+					: Number.NaN;
+		if (Number.isInteger(n) && n >= 1 && n <= 7) return n;
+		const source = useEnv ? "SESSION_PACE_WORK_DAYS" : "session_pace_work_days";
+		const warning = `${source}=${JSON.stringify(raw)}`;
+		if (this.workDaysWarning !== warning) {
+			this.workDaysWarning = warning;
+			log.warn(
+				`Invalid ${warning}: expected an integer from 1 to 7; using 5 (Monday to Friday)`,
+			);
+		}
+		return 5;
 	}
 
 	setUsagePollIntervalMs(ms: number): void {

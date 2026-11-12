@@ -140,12 +140,14 @@ function sessionPaceOptionsFrom(config: {
 	getSessionPaceFamilyGuardPct(): number;
 	getSessionPaceTieBandPct(): number;
 	getSessionPaceIdleMs(): number;
+	getSessionPaceWorkDays(): number;
 }): SessionPaceOptions {
 	return {
 		fiveHourGuardPct: config.getSessionPaceFiveHourGuardPct(),
 		familyGuardPct: config.getSessionPaceFamilyGuardPct(),
 		tieBandPct: config.getSessionPaceTieBandPct(),
 		idleMs: config.getSessionPaceIdleMs(),
+		workDays: config.getSessionPaceWorkDays(),
 	};
 }
 
