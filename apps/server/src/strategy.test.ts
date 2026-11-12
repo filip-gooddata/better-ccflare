@@ -286,6 +286,36 @@ describe("GET /api/config/strategy sessionPace", () => {
 		expect((after.sessionPace as Record<string, unknown>).tieBandPct).toBe(25);
 	});
 
+	it("reports the same start zone before and after a switch to session-pace", async () => {
+		process.env.LB_STRATEGY = "least-used";
+		const config = makeConfig();
+		const before = buildStrategy(
+			config.getStrategy(),
+			FIVE_HOURS_MS,
+			sessionPaceOptionsFrom(config),
+			START_ZONE,
+		);
+		const beforeBody = await strategyBody(config, before);
+		expect((beforeBody.sessionPace as Record<string, unknown>).timeZone).toBe(
+			START_ZONE,
+		);
+
+		process.env.LB_STRATEGY = "session-pace";
+		const after = buildStrategy(
+			config.getStrategy(),
+			FIVE_HOURS_MS,
+			sessionPaceOptionsFrom(config),
+			START_ZONE,
+		);
+		expect(after).toBeInstanceOf(SessionPaceStrategy);
+		expect((after as SessionPaceStrategy).paceBasis.timeZone).toBe(START_ZONE);
+		const afterBody = await strategyBody(config, after);
+		expect(afterBody.strategy).toBe("session-pace");
+		expect((afterBody.sessionPace as Record<string, unknown>).timeZone).toBe(
+			START_ZONE,
+		);
+	});
+
 	it("adds no keys beyond strategy, strategySource and the six sessionPace fields", async () => {
 		for (const strategy of ["session-pace", "session"]) {
 			process.env.LB_STRATEGY = strategy;

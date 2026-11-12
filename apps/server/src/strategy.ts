@@ -15,11 +15,14 @@ import {
 /**
  * Build a load-balancing strategy from its enum name. Add new strategies here
  * as additional cases. Falls back to SessionStrategy on unknown values.
+ * `timeZone` is the zone session-pace splits local days in; the server passes
+ * the zone it read at start so a rebuilt instance keeps it.
  */
 export function buildStrategy(
 	name: StrategyName,
 	sessionDurationMs: number,
 	paceOptions?: Partial<SessionPaceOptions>,
+	timeZone?: string,
 ): LoadBalancingStrategy {
 	switch (name) {
 		case StrategyName.LeastUsed:
@@ -31,7 +34,7 @@ export function buildStrategy(
 		case StrategyName.SessionDrainSoonestStrict:
 			return new SessionDrainSoonestStrategy(sessionDurationMs, "strict");
 		case StrategyName.SessionPace:
-			return new SessionPaceStrategy(paceOptions);
+			return new SessionPaceStrategy(paceOptions, { timeZone });
 		default:
 			return new SessionStrategy(sessionDurationMs);
 	}

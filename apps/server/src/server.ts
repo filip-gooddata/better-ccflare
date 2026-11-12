@@ -1399,8 +1399,8 @@ export default async function startServer(options?: {
 	// Strategy is constructed below after RuntimeConfig is built. The router
 	// accepts a getter so it can read the live (post-hot-reload) instance.
 	let currentStrategy: LoadBalancingStrategy | null = null;
-	// What GET /api/config/strategy reports as the session-pace zone while
-	// another strategy runs; a session-pace instance reads the same zone.
+	// The zone session-pace splits local days in, read once: every
+	// session-pace instance gets it, and GET /api/config/strategy reports it.
 	const startTimeZone = localTimeZone();
 
 	// The model catalog needs a ProxyContext (account credentials, provider)
@@ -1686,6 +1686,7 @@ export default async function startServer(options?: {
 		config.getStrategy(),
 		runtimeConfig.sessionDurationMs,
 		sessionPaceOptionsFrom(config),
+		startTimeZone,
 	);
 	log.info(`Load-balancing strategy: ${config.getStrategy()}`);
 
@@ -1861,6 +1862,7 @@ export default async function startServer(options?: {
 				newStrategyName,
 				runtimeConfig.sessionDurationMs,
 				sessionPaceOptionsFrom(config),
+				startTimeZone,
 			);
 			strategy.initialize?.(strategyStore);
 			proxyContext.strategy = strategy;
