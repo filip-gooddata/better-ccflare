@@ -43,7 +43,7 @@ side.
 | Constant | Value | File |
 |---|---|---|
 | `MIN_RECORDED_DAYS`, `MIN_POOL_DAYS` | 5, 3 | `days.ts` |
-| `RECENT_WINDOW_MS`, `WORK_START_RECENT_DAYS` | 60 min, 10 days | `days.ts` |
+| `RECENT_WINDOW_MS`, `WORK_START_RECENT_DAYS`, `DEFAULT_WORK_START_SHARE_PCT` | 60 min, 10 days, 5 % | `days.ts` |
 | `MIN_CALIBRATION_POINTS`, `MIN_CALIBRATION_UNITS` | 5, 0 | `calibration.ts` |
 | `SILVERMAN_FACTOR`, `NORMAL_IQR_SD` | 1.06, 1.34 | `scenarios.ts` |
 | `DAY_FACTOR_PRIOR_SHARE`, `DAY_FACTOR_MIN`, `DAY_FACTOR_MAX` | 0.25, 0.25, 4 | `scenarios.ts` |
@@ -54,12 +54,23 @@ side.
 | `OPEN_AHEAD_MIN`, `OPEN_BEFORE_WORK_START_MIN` | 0–240 min ahead; 300–60 min before work start | `planner.ts` |
 | `OPENING_BEAM`, `MAX_OPENING_COMBOS`, `MAX_MOVE_SESSIONS` | 3, 64, 3 | `planner.ts` |
 | `TIER_TOLERANCE_POINTS`, `TIER_TOLERANCE_STOP_MIN`, `REASON_MIN_GAIN_POINTS` | 0.5, 5 min, 0.05 | `planner.ts` |
+| `OPEN_MIN_STOP_GAIN_MIN` | 5 min (one simulation step) | `planner.ts` |
 | `ZERO_POINTS` | 0.05 | `stops.ts` |
 | `WEEK_PAST_SPACING_MS` | 30 min | `past.ts` |
 
 The user-facing knobs (`simulatedDays`, `timeShiftMin`, `recentTauMin`, `sessionTurnoverMin`,
 `openMinGainPoints`, `moveMinGainPoints`, `minStopPoints`, `fanLevels`, history half-life and lookback)
 are `ForecastSettings`, not constants.
+
+Opening ahead of need (`openingEarns`, amendment A2): a window opens early when that raises score item 1
+by `openMinGainPoints`, or when items 1 and 2 tie within `TIER_TOLERANCE_POINTS` and the heavy stop
+minutes fall by at least `OPEN_MIN_STOP_GAIN_MIN`. The placement reason is then `open-ahead+<points>` or
+`open-ahead-stop-<minutes>min`.
+
+Learned work start (`workStartMinute`, amendment A3): the median, over the last `WORK_START_RECENT_DAYS`
+work days with demand, of the local minute at which the day's cumulative demand first reaches
+`workStartSharePct` percent (setting, default 5) of its total, taken as the start of that 5-minute bucket.
+A stray overnight request no longer sets the work start.
 
 ## Index
 

@@ -180,6 +180,8 @@ export interface ForecastSettings {
 	recentTauMin: number;
 	/** Time constant with which demand detaches from the sessions that carry it now. */
 	sessionTurnoverMin: number;
+	/** Work start: the local minute by which this percent of a work day's demand has been used (median over recent work days). */
+	workStartSharePct: number;
 }
 
 /** The session-pace values the forecast shares. */

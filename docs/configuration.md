@@ -130,6 +130,7 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `historyLookbackDays` | `FORECAST_HISTORY_LOOKBACK_DAYS` | `forecast_history_lookback_days` | `56` | integer 7–365 |
 | `recentTauMin` | `FORECAST_RECENT_TAU_MIN` | `forecast_recent_tau_min` | `45` | 1–720 |
 | `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
+| `workStartSharePct` | `FORECAST_WORK_START_SHARE_PCT` | `forecast_work_start_share_pct` | `5` | 1–50 |
 
 How the values are read:
 
@@ -535,7 +536,7 @@ Response:
 - While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
 - The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
 
-`forecastSettings` is always present. It holds the 18 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `sessionTurnoverMin`).
+`forecastSettings` is always present. It holds the 19 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`).
 
 `forecast` is present only while the forecast setting `enabled` is `true`:
 

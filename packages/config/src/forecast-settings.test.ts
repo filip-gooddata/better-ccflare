@@ -46,6 +46,7 @@ const DEFAULTS = {
 	historyLookbackDays: 56,
 	recentTauMin: 45,
 	sessionTurnoverMin: 60,
+	workStartSharePct: 5,
 };
 
 describe("resolveForecastSettings", () => {
@@ -84,6 +85,7 @@ describe("resolveForecastSettings", () => {
 				forecast_history_lookback_days: 28,
 				forecast_recent_tau_min: 30,
 				forecast_session_turnover_min: 90,
+				forecast_work_start_share_pct: 12.5,
 			},
 		);
 		expect(warnings).toEqual([]);
@@ -109,6 +111,7 @@ describe("resolveForecastSettings", () => {
 			historyLookbackDays: 28,
 			recentTauMin: 30,
 			sessionTurnoverMin: 90,
+			workStartSharePct: 12.5,
 		});
 	});
 
@@ -124,6 +127,7 @@ describe("resolveForecastSettings", () => {
 				FORECAST_CLAUDE_PATH: "/opt/claude",
 				FORECAST_PREWARM_MODEL: "sonnet",
 				FORECAST_RECENT_TAU_MIN: "20",
+				FORECAST_WORK_START_SHARE_PCT: "10",
 			},
 			{
 				forecast_enabled: true,
@@ -135,6 +139,7 @@ describe("resolveForecastSettings", () => {
 				forecast_claude_path: "/usr/bin/claude",
 				forecast_prewarm_model: "haiku",
 				forecast_recent_tau_min: 60,
+				forecast_work_start_share_pct: 20,
 			},
 		);
 		expect(warnings).toEqual([]);
@@ -150,6 +155,7 @@ describe("resolveForecastSettings", () => {
 		expect(settings.claudePath).toBe("/opt/claude");
 		expect(settings.prewarmModel).toBe("sonnet");
 		expect(settings.recentTauMin).toBe(20);
+		expect(settings.workStartSharePct).toBe(10);
 	});
 
 	it("treats an empty environment value as unset", () => {
@@ -193,6 +199,7 @@ describe("resolveForecastSettings", () => {
 			"9999",
 			1440,
 		],
+		["FORECAST_WORK_START_SHARE_PCT", "workStartSharePct", "0", 1, "80", 50],
 	] as const)("clamps %s into its range", (env, field, low, min, high, max) => {
 		expect(resolve({ [env]: low }).settings[field]).toBe(min);
 		const clampedHigh = resolve({ [env]: high });
@@ -228,6 +235,7 @@ describe("resolveForecastSettings", () => {
 				forecast_routing: "yes",
 				forecast_time_shift_min: "15",
 				forecast_transcripts_dir: 42,
+				forecast_work_start_share_pct: "five",
 			},
 		);
 		expect(settings).toEqual(DEFAULTS);
@@ -242,6 +250,7 @@ describe("resolveForecastSettings", () => {
 				'forecast_routing="yes"',
 				'forecast_time_shift_min="15"',
 				"forecast_transcripts_dir=42",
+				'forecast_work_start_share_pct="five"',
 			].sort(),
 		);
 	});
