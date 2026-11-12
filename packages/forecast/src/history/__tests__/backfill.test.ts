@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -654,6 +654,37 @@ describe("resumability", () => {
 		for (const row of store.sorted().filter((r) => r.start >= earlier)) {
 			expect(row).toMatchObject({ units: 0, fableUnits: 0, requests: 0 });
 		}
+	});
+
+	test("rows above a moved cut-over are zeroed even when their transcripts have become unreadable", async () => {
+		await writeCorpus();
+		const earlier = T0 + 3_600_000;
+		const batches = { upsertBatchSize: 10 };
+		const store = new FakeStore();
+		store.failOnUpsertCall = 10;
+		await expect(runTranscriptBackfill(deps(store, batches))).rejects.toThrow();
+		const live = () =>
+			store.sorted().filter((row) => row.requests > 0 || row.units > 0);
+		expect(live().some((row) => row.start >= T0 + 4 * 3_600_000)).toBe(true);
+
+		const locked = ["p1", "p2", "p3"].map((d) => join(dir, d));
+		store.failOnUpsertCall = null;
+		try {
+			for (const path of locked) await chmod(path, 0o000);
+			const result = await runTranscriptBackfill(
+				deps(store, { ...batches, earliestProxyBucket: async () => earlier }),
+			);
+			expect(result.status).toBe("done");
+			expect(result.unreadable).toBe(3);
+			expect(result.cleared).toBeGreaterThan(0);
+		} finally {
+			for (const path of locked) await chmod(path, 0o755);
+		}
+		expect(live().filter((row) => row.start >= earlier)).toEqual([]);
+		expect(live().length).toBeGreaterThan(0);
+		expect(store.meta.get(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			String(earlier),
+		);
 	});
 
 	test("a single very long line is read whole without blocking the event loop", async () => {

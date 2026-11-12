@@ -15,6 +15,7 @@ import type {
 	StoredDemandRow,
 	TokenUsage,
 } from "../types";
+import { BUCKET_MS } from "../types";
 import { bucketStart, demandUnits, isFableUsage } from "../units";
 import { type ScannedLine, scanUsageLine } from "./backfill-scan";
 
@@ -23,6 +24,12 @@ export const TRANSCRIPT_BACKFILL_META_KEY = "transcript_backfill_done";
 /** Cut-over chosen by the first attempt, reused by reruns after an interruption. */
 export const TRANSCRIPT_BACKFILL_CUTOVER_META_KEY =
 	"transcript_backfill_cutover";
+/**
+ * Bucket range `{from, until}` (until exclusive) that any attempt may have
+ * written rows into; set before the rows, so it covers every stored row.
+ */
+export const TRANSCRIPT_BACKFILL_WRITTEN_META_KEY =
+	"transcript_backfill_written";
 
 const DEFAULT_SLICE_BUDGET_MS = 30;
 const DEFAULT_UPSERT_BATCH_SIZE = 500;
@@ -72,7 +79,11 @@ export interface BackfillCounts {
 	responses: number;
 	/** Bucket rows upserted. */
 	rows: number;
-	/** Stale transcript buckets zeroed because the cut-over moved earlier since an interrupted attempt. */
+	/**
+	 * Buckets zeroed because the cut-over moved earlier since an interrupted
+	 * attempt: every bucket that attempt may have written at or after the new
+	 * cut-over, whether or not this run could read its transcripts.
+	 */
 	cleared: number;
 }
 
@@ -190,6 +201,34 @@ async function resolveCutover(deps: TranscriptBackfillDeps): Promise<{
 		return { cutover: stored, source: "resumed", previous: null };
 	}
 	return { cutover: fresh, source, previous: stored };
+}
+
+interface WrittenRange {
+	from: EpochMs;
+	until: EpochMs;
+}
+
+async function readWrittenRange(
+	store: DemandStore,
+): Promise<WrittenRange | null> {
+	const text = await store.getMeta(TRANSCRIPT_BACKFILL_WRITTEN_META_KEY);
+	if (text === null) return null;
+	let value: unknown = null;
+	try {
+		value = JSON.parse(text);
+	} catch {}
+	const range = value as Partial<WrittenRange> | null;
+	if (
+		typeof range?.from !== "number" ||
+		typeof range.until !== "number" ||
+		!Number.isFinite(range.from) ||
+		!Number.isFinite(range.until)
+	) {
+		// Unparseable: assume nothing about where rows are; the caller clears
+		// the whole span between the cut-overs.
+		return { from: Number.NEGATIVE_INFINITY, until: Number.POSITIVE_INFINITY };
+	}
+	return { from: range.from, until: range.until };
 }
 
 class Slicer {
@@ -352,15 +391,12 @@ export async function runTranscriptBackfill(
 	}
 
 	const buckets = new Map<EpochMs, StoredDemandRow>();
-	/** Buckets an earlier attempt may have stored before the cut-over moved earlier. */
-	const stale = new Set<EpochMs>();
 	for (const group of [responses.values(), unkeyed.values()]) {
 		for (const response of group) {
 			await slicer.maybeYield();
 			const start = bucketStart(response.at);
 			if (start >= cutover) {
 				counts.afterCutover++;
-				if (previous !== null && start < previous) stale.add(start);
 				continue;
 			}
 			counts.responses++;
@@ -394,24 +430,32 @@ export async function runTranscriptBackfill(
 		}
 	};
 
+	const written = await readWrittenRange(deps.store);
 	if (previous !== null) {
 		// DemandStore cannot delete; an all-zero row replaces a stale transcript
-		// row and adds nothing to any sum. Only then is the new cut-over kept,
-		// so an interruption here repeats the clearing on the next attempt.
-		const zeroRows = [...stale]
-			.sort((a, b) => a - b)
-			.map(
-				(start): StoredDemandRow => ({
-					start,
-					accountId: "",
-					source: "transcript",
-					units: 0,
-					fableUnits: 0,
-					requests: 0,
-				}),
-			);
-		await upsertAll(zeroRows);
-		counts.cleared = zeroRows.length;
+		// row and adds nothing to any sum. The span comes from the recorded
+		// written range, not from this run's scan, so a transcript that has
+		// become unreadable cannot leave its old rows behind. Only after the
+		// clearing is the new cut-over kept, so an interruption repeats it.
+		const from = Math.max(cutover, written?.from ?? previous);
+		const until = Math.min(previous, written?.until ?? cutover);
+		let batch: StoredDemandRow[] = [];
+		for (let start = from; start < until; start += BUCKET_MS) {
+			batch.push({
+				start,
+				accountId: "",
+				source: "transcript",
+				units: 0,
+				fableUnits: 0,
+				requests: 0,
+			});
+			counts.cleared++;
+			if (batch.length >= batchSize) {
+				await upsertAll(batch);
+				batch = [];
+			}
+		}
+		await upsertAll(batch);
 		await deps.store.setMeta(
 			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
 			String(cutover),
@@ -421,6 +465,20 @@ export async function runTranscriptBackfill(
 	// Rows replace by (start, accountId, source) and each holds its bucket's
 	// full total, so a rerun after an interruption rewrites the same values.
 	const rows = [...buckets.values()].sort((a, b) => a.start - b.start);
+	const first = rows[0];
+	const last = rows.at(-1);
+	if (first !== undefined && last !== undefined) {
+		const span: WrittenRange = {
+			from: Math.min(first.start, written?.from ?? first.start),
+			until: Math.max(last.start + BUCKET_MS, written?.until ?? 0),
+		};
+		if (span.from !== written?.from || span.until !== written?.until) {
+			await deps.store.setMeta(
+				TRANSCRIPT_BACKFILL_WRITTEN_META_KEY,
+				JSON.stringify(span),
+			);
+		}
+	}
 	await upsertAll(rows);
 	counts.rows = rows.length;
 
