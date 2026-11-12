@@ -26,9 +26,11 @@ export const SESSION_PACE_RECENT_PICK_WINDOW_MS = 500;
 /**
  * After a session is placed on an account with no running 5-hour window, or
  * the account serves a response, the open-session rule leaves that account
- * alone this long. The strategy cannot see when usage data was fetched; usage
- * is polled every 90 s ±20% (at most 108 s apart), so after this hold the
- * data has been refreshed at least once since the window should have opened.
+ * alone this long. The strategy cannot see when usage data was fetched. With
+ * the default poll (90 s ±20%, at most 108 s plus the fetch itself) the data
+ * has usually been refreshed by then; a longer configured interval, a slow
+ * fetch or a failure backoff can leave it older, and the rule then applies
+ * again on data that predates the window.
  */
 export const SESSION_PACE_OPEN_SESSION_HOLD_MS = 120_000;
 
@@ -258,7 +260,7 @@ interface Plan {
 	/** Set when this request places the session fresh (no live mapping used). */
 	placement: { rule: Rule; reason: string } | null;
 	/** Set when the family guard demoted the session's mapped account. */
-	familyMove: { fromName: string } | null;
+	familyMove: { fromName: string; rule: Rule; reason: string } | null;
 	family: string | null;
 	candidates: Candidate[];
 }
@@ -337,12 +339,15 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		const clientId = meta.clientSessionId || null;
 		const first = plan.ordered[0];
 
-		if (plan.placement) {
-			this.lastPickedAt.set(first.id, now);
-			this.lastPickSeq.set(first.id, ++this.pickSeq);
+		if (plan.placement || plan.familyMove) {
 			const placed = plan.candidates.find((c) => c.account.id === first.id);
 			if (placed?.fiveHourState === "not-running")
 				this.holdOpenSession(first.id, now);
+		}
+
+		if (plan.placement) {
+			this.lastPickedAt.set(first.id, now);
+			this.lastPickSeq.set(first.id, ++this.pickSeq);
 			if (clientId !== null) {
 				const previous = this.sessions.get(clientId);
 				const live = previous && !this.isExpired(previous, now);
@@ -362,7 +367,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 					// mapping until another account serves (onRequestServed).
 					this.touch(clientId, previous, now);
 					this.log.info(
-						`session-pace failover-order session=${sessionLogTag(clientId)} mapped=${previous.accountName} unavailable next=${first.name} rule=${plan.placement.rule} ${this.describe(plan.candidates, plan.family)}`,
+						`session-pace failover-order session=${sessionLogTag(clientId)} mapped=${previous.accountName} unavailable next=${first.name} rule=${plan.placement.rule} reason=${plan.placement.reason} ${this.describe(plan.candidates, plan.family)}`,
 					);
 				}
 			}
@@ -371,7 +376,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			if (mapping) this.touch(clientId, mapping, now);
 			if (plan.familyMove) {
 				this.log.info(
-					`session-pace family-guard demotes session=${sessionLogTag(clientId)} from=${plan.familyMove.fromName} next=${first.name} family=${plan.family} ${this.describe(plan.candidates, plan.family)}`,
+					`session-pace family-guard demotes session=${sessionLogTag(clientId)} from=${plan.familyMove.fromName} next=${first.name} rule=${plan.familyMove.rule} reason=${plan.familyMove.reason} family=${plan.family} ${this.describe(plan.candidates, plan.family)}`,
 				);
 			}
 		}
@@ -448,7 +453,12 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 					return {
 						ordered: [...movers, ...rest].map((c) => c.account),
 						placement: null,
-						familyMove: { fromName: mapped.account.name },
+						familyMove: {
+							fromName: mapped.account.name,
+							...(movers.length > 1
+								? this.decidingRule(movers[0], movers[1])
+								: { rule: "only-candidate" as const, reason: "single" }),
+						},
 						family,
 						candidates,
 					};

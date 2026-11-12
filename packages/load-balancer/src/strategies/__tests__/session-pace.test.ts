@@ -1131,6 +1131,33 @@ describe("SessionPaceStrategy", () => {
 			).toEqual(["c", "b", "a"]);
 		});
 
+		it("holds the account after a family-guard move and names the rule in the move line", () => {
+			const lines = captureLines();
+			const c = makeAccount("c");
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 50);
+			store.setWeeklyDeficit("b", 30);
+			store.setFiveHour("b", 50);
+			store.setWeeklyDeficit("c", -20);
+			store.setFiveHour("c", 50);
+			strategy.select([a, b, c], meta("s1"));
+			setSystemTime(new Date(NOW + 1_000));
+			strategy.select([a, b, c], meta("s2"));
+			expect(lines).toHaveLength(2);
+			store.setFamily("a", "opus", 95);
+			setNoWindow("c");
+			setSystemTime(new Date(NOW + 60_000));
+			expect(
+				strategy.select([a, b, c], meta("s1", "claude-opus-5-5"))[0].id,
+			).toBe("c");
+			expect(lines[2]).toContain(
+				"session-pace family-guard demotes session=s1 from=a next=c rule=open-session reason=no-five-hour-window",
+			);
+			expect(
+				strategy.select([a, b, c], meta("s2", "claude-opus-5-5"))[0].id,
+			).toBe("b");
+		});
+
 		it("peek follows the rule without taking the account out", () => {
 			store.setWeeklyDeficit("a", 40);
 			store.setFiveHour("a", 84);
