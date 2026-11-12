@@ -42,8 +42,10 @@ function count(n: number | null): number {
 }
 
 /**
- * Cache writes with an unknown split count at the 1-hour weight, as does the
- * part of cacheWriteTokens a known split leaves unaccounted for.
+ * Cache writes with an unknown split (both split fields null) count at the
+ * 1-hour weight. A split with either field set is authoritative: a null side
+ * counts as 0, a split above cacheWriteTokens counts as reported, and the part
+ * of cacheWriteTokens a split leaves unaccounted for counts at the 1-hour weight.
  */
 export function demandUnits(usage: TokenUsage): number {
 	const cacheWrite = count(usage.cacheWriteTokens);

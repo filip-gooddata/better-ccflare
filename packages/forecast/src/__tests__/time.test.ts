@@ -155,3 +155,52 @@ describe("invariants over a year", () => {
 		});
 	}
 });
+
+describe("Australia/Lord_Howe, half-hour DST shift", () => {
+	const LH = "Australia/Lord_Howe";
+
+	test("2026-10-04: 02:00–02:30 is skipped and moves forward", () => {
+		const dayStart = z("2026-10-03T13:30:00Z"); // 00:00 at +10:30
+		expect(localDayStart(z("2026-10-04T05:00:00Z"), LH)).toBe(dayStart);
+		expect(addLocalDays(dayStart, 1, LH) - dayStart).toBe(23.5 * H);
+		expect(atLocalMinute(dayStart, 135, LH)).toBe(z("2026-10-03T15:45:00Z"));
+		expect(atLocalMinute(dayStart, 150, LH)).toBe(z("2026-10-03T15:30:00Z"));
+	});
+
+	test("2026-04-05: 01:30–02:00 repeats and resolves to the earlier one", () => {
+		const dayStart = z("2026-04-04T13:00:00Z"); // 00:00 at +11:00
+		expect(localDayStart(z("2026-04-05T05:00:00Z"), LH)).toBe(dayStart);
+		expect(addLocalDays(dayStart, 1, LH) - dayStart).toBe(24.5 * H);
+		expect(atLocalMinute(dayStart, 105, LH)).toBe(z("2026-04-04T14:45:00Z"));
+		expect(localParts(z("2026-04-04T15:15:00Z"), LH).minuteOfDay).toBe(105);
+	});
+});
+
+describe("America/Santiago, skipped local midnight on 2026-09-06", () => {
+	const SCL = "America/Santiago";
+	const dayStart = z("2026-09-06T04:00:00Z"); // 01:00 at -03, 00:00–01:00 skipped
+
+	test("the day starts at the first instant with that date", () => {
+		expect(localDayStart(z("2026-09-06T15:00:00Z"), SCL)).toBe(dayStart);
+		expect(localParts(dayStart, SCL).minuteOfDay).toBe(60);
+		expect(localDayKey(dayStart, SCL)).toBe("2026-09-06");
+		expect(localDayKey(dayStart - 1000, SCL)).toBe("2026-09-05");
+		expect(addLocalDays(z("2026-09-05T04:00:00Z"), 1, SCL)).toBe(dayStart);
+		expect(addLocalDays(dayStart, -1, SCL)).toBe(z("2026-09-05T04:00:00Z"));
+	});
+
+	test("a skipped minute moves forward by the gap", () => {
+		expect(atLocalMinute(dayStart, 30, SCL)).toBe(z("2026-09-06T04:30:00Z"));
+		expect(atLocalMinute(dayStart, 0, SCL)).toBe(dayStart);
+	});
+});
+
+describe("atLocalMinute input range", () => {
+	test("rejects minutes outside 0..1439 and non-integers", () => {
+		const day = z("2026-11-12T00:00:00Z");
+		for (const bad of [-1, 1440, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			expect(() => atLocalMinute(day, bad, UTC)).toThrow(RangeError);
+		}
+		expect(atLocalMinute(day, 0, UTC)).toBe(day);
+	});
+});

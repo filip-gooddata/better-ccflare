@@ -142,14 +142,20 @@ export function localDayKey(at: EpochMs, timeZone: string): string {
 
 /**
  * The instant the wall clock reads minuteOfDay on the local day containing
- * dayStart. A repeated minute resolves to its earlier instant; a skipped
- * minute moves forward by the length of the gap.
+ * dayStart. minuteOfDay must be an integer in 0..1439 (RangeError otherwise).
+ * A repeated minute (clocks set back) resolves to its earlier instant, which
+ * may already be past when the later one is not; a skipped minute moves
+ * forward by the length of the gap. Assumes at most one offset change within
+ * a day of the minute, true of every zone in use today. Identify buckets by
+ * epoch ms: two instants can share one local minute.
  */
 export function atLocalMinute(
 	dayStart: EpochMs,
 	minuteOfDay: number,
 	timeZone: string,
 ): EpochMs {
+	if (!Number.isInteger(minuteOfDay) || minuteOfDay < 0 || minuteOfDay > 1439)
+		throw new RangeError(`minuteOfDay out of range: ${minuteOfDay}`);
 	return instantOfWall(
 		timeZone,
 		localDayUtc(timeZone, dayStart) + minuteOfDay * 60_000,

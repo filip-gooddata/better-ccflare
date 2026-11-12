@@ -185,3 +185,30 @@ describe("bucketStart", () => {
 		expect(bucketStart(now)).toBe(Date.UTC(2026, 10, 12, 9, 45));
 	});
 });
+
+describe("demandUnits cache-write split policy", () => {
+	test("a split with the 5-minute side null treats it as zero", () => {
+		// 1h: 300k×2, remainder 700k×2 = 2M
+		expect(
+			demandUnits(
+				usage({
+					cacheWriteTokens: 1_000_000,
+					cacheWrite5mTokens: null,
+					cacheWrite1hTokens: 300_000,
+				}),
+			),
+		).toBeCloseTo(2, 12);
+	});
+
+	test("a split above cacheWriteTokens is counted as reported", () => {
+		expect(
+			demandUnits(
+				usage({
+					cacheWriteTokens: 0,
+					cacheWrite5mTokens: 1_000_000,
+					cacheWrite1hTokens: 1_000_000,
+				}),
+			),
+		).toBeCloseTo(3.25, 12);
+	});
+});
