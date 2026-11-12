@@ -302,8 +302,14 @@ export async function planForecast(ctx: EngineContext): Promise<{
 				at,
 				evaluated: await evaluate(withOpening(baseline.plan, j, at)),
 			});
-		singles.sort((x, y) => compareScores(x.evaluated.score, y.evaluated.score));
-		beams.push([null, ...singles.slice(0, OPENING_BEAM).map((x) => x.at)]);
+		beams.push([
+			null,
+			...openingBeam(
+				singles.map((x) => ({ at: x.at, score: x.evaluated.score })),
+				baseline.score,
+				openMin,
+			),
+		]);
 	}
 	let bestOpening: Evaluated | null = null;
 	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
@@ -326,11 +332,18 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		if (better(candidate, best)) best = candidate;
 	}
 
-	// An opening stays only while it still earns its place (openingEarns) in the final combination.
-	for (const j of closed) {
-		if (best.plan.openAt[j] == null) continue;
-		const without = await evaluate(withOpening(best.plan, j, null));
-		if (!openingEarns(best.score, without.score, openMin)) best = without;
+	// An opening stays only while it still earns its place (openingEarns) in the final combination;
+	// dropping one can change what another earns, so repeat until nothing drops.
+	for (let dropped = true; dropped; ) {
+		dropped = false;
+		for (const j of closed) {
+			if (best.plan.openAt[j] == null) continue;
+			const without = await evaluate(withOpening(best.plan, j, null));
+			if (!openingEarns(best.score, without.score, openMin)) {
+				best = without;
+				dropped = true;
+			}
+		}
 	}
 
 	// 3. At most one move of one warm live session; it pays its move cost inside the simulation.
@@ -443,7 +456,11 @@ function placementOf(
 	let reason: string;
 	const ahead =
 		plannedAt != null
-			? openingReason(gain, stopGainMinutes(top, baseline.score))
+			? openingReason(
+					gain,
+					stopGainMinutes(top, baseline.score),
+					ctx.input.settings.openMinGainPoints,
+				)
 			: null;
 	if (ahead) reason = ahead;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
@@ -459,18 +476,43 @@ function placementOf(
 
 /**
  * Reason token for a placement whose first account the plan opens ahead of need: `open-ahead+<points>`
- * for a gain of score item 1, else `open-ahead-stop-<minutes>min` for heavy stop minutes cut (amendment
- * A2(b)); null when neither gain is worth naming.
+ * when score item 1 gains `openMinGainPoints` (rule a), else `open-ahead-stop-<minutes>min` when the heavy
+ * stop minutes fall by OPEN_MIN_STOP_GAIN_MIN (rule b), else `open-ahead+<points>` for a smaller gain
+ * still worth naming; null otherwise.
  */
 export function openingReason(
 	gainPoints: number,
 	stopGainMin: number,
+	openMinGainPoints: number,
 ): string | null {
-	if (gainPoints >= REASON_MIN_GAIN_POINTS)
-		return `open-ahead+${gainPoints.toFixed(1)}`;
+	const points = `open-ahead+${gainPoints.toFixed(1)}`;
+	if (gainPoints >= openMinGainPoints && gainPoints >= REASON_MIN_GAIN_POINTS)
+		return points;
 	if (stopGainMin >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS)
 		return `open-ahead-stop-${Math.round(stopGainMin)}min`;
-	return null;
+	return gainPoints >= REASON_MIN_GAIN_POINTS ? points : null;
+}
+
+/**
+ * Best single openings of one closed account carried into the combination search: the OPENING_BEAM
+ * best by score, except that the last place goes to the best opening that earns its place alone
+ * (openingEarns) when none of the others does; a tie that shortens the heavy stop may rank below
+ * openings that raise item 1 too little to count.
+ */
+export function openingBeam(
+	singles: { at: EpochMs; score: PlanScore }[],
+	baseline: PlanScore,
+	openMinGainPoints: number,
+): EpochMs[] {
+	const sorted = [...singles].sort((x, y) => compareScores(x.score, y.score));
+	const beam = sorted.slice(0, OPENING_BEAM);
+	const earns = (x: { score: PlanScore }) =>
+		openingEarns(x.score, baseline, openMinGainPoints);
+	if (beam.length === OPENING_BEAM && !beam.some(earns)) {
+		const earner = sorted.slice(OPENING_BEAM).find(earns);
+		if (earner) beam[OPENING_BEAM - 1] = earner;
+	}
+	return beam.map((x) => x.at);
 }
 
 /** Cartesian product of the choices, or only the one-change-at-a-time rows when it exceeds `limit`. */
