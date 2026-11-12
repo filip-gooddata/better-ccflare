@@ -299,6 +299,49 @@ describe("UsageCollector - served usage sink", () => {
 		expect(events).toHaveLength(0);
 	});
 
+	test("stream: no event when frames carry a model but no usage", async () => {
+		const { c, events, saves } = setup();
+		const body = [
+			"event: message_start",
+			`data: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5" } })}`,
+			"",
+			"event: message_stop",
+			`data: {"type":"message_stop"}`,
+			"",
+		].join("\n");
+		await runStream(c, "sse-model-only", body);
+		expect(saves.map((s) => s.requestId)).toEqual(["sse-model-only"]);
+		expect(events).toHaveLength(0);
+	});
+
+	test("stream: takes the split from a generic usage frame", async () => {
+		const { c, events } = setup();
+		const body = [
+			"event: message_start",
+			`data: ${JSON.stringify({ type: "message_start", message: { model: "claude-opus-5-5" } })}`,
+			"",
+			"event: usage",
+			`data: ${JSON.stringify({
+				type: "usage",
+				usage: {
+					input_tokens: 5,
+					output_tokens: 9,
+					cache_creation_input_tokens: 300,
+					cache_creation: {
+						ephemeral_5m_input_tokens: 100,
+						ephemeral_1h_input_tokens: 200,
+					},
+				},
+			})}`,
+			"",
+		].join("\n");
+		await runStream(c, "sse-generic", body);
+		expect(events).toHaveLength(1);
+		expect(events[0].usage.cacheWriteTokens).toBe(300);
+		expect(events[0].usage.cacheWrite5mTokens).toBe(100);
+		expect(events[0].usage.cacheWrite1hTokens).toBe(200);
+	});
+
 	test("no event without a serving account", async () => {
 		const { c, events } = setup();
 		await runJson(c, "no-account", jsonBody(fullSplit), {

@@ -52,6 +52,8 @@ interface RequestState {
 		cacheCreation5mInputTokens?: number | null;
 		/** 1-hour part of cacheCreationInputTokens; null when not reported. */
 		cacheCreation1hInputTokens?: number | null;
+		/** The provider reported at least one token count (not a default). */
+		reported?: boolean;
 		outputTokens?: number;
 		outputTokensComputed?: number;
 		totalTokens?: number;
@@ -247,6 +249,22 @@ function recordCacheCreationSplit(usage: unknown, state: RequestState): void {
 	);
 }
 
+const REPORTED_TOKEN_FIELDS = [
+	"input_tokens",
+	"output_tokens",
+	"cache_read_input_tokens",
+	"cache_creation_input_tokens",
+] as const;
+
+/** Marks the request as having provider-reported token usage. */
+function noteReportedUsage(usage: unknown, state: RequestState): void {
+	if (!usage || typeof usage !== "object") return;
+	const fields = usage as Record<string, unknown>;
+	if (REPORTED_TOKEN_FIELDS.some((key) => typeof fields[key] === "number")) {
+		state.usage.reported = true;
+	}
+}
+
 // Extract usage data from non-stream JSON response bodies
 function extractUsageFromJson(
 	json: {
@@ -278,6 +296,7 @@ function extractUsageFromJson(
 	const completionTier = reportedCompletionTier(usageObj);
 	if (completionTier) state.usage.completionTier = completionTier;
 
+	noteReportedUsage(usageObj, state);
 	state.usage.inputTokens = usageObj.input_tokens ?? 0;
 	state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens ?? 0;
 	state.usage.cacheCreationInputTokens =
@@ -331,6 +350,7 @@ function extractUsageFromData(
 		if (isMessageStart) {
 			if (parsed.message?.usage) {
 				const usage = parsed.message.usage;
+				noteReportedUsage(usage, state);
 				state.usage.inputTokens = usage.input_tokens || 0;
 				state.usage.cacheReadInputTokens = usage.cache_read_input_tokens || 0;
 				state.usage.cacheCreationInputTokens =
@@ -355,6 +375,7 @@ function extractUsageFromData(
 			state.lastTokenTimestamp = Date.now();
 
 			if (parsed.usage) {
+				noteReportedUsage(parsed.usage, state);
 				// Update all token counts from message_delta (authoritative for zai)
 				if (parsed.usage.output_tokens !== undefined) {
 					state.providerFinalOutputTokens = parsed.usage.output_tokens;
@@ -389,6 +410,7 @@ function extractUsageFromData(
 			}
 			const usage = parsed.response.usage;
 			if (usage) {
+				noteReportedUsage(usage, state);
 				const cachedTokens =
 					typeof usage.input_tokens_details?.cached_tokens === "number"
 						? usage.input_tokens_details.cached_tokens
@@ -420,6 +442,7 @@ function extractUsageFromData(
 
 		// Handle any usage field in the data
 		if (parsed.usage) {
+			noteReportedUsage(parsed.usage, state);
 			if (parsed.usage.input_tokens !== undefined) {
 				state.usage.inputTokens = parsed.usage.input_tokens;
 			}
@@ -1189,12 +1212,7 @@ export class UsageCollector {
 		const sessionId = startMessage.clientSessionId;
 		const accountId = startMessage.accountId;
 		if (!sessionId || !accountId || accountId === NO_ACCOUNT_ID) return;
-		const hasUsage =
-			usage.inputTokens !== undefined ||
-			usage.outputTokens !== undefined ||
-			usage.cacheReadInputTokens !== undefined ||
-			usage.cacheCreationInputTokens !== undefined;
-		if (!hasUsage) return;
+		if (!usage.reported) return;
 		try {
 			sink({
 				sessionId,
