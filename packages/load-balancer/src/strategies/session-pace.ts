@@ -3,6 +3,11 @@ import {
 	isAccountAvailable,
 	probeBackoffRank,
 } from "@better-ccflare/core";
+import type {
+	ForecastAdvisor,
+	MoveAdvice,
+	PlacementAdvice,
+} from "@better-ccflare/forecast";
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
@@ -236,6 +241,8 @@ interface Candidate {
 	familyUtil: number | null;
 	familyGuarded: boolean;
 	hasUsage: boolean;
+	/** 5-hour or weekly limit used up with its reset ahead (forecast hard filter). */
+	out: boolean;
 }
 
 interface Mapping {
@@ -257,12 +264,18 @@ type Rule =
 	| "cold-start"
 	| "account-id";
 
+type ForecastStep =
+	| { kind: "place"; advice: PlacementAdvice }
+	| { kind: "move"; advice: MoveAdvice; fromName: string; toName: string };
+
 interface Plan {
 	ordered: Account[];
 	/** Set when this request places the session fresh (no live mapping used). */
-	placement: { rule: Rule; reason: string } | null;
+	placement: { rule: Rule | PlacementAdvice["rule"]; reason: string } | null;
 	/** Set when the family guard demoted the session's mapped account. */
 	familyMove: { fromName: string; rule: Rule; reason: string } | null;
+	/** Set when the forecast advisor placed (new or cold session) or moved the session. */
+	forecast: ForecastStep | null;
 	family: string | null;
 	candidates: Candidate[];
 }
@@ -272,6 +285,14 @@ interface RoutedRequest {
 	family: string | null;
 	familyMove: boolean;
 	candidates: Candidate[];
+	/** The forecast placement or move this request carries, and its advised account. */
+	forecast: { kind: "place" | "move"; accountId: string } | null;
+}
+
+const ADVISOR_ERROR_LOG_INTERVAL_MS = 60_000;
+
+function points(n: number): string {
+	return Number.isFinite(n) ? n.toFixed(1) : String(n);
 }
 
 /**
@@ -321,6 +342,8 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 	/** Per account: until when the open-session rule leaves it alone. */
 	private openSessionHeldUntil = new Map<string, number>();
 	private routed = new WeakMap<RequestMeta, RoutedRequest>();
+	private advisor: ForecastAdvisor | null = null;
+	private advisorErrorLoggedAt = Number.NEGATIVE_INFINITY;
 
 	/** `internal.timeZone` replaces the process's local zone (tests). */
 	constructor(
@@ -336,6 +359,14 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 	initialize(store: StrategyStore): void {
 		this.store = store;
+	}
+
+	/**
+	 * Route by the interruption forecast. Without an advisor, or when it
+	 * gives no advice or throws, the strategy behaves exactly as before.
+	 */
+	setForecastAdvisor(advisor: ForecastAdvisor | null): void {
+		this.advisor = advisor;
 	}
 
 	peek(accounts: Account[], meta?: RequestMeta): string | null {
@@ -361,7 +392,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		const clientId = meta.clientSessionId || null;
 		const first = plan.ordered[0];
 
-		if (plan.placement || plan.familyMove) {
+		if (plan.placement || plan.familyMove || plan.forecast?.kind === "move") {
 			const placed = plan.candidates.find((c) => c.account.id === first.id);
 			if (placed?.fiveHourState === "not-running")
 				this.holdOpenSession(first.id, now);
@@ -380,7 +411,8 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			if (clientId !== null) {
 				const previous = this.sessions.get(clientId);
 				const live = previous && !this.isExpired(previous, now);
-				if (!live) {
+				// A forecast placement of a mapped session re-places a cold one.
+				if (!live || plan.forecast?.kind === "place") {
 					this.sessions.delete(clientId);
 					this.evictOldestIfFull();
 					this.sessions.set(clientId, {
@@ -408,6 +440,12 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 					`session-pace family-guard demotes session=${sessionLogTag(clientId)} from=${plan.familyMove.fromName} next=${first.name} rule=${plan.familyMove.rule} reason=${plan.familyMove.reason} family=${plan.family} ${this.describe(plan.candidates, plan.family)}`,
 				);
 			}
+			if (plan.forecast?.kind === "move") {
+				const { advice, fromName, toName } = plan.forecast;
+				this.log.info(
+					`session-pace move session=${sessionLogTag(clientId)} from=${fromName} to=${toName} rule=${advice.rule} reason=${advice.reason} gain=${points(advice.gainPoints)} cost=${points(advice.costPoints)}`,
+				);
+			}
 		}
 
 		this.routed.set(meta, {
@@ -415,6 +453,10 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			family: plan.family,
 			familyMove: plan.familyMove !== null,
 			candidates: plan.candidates,
+			forecast:
+				plan.forecast && clientId !== null
+					? { kind: plan.forecast.kind, accountId: first.id }
+					: null,
 		});
 		return plan.ordered;
 	}
@@ -428,19 +470,30 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		const now = Date.now();
 		this.holdOpenSession(account.id, now);
 		if (routed.clientId === null) return;
-		const mapping = this.sessions.get(routed.clientId);
+		const clientId = routed.clientId;
+		const advised =
+			routed.forecast && routed.forecast.accountId === account.id
+				? routed.forecast
+				: null;
+		const mapping = this.sessions.get(clientId);
 		if (mapping && mapping.accountId === account.id) {
-			this.touch(routed.clientId, mapping, now);
+			this.touch(clientId, mapping, now);
+			if (advised) this.notifyApplied(advised.kind, clientId, account.id, now);
 			return;
 		}
 		const fromName = mapping?.accountName ?? "none";
-		this.sessions.delete(routed.clientId);
+		this.sessions.delete(clientId);
 		this.evictOldestIfFull();
-		this.sessions.set(routed.clientId, {
+		this.sessions.set(clientId, {
 			accountId: account.id,
 			accountName: account.name,
 			lastSeenAt: now,
 		});
+		if (advised) {
+			// The move line was logged when the request was routed.
+			this.notifyApplied(advised.kind, clientId, account.id, now);
+			return;
+		}
 		const rule = routed.familyMove ? "family-guard" : "failover";
 		this.log.info(
 			`session-pace rebind session=${sessionLogTag(routed.clientId)} from=${fromName} to=${account.name} rule=${rule} ${this.describe(routed.candidates, routed.family)}`,
@@ -466,10 +519,39 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 		const clientId = meta?.clientSessionId || null;
 		const mapping = clientId !== null ? this.sessions.get(clientId) : undefined;
-		const mapped =
-			mapping && !this.isExpired(mapping, now)
-				? byId.get(mapping.accountId)
-				: undefined;
+		const liveMapping =
+			mapping && !this.isExpired(mapping, now) ? mapping : undefined;
+		const mapped = liveMapping ? byId.get(liveMapping.accountId) : undefined;
+
+		// Forecast routing applies to client sessions only: a new session, or
+		// a mapped one whose cache has gone cold, is placed by the advice.
+		const advising = this.advisor !== null && clientId !== null;
+		const cold =
+			advising &&
+			clientId !== null &&
+			liveMapping !== undefined &&
+			this.isCold(clientId, liveMapping, now);
+		if (advising && (!liveMapping || cold)) {
+			const advised = this.forecastPlacement(sorted, candidates, now);
+			if (advised) {
+				const landsElsewhere =
+					liveMapping !== undefined &&
+					advised.order[0].account.id !== liveMapping.accountId;
+				return {
+					ordered: advised.order.map((c) => c.account),
+					placement: {
+						rule: advised.advice.rule,
+						reason: landsElsewhere
+							? `cold:${advised.advice.reason}`
+							: advised.advice.reason,
+					},
+					familyMove: null,
+					forecast: { kind: "place", advice: advised.advice },
+					family,
+					candidates,
+				};
+			}
+		}
 
 		if (mapped) {
 			if (family !== null && mapped.familyGuarded) {
@@ -488,10 +570,34 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 								? this.decidingRule(movers[0], movers[1])
 								: { rule: "only-candidate" as const, reason: "single" }),
 						},
+						forecast: null,
 						family,
 						candidates,
 					};
 				}
+			}
+			const target =
+				advising && !cold && clientId !== null
+					? this.forecastMoveTarget(clientId, mapped, byId, now)
+					: null;
+			if (target) {
+				return {
+					ordered: [
+						target.candidate,
+						mapped,
+						...sorted.filter((c) => c !== mapped && c !== target.candidate),
+					].map((c) => c.account),
+					placement: null,
+					familyMove: null,
+					forecast: {
+						kind: "move",
+						advice: target.advice,
+						fromName: mapped.account.name,
+						toName: target.candidate.account.name,
+					},
+					family,
+					candidates,
+				};
 			}
 			return {
 				ordered: [mapped, ...sorted.filter((c) => c !== mapped)].map(
@@ -499,6 +605,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 				),
 				placement: null,
 				familyMove: null,
+				forecast: null,
 				family,
 				candidates,
 			};
@@ -509,9 +616,93 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			ordered: order.map((c) => c.account),
 			placement: { rule, reason },
 			familyMove: null,
+			forecast: null,
 			family,
 			candidates,
 		};
+	}
+
+	/** Advisor call that never throws: a failure counts as no advice. */
+	private ask<T>(call: (advisor: ForecastAdvisor) => T): T | null {
+		const advisor = this.advisor;
+		if (advisor === null) return null;
+		try {
+			return call(advisor) ?? null;
+		} catch (error) {
+			const now = Date.now();
+			if (now - this.advisorErrorLoggedAt >= ADVISOR_ERROR_LOG_INTERVAL_MS) {
+				this.advisorErrorLoggedAt = now;
+				this.log.warn(
+					`session-pace forecast advisor failed, using session-pace rules: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+			return null;
+		}
+	}
+
+	/** Mapped and live by idleMs, but its cache lifetime (unknown: idleMs) has passed. */
+	private isCold(clientId: string, mapping: Mapping, now: number): boolean {
+		const ttl = this.ask((a) => a.cacheTtlMs(clientId));
+		const lifetime =
+			ttl !== null && Number.isFinite(ttl) && ttl >= 0
+				? ttl
+				: this.options.idleMs;
+		return now - mapping.lastSeenAt >= lifetime;
+	}
+
+	/**
+	 * New or cold session under forecast advice. Hard filters first: the best
+	 * probe-backoff rank, the family guard, never an account that is out. The
+	 * first tier holding a filtered candidate wins; inside it today's ranking
+	 * decides. The 5-hour guard is no filter here, only a tie-break in a tier.
+	 */
+	private forecastPlacement(
+		sorted: Candidate[],
+		all: Candidate[],
+		now: number,
+	): { order: Candidate[]; advice: PlacementAdvice } | null {
+		const advice = this.ask((a) => a.placeNewSession(now));
+		if (advice === null || !Array.isArray(advice.tiers)) return null;
+		const bestRank = Math.min(...sorted.map((c) => c.probeRank));
+		const eligible = sorted.filter(
+			(c) => c.probeRank === bestRank && !c.familyGuarded && !c.out,
+		);
+		for (const tier of advice.tiers) {
+			const ids = new Set(tier);
+			const inTier = eligible.filter((c) => ids.has(c.account.id));
+			if (inTier.length === 0) continue;
+			const { order } = this.placeNew(inTier, all, now);
+			return {
+				order: [...order, ...sorted.filter((c) => !order.includes(c))],
+				advice,
+			};
+		}
+		return null;
+	}
+
+	/** A planned move of a live session, if its target may take it. */
+	private forecastMoveTarget(
+		clientId: string,
+		mapped: Candidate,
+		byId: Map<string, Candidate>,
+		now: number,
+	): { candidate: Candidate; advice: MoveAdvice } | null {
+		const advice = this.ask((a) => a.moveFor(clientId, now));
+		if (advice === null) return null;
+		if (advice.from !== mapped.account.id || advice.to === advice.from)
+			return null;
+		const candidate = byId.get(advice.to);
+		if (!candidate || candidate.out || candidate.familyGuarded) return null;
+		return { candidate, advice };
+	}
+
+	private notifyApplied(
+		kind: "place" | "move",
+		clientId: string,
+		accountId: string,
+		now: number,
+	): void {
+		this.ask((a) => a.applied(kind, clientId, accountId, now));
 	}
 
 	private placeNew(
@@ -674,6 +865,12 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 			familyGuarded:
 				familyUtil !== null && familyUtil >= this.options.familyGuardPct,
 			hasUsage: weekly !== null || fiveHour !== null,
+			out:
+				(fiveHourLive !== null && fiveHourLive >= 100) ||
+				(weekly !== null &&
+					weekly.resetsAt !== null &&
+					weekly.resetsAt > now &&
+					weekly.utilization >= 100),
 		};
 	}
 
