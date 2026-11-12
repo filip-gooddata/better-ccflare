@@ -3,6 +3,7 @@ export {
 	LeastUsedStrategy,
 	localTimeZone,
 	SESSION_PACE_DEFAULTS,
+	SESSION_PACE_OPEN_SESSION_HOLD_MS,
 	SESSION_PACE_RECENT_PICK_WINDOW_MS,
 	SessionAffinityStrategy,
 	SessionDrainSoonestStrategy,
