@@ -22,7 +22,10 @@ import {
 	DAY_FACTOR_MAX,
 	DAY_FACTOR_MIN,
 	dayFactor,
+	resolveNoiseMode,
 	scaleBandwidth,
+	scaleKernel,
+	scaleLogShift,
 } from "../scenarios";
 
 const TZ = "Europe/Prague";
@@ -593,5 +596,166 @@ describe("buildScenarios", () => {
 		expect(horizon.simEnd - NOW).toBe(7 * DAY);
 		// design target: no slice much longer than 25 ms; slack for a loaded machine
 		expect(longest).toBeLessThan(40);
+	});
+});
+
+/** Weighted moments of the log totals of a pool's positive days, weights as the draw uses them. */
+function weightedLogMoments(pool: RecordedDay[]): {
+	m: number;
+	s2: number;
+	mu4: number;
+} {
+	const kept = pool.filter((d) => d.total > 0);
+	const sw = kept.reduce((a, d) => a + d.weight, 0);
+	const m = kept.reduce((a, d) => a + d.weight * Math.log(d.total), 0) / sw;
+	const moment = (p: number) =>
+		kept.reduce((a, d) => a + d.weight * (Math.log(d.total) - m) ** p, 0) / sw;
+	return { m, s2: moment(2), mu4: moment(4) };
+}
+
+describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", () => {
+	test("scaleKernel: weighted mean and variance of the log totals, zero-total days left out, h unchanged", () => {
+		const pool = poolOfTotals([0, 1, 2, 4, 8, 16]);
+		pool.forEach((d, i) => {
+			d.weight = 0.5 ** i;
+		});
+		const k = scaleKernel(pool);
+		const { m, s2 } = weightedLogMoments(pool);
+		expect(k.mean).toBeCloseTo(m, 12);
+		expect(k.variance).toBeCloseTo(s2, 12);
+		expect(k.bandwidth).toBe(scaleBandwidth(pool));
+		// only zero days: no log statistics at all
+		expect(scaleKernel(poolOfTotals([0, 0]))).toEqual({
+			bandwidth: 0,
+			mean: 0,
+			variance: 0,
+		});
+	});
+
+	test("scaleLogShift: L* − L_I with L* = m + (L_I − m + hε) ÷ √(1 + h²/s²); unshrunk hε; off 0", () => {
+		const k = { bandwidth: 0.5, mean: 1, variance: 0.8 };
+		const L = 2.3;
+		const eps = -0.7;
+		const c = Math.sqrt(1 + 0.25 / 0.8);
+		expect(scaleLogShift(k, L, eps, "shrunk")).toBeCloseTo(
+			1 + (L - 1 + 0.5 * eps) / c - L,
+			12,
+		);
+		expect(scaleLogShift(k, L, eps, "unshrunk")).toBeCloseTo(0.5 * eps, 12);
+		expect(scaleLogShift(k, L, eps, "off")).toBe(0);
+		// no bandwidth: no scale noise in either kernel mode; no spread: none when shrunk
+		for (const mode of ["shrunk", "unshrunk"] as const)
+			expect(scaleLogShift({ ...k, bandwidth: 0 }, L, eps, mode)).toBe(0);
+		expect(scaleLogShift({ ...k, variance: 0 }, L, eps, "shrunk")).toBe(0);
+	});
+
+	test("resolveNoiseMode: noise true or absent = shrunk, false = off, noiseMode wins", () => {
+		expect(resolveNoiseMode({})).toBe("shrunk");
+		expect(resolveNoiseMode({ noise: true })).toBe("shrunk");
+		expect(resolveNoiseMode({ noise: false })).toBe("off");
+		expect(resolveNoiseMode({ noise: false, noiseMode: "unshrunk" })).toBe(
+			"unshrunk",
+		);
+		expect(resolveNoiseMode({ noise: true, noiseMode: "off" })).toBe("off");
+	});
+
+	/**
+	 * Log date totals of 2026-11-13 (a future workday, day factor 1) over the default 400
+	 * simulated days, from a handmade workday pool with a wide spread of daily totals and
+	 * unequal weights. All demand sits mid-day, so the ±30 min time shift never moves units
+	 * off the day, and τ ≈ 0 removes the last-hour blend: each date total is exactly the
+	 * drawn total times its scale.
+	 */
+	async function futureDateLogTotals(
+		noiseMode: "shrunk" | "unshrunk" | "off",
+	): Promise<{ logs: number[]; pool: RecordedDay[] }> {
+		const input = makeInput(NOW, { recentTauMin: 0.001 });
+		const table = buildDayTable(input);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		const todayStart = localDayStart(NOW, TZ);
+		const totals = [0.5, 1, 2, 3, 5, 8, 20];
+		const pool: RecordedDay[] = totals.map((total, i) => {
+			const start = addLocalDays(todayStart, -(i + 1), TZ);
+			const units = new Float64Array(288);
+			for (let j = 0; j < 60; j++) units[110 + j] = total / 60;
+			return {
+				key: localDayKey(start, TZ),
+				start,
+				type: "workday",
+				weight: 1 - i * 0.1,
+				units,
+				fable: new Float64Array(288),
+				total,
+				fableTotal: 0,
+			};
+		});
+		const handmade: DayTable = { days: pool, today: table.today };
+		const sc = await buildScenarios(input, handmade, horizon, { noiseMode });
+		expect(sc.diagnostics.noiseMode).toBe(noiseMode);
+		expect(sc.diagnostics.noise).toBe(noiseMode !== "off");
+		const fri = addLocalDays(todayStart, 1, TZ);
+		expect(localDayKey(fri, TZ)).toBe("2026-11-13");
+		const b0 = (fri - sc.start) / BUCKET_MS;
+		const b1 = (addLocalDays(fri, 1, TZ) - sc.start) / BUCKET_MS;
+		const logs = sc.units.map((u) => {
+			let sum = 0;
+			for (let j = b0; j < b1; j++) sum += u[j] as number;
+			return Math.log(sum);
+		});
+		return { logs, pool };
+	}
+
+	const mean = (xs: number[]) => xs.reduce((a, x) => a + x, 0) / xs.length;
+	const variance = (xs: number[]) => {
+		const mu = mean(xs);
+		return xs.reduce((a, x) => a + (x - mu) ** 2, 0) / xs.length;
+	};
+
+	test("property: over the default 400 simulated days a future date keeps the pool's weighted m and s² of log totals; unshrunk does not", async () => {
+		const shrunk = await futureDateLogTotals("shrunk");
+		const n = shrunk.logs.length;
+		expect(n).toBe(400);
+		const { m, s2, mu4 } = weightedLogMoments(shrunk.pool);
+		const h = scaleBandwidth(shrunk.pool);
+		expect(h).toBeGreaterThan(0);
+
+		// Mean: L* has variance s² by construction, so the mean of n = 400 draws has
+		// standard error s/√n = 0.05·s. Tolerance: 4 standard errors.
+		const meanTol = (4 * Math.sqrt(s2)) / Math.sqrt(n);
+		// Variance: the sample variance of n draws has standard error ≈ √((μ4* − s⁴)/n),
+		// μ4* the fourth central moment of L*. L* is the resampled log total (discrete, not
+		// normal) plus independent N(0, h²), divided by c = √(1 + h²/s²), so
+		// μ4* = (μ4 + 6·s²·h² + 3·h⁴) ÷ c⁴ with μ4 the pool's own weighted fourth central
+		// moment (for a normal this reduces to s²·√(2/n)). Tolerance: 4 standard errors.
+		const c2 = 1 + (h * h) / s2;
+		const mu4Star = (mu4 + 6 * s2 * h * h + 3 * h ** 4) / (c2 * c2);
+		const varTol = 4 * Math.sqrt((mu4Star - s2 * s2) / n);
+
+		expect(Math.abs(mean(shrunk.logs) - m)).toBeLessThan(meanTol);
+		expect(Math.abs(variance(shrunk.logs) - s2)).toBeLessThan(varTol);
+
+		// The unshrunk kernel (previous behaviour) widens the variance to about s² + h²,
+		// outside the same bound on this wide pool.
+		const unshrunk = await futureDateLogTotals("unshrunk");
+		expect(variance(unshrunk.logs) - s2).toBeGreaterThan(varTol);
+	});
+
+	test("the three modes draw the same days and ε in the same order; shrunk scale = exp(scaleLogShift)", async () => {
+		const off = await futureDateLogTotals("off");
+		const unshrunk = await futureDateLogTotals("unshrunk");
+		const shrunk = await futureDateLogTotals("shrunk");
+		const kernel = scaleKernel(off.pool);
+		const recorded = off.pool.map((d) => Math.log(d.total));
+		for (let s = 0; s < off.logs.length; s++) {
+			const L = off.logs[s] as number;
+			// off: every simulated total is a recorded total (plain resampling)
+			expect(recorded.some((r) => Math.abs(r - L) < 1e-5)).toBe(true);
+			// unshrunk scale is exp(hε) of the same draw: recover ε, then shrunk follows
+			const eps = ((unshrunk.logs[s] as number) - L) / kernel.bandwidth;
+			expect(shrunk.logs[s] as number).toBeCloseTo(
+				L + scaleLogShift(kernel, L, eps, "shrunk"),
+				4,
+			);
+		}
 	});
 });
