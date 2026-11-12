@@ -37,7 +37,9 @@ flowchart TD
     C --> H["applyUsageThrottling<br/>(5h / weekly pacing-line gate)"]
     G --> H
     H --> I{"Any account available<br/>after throttling?"}
-    I -->|"No"| J{"Why is the pool empty?"}
+    I -->|"No"| R{"Strategy has the all-limited rule<br/>(session-pace) and every account<br/>left is out only on limits?"}
+    R -->|"Yes"| R2["Forward to the account usable first;<br/>its upstream response goes to the client"]
+    R -->|"No"| J{"Why is the pool empty?"}
     J -->|"Capacity filter emptied<br/>a non-empty candidate list"| K["429 rate_limit_error<br/>code: model_family_exhausted"]
     J -->|"Usage-throttling emptied<br/>an otherwise non-empty list"| L["529 overloaded_error<br/>(usage-throttled)"]
     J -->|"Strategy itself found nothing<br/>(all paused / rate-limited)"| M["503 pool_exhausted"]
@@ -73,6 +75,22 @@ provider (or the organization behind the account) is not. On the last candidate
 account the real upstream response is forwarded instead of a synthetic
 `pool_exhausted`. Set `CCFLARE_SERVER_ERROR_RETRY_ENABLED=false` to forward
 these straight to the client again.
+
+A 429 from the last candidate is not forwarded that way under most
+strategies: it fails over like any other 429 and the request ends in the local
+`pool_exhausted` 503. Under `session-pace` (any strategy with the all-limited
+rule, see [below](#session-pace-sessionpacestrategy)) the proxy keeps the most
+recent upstream limit refusal of the request (account-wide, all models
+exhausted, `out_of_credits`, windowless; at most 64 KiB of body) instead of
+draining it. When every candidate has refused, it asks the all-limited rule
+which account becomes usable first, now that this request's refusals have set
+their cooldowns. If that is the account whose refusal it holds, the client gets
+that refusal; otherwise the proxy sends the request once more to that account
+and the client gets whatever it answers, or the held refusal if it gives no
+response. Either way the client sees a genuine upstream status, body and
+headers (minus `content-encoding`, `content-length` and `transfer-encoding`,
+which every proxied response loses because the body is already decoded, plus
+`x-better-ccflare-request-id`). Combo routes keep today's behaviour.
 
 The `windowless_429` exemption is not universal: it is evaluated only on the
 no-fallback path (the requested model has no multi-entry mapping). An account
@@ -183,6 +201,7 @@ Per-client-session stickiness keyed on `metadata.user_id` (the whole string, as 
 - **Rebind after failover**: the proxy calls `strategy.onRequestServed(meta, account, status)` once it has committed to an account's response (`packages/proxy/src/proxy.ts`, `recordServedAccount`). If a request this strategy routed was served (2xx/3xx) by an account other than the session's mapped one, the session rebinds to it and does not return. Requests that never reach `select()` (force-routed by `x-better-ccflare-account-id`, combo slots) never rebind.
 - **Idle expiry**: a mapping expires after `session_pace_idle_ms` (default 1 hour, the prompt-cache lifetime) without a request; the next request is placed fresh.
 - The paid extra-usage pool plays no part in the ranking.
+- **All accounts limited**: when a request has no account only because every account that could serve it is out on a limit (provider cooldown, exhausted 5-hour or weekly window, or, with `MODEL_SCOPED_CAPACITY_ROUTING=exhausted`, the requested family's exhausted window), the proxy does not compose `503 pool_exhausted` or `429 model_family_exhausted`. It forwards the request to the account that becomes usable first: per account, the latest reset among the limits blocking it; an unknown reset sorts last; ties go to the lower priority number, then the name. The client receives that account's own upstream response unchanged, normally Anthropic's limit refusal with its real reset, or a success if the usage data was stale. Paused accounts, accounts needing re-authentication and accounts excluded for other reasons are never targets; with none left the local error stays. The rule applies to new, mapped and session-less requests alike and does not rewrite mappings. It logs `session-pace place … rule=all-exhausted reason=earliest-reset` with every candidate's usable-again time and blocking limits. A 429 from an account chosen this way sets its cooldown from the response but leaves `consecutive_rate_limits`, the backoff ramp and the circuit breaker alone, so repeated refusals do not delay the account once its reset passes. Forced-account requests (`x-better-ccflare-account-id`), `x-better-ccflare-bypass-session` probes and combo routes are outside the rule. `CCFLARE_PASSTHROUGH_ON_EMPTY_POOL` is reached only when the rule finds no target. If accounts that looked available all refuse for limits during the request, the proxy answers with a genuine upstream refusal too (see [Master Pipeline](#master-pipeline)).
 
 Usage figures come from the usage cache, refreshed by the usage poller every `usage_poll_interval_ms` (default 90 s, ±20% jitter); a cached entry expires after 10 minutes without a successful poll. Response headers on proxied Anthropic requests do not update this cache.
 
