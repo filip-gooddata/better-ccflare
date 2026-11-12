@@ -313,7 +313,9 @@ function validateDatabaseConfig(
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};
-	private workDaysWarning: string | null = null;
+	// Invalid work-days values already warned about, so a value polled again
+	// (or switched back to) is not logged twice.
+	private readonly workDaysWarnings = new Set<string>();
 
 	constructor(configPath?: string) {
 		super();
@@ -701,8 +703,8 @@ export class Config extends EventEmitter {
 		if (Number.isInteger(n) && n >= 1 && n <= 7) return n;
 		const source = useEnv ? "SESSION_PACE_WORK_DAYS" : "session_pace_work_days";
 		const warning = `${source}=${JSON.stringify(raw)}`;
-		if (this.workDaysWarning !== warning) {
-			this.workDaysWarning = warning;
+		if (!this.workDaysWarnings.has(warning)) {
+			this.workDaysWarnings.add(warning);
 			log.warn(
 				`Invalid ${warning}: expected an integer from 1 to 7; using 5 (Monday to Friday)`,
 			);

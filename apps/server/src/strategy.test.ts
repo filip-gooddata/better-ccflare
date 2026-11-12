@@ -171,21 +171,25 @@ describe("GET /api/config/strategy sessionPace", () => {
 		expect((body.sessionPace as Record<string, unknown>).workDays).toBe(5);
 	});
 
-	it("does not repeat the invalid work-days warning when the endpoint is polled", async () => {
+	it("warns once per distinct invalid work-days value however often the endpoint is polled", async () => {
 		process.env.LB_STRATEGY = "least-used";
-		process.env.SESSION_PACE_WORK_DAYS = "0";
 		const warn = spyOn(Logger.prototype, "warn");
 		try {
 			const config = makeConfig();
 			const running = new LeastUsedStrategy();
-			for (let i = 0; i < 5; i++) {
-				const body = await strategyBody(config, running);
-				expect((body.sessionPace as Record<string, unknown>).workDays).toBe(5);
+			for (const value of ["0", "8", "0"]) {
+				process.env.SESSION_PACE_WORK_DAYS = value;
+				for (let i = 0; i < 5; i++) {
+					const body = await strategyBody(config, running);
+					expect((body.sessionPace as Record<string, unknown>).workDays).toBe(
+						5,
+					);
+				}
 			}
 			const workDayWarnings = warn.mock.calls.filter(([message]) =>
 				String(message).includes("SESSION_PACE_WORK_DAYS"),
 			);
-			expect(workDayWarnings).toHaveLength(1);
+			expect(workDayWarnings).toHaveLength(2);
 		} finally {
 			warn.mockRestore();
 		}

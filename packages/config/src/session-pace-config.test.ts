@@ -155,5 +155,24 @@ describe("session-pace settings", () => {
 				warn.mockRestore();
 			}
 		});
+
+		it("warns once per distinct invalid value, even when an earlier one returns", () => {
+			const warn = spyOn(Logger.prototype, "warn").mockImplementation(() => {});
+			for (const n of ENV_NAMES) delete process.env[n];
+			const { config, cleanup } = configWithFile({});
+			try {
+				for (const value of ["0", "8", "0", "8", "6", "0"]) {
+					process.env.SESSION_PACE_WORK_DAYS = value;
+					expect(config.getSessionPaceWorkDays()).toBe(value === "6" ? 6 : 5);
+				}
+				const messages = warn.mock.calls.map(([message]) => String(message));
+				expect(messages).toHaveLength(2);
+				expect(messages[0]).toContain('SESSION_PACE_WORK_DAYS="0"');
+				expect(messages[1]).toContain('SESSION_PACE_WORK_DAYS="8"');
+			} finally {
+				cleanup();
+				warn.mockRestore();
+			}
+		});
 	});
 });
