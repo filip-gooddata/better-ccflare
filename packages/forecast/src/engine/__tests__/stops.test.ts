@@ -96,6 +96,8 @@ describe("projected stops", () => {
 		expect(stops?.heavy).toEqual([{ start: at(14, 12), end: RESET_A }]);
 		expect(stops?.typical).toEqual([]);
 		expect(stops?.light).toEqual([]);
+		// Just above 0.432: counting the whole 14:10-14:15 step (0.44) would list it.
+		expect(exampleRun(0.01, 2, 0.435).day?.stops.heavy).toEqual([]);
 	});
 
 	test("zero quota at night with no demand is not a stop", () => {
