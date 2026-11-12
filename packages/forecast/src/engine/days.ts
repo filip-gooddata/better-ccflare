@@ -18,6 +18,10 @@ export const MIN_POOL_DAYS = 3;
 export const RECENT_WINDOW_MS = 60 * 60_000;
 /** Work start = median over this many most recent recorded work days with demand: two working weeks, recent enough to follow a changed routine. */
 export const WORK_START_RECENT_DAYS = 10;
+/** Work start = the minute by which this percent of a work day's demand is used, unless settings say otherwise (design amendment A3). */
+export const DEFAULT_WORK_START_SHARE_PCT = 5;
+/** Relative slack of the work-start share test, so float rounding in the running sum cannot move it a bucket later. */
+const SHARE_SLACK = 1e-9;
 
 export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
 	const weekday = localParts(dayStart, pace.timeZone).isoWeekday;
@@ -126,28 +130,47 @@ export function historyAvailable(table: DayTable): boolean {
 }
 
 /**
- * Median local clock minute of the first demand over the most recent
- * WORK_START_RECENT_DAYS recorded work days with demand; null when there is none.
- * Takes the time zone because DayTable carries none and on a DST day the bucket
- * index is not the clock.
+ * Median, over the most recent WORK_START_RECENT_DAYS recorded work days with
+ * demand, of the local clock minute by which `sharePct` percent of that day's
+ * demand (units) has been used: the start of the first bucket at which the
+ * day's cumulative units reach the share. The share keeps a stray overnight
+ * request from setting the work start (design amendment A3). Null when there
+ * is no such day. Takes the time zone because DayTable carries none and on a
+ * DST day the bucket index is not the clock.
  */
 export function workStartMinute(
 	table: DayTable,
 	timeZone: string,
+	sharePct: number = DEFAULT_WORK_START_SHARE_PCT,
 ): number | null {
-	const firsts: number[] = [];
+	const minutes: number[] = [];
 	for (
 		let i = table.days.length - 1;
-		i >= 0 && firsts.length < WORK_START_RECENT_DAYS;
+		i >= 0 && minutes.length < WORK_START_RECENT_DAYS;
 		i--
 	) {
 		const d = table.days[i] as RecordedDay;
-		if (d.type === "weekend" || d.total <= 0) continue;
-		const first = d.units.findIndex((u) => u > 0);
-		if (first >= 0)
-			firsts.push(
-				localParts(d.start + first * BUCKET_MS, timeZone).minuteOfDay,
+		if (d.type === "weekend") continue;
+		const bucket = shareReachedAt(d.units, sharePct);
+		if (bucket !== null)
+			minutes.push(
+				localParts(d.start + bucket * BUCKET_MS, timeZone).minuteOfDay,
 			);
 	}
-	return firsts.length === 0 ? null : Math.round(median(firsts));
+	return minutes.length === 0 ? null : Math.round(median(minutes));
+}
+
+/** Index of the first bucket at which the cumulative units reach `sharePct` percent of the day's total; null without demand. */
+function shareReachedAt(units: Float64Array, sharePct: number): number | null {
+	let total = 0;
+	for (const u of units) total += u;
+	if (!(total > 0)) return null;
+	const target = (total * sharePct) / 100 - total * SHARE_SLACK;
+	let sum = 0;
+	for (let b = 0; b < units.length; b++) {
+		const u = units[b] as number;
+		sum += u;
+		if (u > 0 && sum >= target) return b;
+	}
+	return null;
 }

@@ -77,7 +77,11 @@ export async function prepareEngineContext(
 		table,
 		calibration,
 		scenarios,
-		workStartMinute: workStartMinute(table, timeZone),
+		workStartMinute: workStartMinute(
+			table,
+			timeZone,
+			input.settings.workStartSharePct,
+		),
 	};
 }
 

@@ -10,6 +10,7 @@ import type {
 import { BUCKET_MS } from "../../types";
 import {
 	buildDayTable,
+	DEFAULT_WORK_START_SHARE_PCT,
 	dayTypeOf,
 	historyAvailable,
 	MIN_POOL_DAYS,
@@ -49,6 +50,7 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		historyLookbackDays: 28,
 		recentTauMin: 60,
 		sessionTurnoverMin: 60,
+		workStartSharePct: 5,
 		...over,
 	};
 }
@@ -302,7 +304,7 @@ describe("historyAvailable", () => {
 });
 
 describe("workStartMinute", () => {
-	test("median first minute with demand over recent recorded work days", () => {
+	test("median minute by which 5 % of the day's demand is used, over recent recorded work days", () => {
 		const todayStart = localDayStart(NOW, TZ);
 		const from = addLocalDays(todayStart, -7, TZ);
 		// Thu 5 08:00, Fri 6 09:00, Sat/Sun 06:00 (weekend, ignored), Mon 9 none, Tue 10 10:00, Wed 11 09:30
@@ -325,8 +327,11 @@ describe("workStartMinute", () => {
 		});
 		const t = buildDayTable(input({ history: h, historyFrom: from }));
 		expect(WORK_START_RECENT_DAYS).toBeGreaterThanOrEqual(4);
-		// work days with demand: 480, 540, 600, 570 → median 555
-		expect(workStartMinute(t, TZ)).toBe(555);
+		// 5 % of each work day is reached in the bucket starting at
+		// 08:25 (6 of 120), 09:25 (6 of 108), 10:20 (5 of 96), 09:55 (6 of 102)
+		// → 505, 565, 620, 595 → median 580
+		expect(workStartMinute(t, TZ)).toBe(580);
+		expect(workStartMinute(t, TZ, DEFAULT_WORK_START_SHARE_PCT)).toBe(580);
 	});
 
 	test("a DST work day counts by its local clock (2026-10-25, 25 hours, workDays 7)", () => {
@@ -346,7 +351,33 @@ describe("workStartMinute", () => {
 		expect(t.days.map((d) => [d.key, d.units.length, d.type])).toEqual([
 			["2026-10-25", 300, "workday"],
 		]);
-		expect(workStartMinute(t, TZ)).toBe(540);
+		// 09:00–24:00 is 180 buckets; 5 % (9 buckets) is reached in the one starting 09:40.
+		expect(workStartMinute(t, TZ)).toBe(580);
+	});
+
+	/** Work days Thu 5 to Wed 11 (weekend ignored): one small request at 00:30, then 09:00–17:00. */
+	function overnightTable(): DayTable {
+		const todayStart = localDayStart(NOW, TZ);
+		const from = addLocalDays(todayStart, -7, TZ);
+		const h = history(from, todayStart, (t) => {
+			const m = localParts(t, TZ).minuteOfDay;
+			return m === 30 || (m >= 9 * 60 && m < 17 * 60) ? 0.01 : 0;
+		});
+		return buildDayTable(input({ history: h, historyFrom: from }));
+	}
+
+	test("one overnight request on otherwise normal work days gives the morning start, not midnight", () => {
+		// total 0.97 per day; 5 % = 0.0485 is reached with the 00:30 bucket and the first
+		// four from 09:00, in the bucket starting 09:15.
+		expect(workStartMinute(overnightTable(), TZ)).toBe(555);
+	});
+
+	test("the share changes the work start", () => {
+		const t = overnightTable();
+		// 1 % = 0.0097: the 00:30 bucket alone reaches it.
+		expect(workStartMinute(t, TZ, 1)).toBe(30);
+		// 50 % = 0.485: 00:30 plus 48 buckets from 09:00, the last starting 12:55.
+		expect(workStartMinute(t, TZ, 50)).toBe(775);
 	});
 
 	test("null without recorded work days with demand", () => {

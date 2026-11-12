@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
 	compareScores,
+	OPEN_MIN_STOP_GAIN_MIN,
+	openingBeam,
+	openingEarns,
 	openingGrid,
+	openingReason,
+	type PlanScore,
 	planForecast,
 	scorePlan,
 } from "../planner";
@@ -119,6 +124,111 @@ describe("planForecast: 2026-11-12 shape", () => {
 			},
 		});
 		expect(off.every((t) => t <= prague(12, 22))).toBe(true);
+	});
+});
+
+describe("planForecast: an early opening for a shorter heavy stop (amendment A2)", () => {
+	test("opens ahead when the heavy low point stays 0 but the heavy stop gets shorter", async () => {
+		// One closed account; work 09:00–16:00 needs twice what a window holds (a window fills in an hour).
+		// On demand the window opens at 09:00; opened at 06:00 instead, it resets at 11:00 and serves a
+		// third hour of the day. The heavy lowest point is 0 either way; the weekly line barely moves.
+		const ctx = makeCtx({
+			now: prague(12, 4),
+			days: 20,
+			accounts: [account({ id: "acct-a", weekUsed: 10 })],
+			k5: { "acct-a": 100 / 60 },
+			kW: { "acct-a": 0.0001 },
+			rate: (m, w) => (w <= 5 && m >= 540 && m < 960 ? 1 : 0),
+			settings: { prewarm: true },
+			workStartMinute: 540,
+		});
+		const { plan, score, baseline } = await planForecast(ctx);
+		expect(baseline.score.dayLowPoints).toBe(0);
+		expect(score.dayLowPoints).toBe(0);
+		expect(item1And2(score)).toEqual(item1And2(baseline.score));
+		expect(baseline.score.stopMinutes).toBe(830);
+		expect(score.stopMinutes).toBe(655);
+		expect(plan.openAt).toEqual({ "acct-a": prague(12, 6) });
+	}, 30_000);
+
+	function item1And2(s: PlanScore): number[] {
+		return [s.item1, s.item2].map((v) => Math.round(v * 1e4) / 1e4);
+	}
+
+	const base: PlanScore = {
+		item1: 0,
+		item2: 0.9,
+		stopMinutes: 120,
+		typicalShare: 0.2,
+		dayLowPoints: 0,
+		weekLowPoints: 180,
+		poolPoints: 200,
+	};
+
+	test("a tie on items 1 and 2 earns the opening when the stop falls by one 5-minute step", () => {
+		expect(OPEN_MIN_STOP_GAIN_MIN).toBe(5);
+		expect(openingEarns({ ...base, stopMinutes: 115 }, base, 1)).toBe(true);
+		// Items 1 and 2 within the tier tolerance (0.5 points of a 200-point pool) still tie.
+		expect(
+			openingEarns(
+				{ ...base, item2: base.item2 - 0.4 / 200, stopMinutes: 100 },
+				base,
+				1,
+			),
+		).toBe(true);
+	});
+
+	test("a tie on items 1 and 2 does not earn the opening when the stop falls by less than a step", () => {
+		expect(openingEarns({ ...base, stopMinutes: 116 }, base, 1)).toBe(false);
+		expect(openingEarns(base, base, 1)).toBe(false);
+		// A shorter stop does not buy a lower item 2 beyond the tolerance.
+		expect(
+			openingEarns(
+				{ ...base, item2: base.item2 - 0.6 / 200, stopMinutes: 60 },
+				base,
+				1,
+			),
+		).toBe(false);
+	});
+
+	test("rule (b) needs a tie: a gain of item 1 above the tolerance but below openMinGainPoints does not earn the opening", () => {
+		// Literal amendment A2: 0.6 points is outside the 0.5-point tolerance and below 1 point.
+		expect(
+			openingEarns(
+				{ ...base, item1: base.item1 + 0.6 / 200, stopMinutes: 60 },
+				base,
+				1,
+			),
+		).toBe(false);
+	});
+
+	test("the beam keeps an opening that earns its place alone when the best-scored ones do not", () => {
+		const up = (at: number, points: number) => ({
+			at,
+			score: { ...base, item1: base.item1 + points / 200 },
+		});
+		const shorter = { at: 5, score: { ...base, stopMinutes: 60 } };
+		const singles = [up(1, 0.9), up(2, 0.8), up(3, 0.7), up(4, 0.6), shorter];
+		expect(openingBeam(singles, base, 1)).toEqual([1, 2, 5]);
+		// When one of the best already earns its place, the beam is the best three.
+		expect(openingBeam([up(0, 1.5), ...singles], base, 1)).toEqual([0, 1, 2]);
+	});
+
+	test("a gain of item 1 by openMinGainPoints earns the opening as before", () => {
+		const up = { ...base, item1: base.item1 + 1 / 200, stopMinutes: 130 };
+		expect(openingEarns(up, base, 1)).toBe(true);
+		expect(openingEarns(up, base, 2)).toBe(false);
+	});
+
+	test("reason tokens: an item 1 gain of openMinGainPoints first, else the stop minutes cut", () => {
+		expect(openingReason(85.46, 60, 1)).toBe("open-ahead+85.5");
+		expect(openingReason(0, 175, 1)).toBe("open-ahead-stop-175min");
+		expect(openingReason(0.01, 5, 1)).toBe("open-ahead-stop-5min");
+		// A gain below openMinGainPoints names the stop minutes when rule (b) is what holds.
+		expect(openingReason(0.3, 25, 1)).toBe("open-ahead-stop-25min");
+		// Otherwise a gain still worth naming is named as before.
+		expect(openingReason(0.3, 0, 1)).toBe("open-ahead+0.3");
+		expect(openingReason(0.01, 4, 1)).toBeNull();
 	});
 });
 

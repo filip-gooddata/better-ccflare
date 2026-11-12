@@ -41,6 +41,11 @@ const MAX_MOVE_SESSIONS = 3;
 const TIER_TOLERANCE_POINTS = 0.5;
 /** Placement tiers: and by at most this many minutes of heavy stops (score item 3). */
 const TIER_TOLERANCE_STOP_MIN = 5;
+/**
+ * Design amendment A2(b): an opening that leaves score items 1 and 2 equal within the tier tolerance
+ * is still chosen when it cuts the heavy stop minutes (item 3) by at least one 5-minute simulation step.
+ */
+export const OPEN_MIN_STOP_GAIN_MIN = 5;
 /** Gains below this many points are not named in a placement reason. */
 const REASON_MIN_GAIN_POINTS = 0.05;
 
@@ -196,6 +201,31 @@ function item1GainPoints(next: PlanScore, base: PlanScore): number {
 	return (next.item1 - base.item1) * next.poolPoints;
 }
 
+/**
+ * The opening rule (design 4.7, amendment A2): a plan with openings ahead of need, `next`, earns them
+ * over the same plan without them, `base`, when (a) score item 1 rises by at least `openMinGainPoints`,
+ * or (b) items 1 and 2 are equal within the tier tolerance and the heavy stop minutes fall by at least
+ * OPEN_MIN_STOP_GAIN_MIN.
+ */
+export function openingEarns(
+	next: PlanScore,
+	base: PlanScore,
+	openMinGainPoints: number,
+): boolean {
+	if (item1GainPoints(next, base) >= openMinGainPoints) return true;
+	const tol = TIER_TOLERANCE_POINTS / Math.max(1, next.poolPoints);
+	return (
+		Math.abs(next.item1 - base.item1) <= tol &&
+		Math.abs(next.item2 - base.item2) <= tol &&
+		stopGainMinutes(next, base) >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS
+	);
+}
+
+/** Fall of score item 3 (heavy stop minutes) from `base` to `next`. */
+function stopGainMinutes(next: PlanScore, base: PlanScore): number {
+	return base.stopMinutes - next.stopMinutes;
+}
+
 /** Opening times tried for a closed window, ascending, inside [now, fineEnd). */
 export function openingGrid(ctx: EngineContext): EpochMs[] {
 	const { now } = ctx;
@@ -272,8 +302,14 @@ export async function planForecast(ctx: EngineContext): Promise<{
 				at,
 				evaluated: await evaluate(withOpening(baseline.plan, j, at)),
 			});
-		singles.sort((x, y) => compareScores(x.evaluated.score, y.evaluated.score));
-		beams.push([null, ...singles.slice(0, OPENING_BEAM).map((x) => x.at)]);
+		beams.push([
+			null,
+			...openingBeam(
+				singles.map((x) => ({ at: x.at, score: x.evaluated.score })),
+				baseline.score,
+				openMin,
+			),
+		]);
 	}
 	let bestOpening: Evaluated | null = null;
 	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
@@ -283,7 +319,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		});
 		const candidate = await evaluate({ ...baseline.plan, openAt });
 		if (
-			item1GainPoints(candidate.score, baseline.score) >= openMin &&
+			openingEarns(candidate.score, baseline.score, openMin) &&
 			better(candidate, bestOpening)
 		)
 			bestOpening = candidate;
@@ -296,11 +332,18 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		if (better(candidate, best)) best = candidate;
 	}
 
-	// An opening stays only while it still earns openMinGainPoints in the final combination.
-	for (const j of closed) {
-		if (best.plan.openAt[j] == null) continue;
-		const without = await evaluate(withOpening(best.plan, j, null));
-		if (item1GainPoints(best.score, without.score) < openMin) best = without;
+	// An opening stays only while it still earns its place (openingEarns) in the final combination;
+	// dropping one can change what another earns, so repeat until nothing drops.
+	for (let dropped = true; dropped; ) {
+		dropped = false;
+		for (const j of closed) {
+			if (best.plan.openAt[j] == null) continue;
+			const without = await evaluate(withOpening(best.plan, j, null));
+			if (!openingEarns(best.score, without.score, openMin)) {
+				best = without;
+				dropped = true;
+			}
+		}
 	}
 
 	// 3. At most one move of one warm live session; it pays its move cost inside the simulation.
@@ -411,8 +454,15 @@ function placementOf(
 		!isOpenNow(ctx, first) &&
 		(plan.preferred === first || (plannedAt != null && plannedAt <= ctx.now));
 	let reason: string;
-	if (plannedAt != null && gain >= REASON_MIN_GAIN_POINTS)
-		reason = `open-ahead+${gain.toFixed(1)}`;
+	const ahead =
+		plannedAt != null
+			? openingReason(
+					gain,
+					stopGainMinutes(top, baseline.score),
+					ctx.input.settings.openMinGainPoints,
+				)
+			: null;
+	if (ahead) reason = ahead;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
 		reason = `low-point+${gain.toFixed(1)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
@@ -422,6 +472,47 @@ function placementOf(
 		rule: opens ? "forecast-open" : "forecast-lookahead",
 		reason,
 	};
+}
+
+/**
+ * Reason token for a placement whose first account the plan opens ahead of need: `open-ahead+<points>`
+ * when score item 1 gains `openMinGainPoints` (rule a), else `open-ahead-stop-<minutes>min` when the heavy
+ * stop minutes fall by OPEN_MIN_STOP_GAIN_MIN (rule b), else `open-ahead+<points>` for a smaller gain
+ * still worth naming; null otherwise.
+ */
+export function openingReason(
+	gainPoints: number,
+	stopGainMin: number,
+	openMinGainPoints: number,
+): string | null {
+	const points = `open-ahead+${gainPoints.toFixed(1)}`;
+	if (gainPoints >= openMinGainPoints && gainPoints >= REASON_MIN_GAIN_POINTS)
+		return points;
+	if (stopGainMin >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS)
+		return `open-ahead-stop-${Math.round(stopGainMin)}min`;
+	return gainPoints >= REASON_MIN_GAIN_POINTS ? points : null;
+}
+
+/**
+ * Best single openings of one closed account carried into the combination search: the OPENING_BEAM
+ * best by score, except that the last place goes to the best opening that earns its place alone
+ * (openingEarns) when none of the others does; a tie that shortens the heavy stop may rank below
+ * openings that raise item 1 too little to count.
+ */
+export function openingBeam(
+	singles: { at: EpochMs; score: PlanScore }[],
+	baseline: PlanScore,
+	openMinGainPoints: number,
+): EpochMs[] {
+	const sorted = [...singles].sort((x, y) => compareScores(x.score, y.score));
+	const beam = sorted.slice(0, OPENING_BEAM);
+	const earns = (x: { score: PlanScore }) =>
+		openingEarns(x.score, baseline, openMinGainPoints);
+	if (beam.length === OPENING_BEAM && !beam.some(earns)) {
+		const earner = sorted.slice(OPENING_BEAM).find(earns);
+		if (earner) beam[OPENING_BEAM - 1] = earner;
+	}
+	return beam.map((x) => x.at);
 }
 
 /** Cartesian product of the choices, or only the one-change-at-a-time rows when it exceeds `limit`. */
