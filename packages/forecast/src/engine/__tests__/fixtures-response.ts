@@ -160,7 +160,13 @@ export function makeCtx(options: CtxOptions = {}): EngineContext {
 			bucketCount: 0,
 			units: [],
 			fable: [],
-			diagnostics: { noise: true, bandwidths: {}, dayFactor: 1, recentRate: 0 },
+			diagnostics: {
+				noise: true,
+				noiseMode: "shrunk",
+				bandwidths: {},
+				dayFactor: 1,
+				recentRate: 0,
+			},
 		},
 		workStartMinute: null,
 	};

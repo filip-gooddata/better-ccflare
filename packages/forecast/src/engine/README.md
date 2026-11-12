@@ -3,8 +3,10 @@
 Pure TypeScript: no IO, no clock, and no randomness except one seeded generator. `createForecastEngine()`
 returns a `ForecastEngine`. Its `compute(input)` produces the `/api/forecast` response and the plan. It never
 throws: any failure becomes `available: false, reason: "error"` with the spec's no-forecast shape, and the
-error text stays out of the response. `createForecastEngine({ noise: false })` turns the kernel noise off.
-It exists only to measure what the noise does to the heavy line.
+error text stays out of the response. The kernel noise is the shrunk kernel by default (the only mode the
+service uses). `createForecastEngine({ noiseMode: "unshrunk" })` gives the previous plain kernel and
+`{ noiseMode: "off" }` (or `{ noise: false }`) plain resampling. They exist only to measure what the noise
+does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or absent means shrunk.
 
 ## Stages (`engine.ts`)
 
@@ -17,8 +19,16 @@ It exists only to measure what the noise does to the heavy line.
 3. **Calibration** (`calibration.ts`). A ratio-of-sums estimator gives points per demand unit for each
    account and limit, over the window instances of the usage readings.
 4. **Scenarios** (`scenarios.ts`). A smoothed bootstrap resamples whole recorded days, weighted by recency.
-   It adds kernel noise on scale: exp(ε) with ε ~ N(0, h²), where h comes from the normal-reference
-   (Silverman) bandwidth rule on the log daily totals. It adds kernel noise on time: a uniform whole-bucket
+   It adds kernel noise on scale by the shrunk (variance-preserving) smoothed bootstrap of Silverman and
+   Young (1987), "The bootstrap: to smooth or not to smooth?", Biometrika 74(3), 469–479 (also Silverman
+   1986, Density Estimation for Statistics and Data Analysis, section 6.4.1): a drawn day with log total
+   L_I is multiplied by exp(L* − L_I), L* = m + (L_I − m + h·ε) ÷ √(1 + h²/s²), ε ~ N(0, 1). h comes from
+   the normal-reference (Silverman) bandwidth rule on the log daily totals; m and s² are the mean and
+   variance of the log totals under the draw's own recency weights (s² = Σw·(L − m)² ÷ Σw), so the
+   simulated log totals keep the resampled m and s² instead of widening to s² + h². Zero-total days have
+   no logarithm: they are left out of h, m and s², and a drawn zero-total day stays 0 with no scale noise.
+   A pool with h = 0 or s² = 0 gets no scale noise. The unshrunk mode multiplies by exp(h·ε) instead.
+   In both kernel modes it adds kernel noise on time: a uniform whole-bucket
    shift within ±`timeShiftMin`. Today is scaled by the call-centre intraday day-factor update
    a = (Y + c) ÷ (M + c). The last hour's rate is blended in with an exponentially decaying weight
    e^(−h/τ). The generator is seeded from the local day key.

@@ -62,6 +62,20 @@ export interface Horizon {
 }
 
 /**
+ * Kernel noise of the smoothed bootstrap. `shrunk` (the default): the variance-preserving
+ * shrunk smoothed bootstrap of Silverman and Young (1987). `unshrunk`: plain kernel noise
+ * exp(hε), which widens the variance of log totals to s² + h² (kept for measurement).
+ * `off`: plain resampling, no scale or time noise.
+ */
+export type NoiseMode = "shrunk" | "unshrunk" | "off";
+
+/** Engine options choosing the kernel noise; `noiseMode` wins over `noise` (true or absent = shrunk, false = off). */
+export interface NoiseOptions {
+	noise?: boolean;
+	noiseMode?: NoiseMode;
+}
+
+/**
  * Demand of every simulated day (smoothed bootstrap of whole recorded days,
  * day factor and last-hour blend already applied), per BUCKET_MS bucket.
  */
@@ -74,7 +88,9 @@ export interface Scenarios {
 	units: Float32Array[];
 	fable: Float32Array[];
 	diagnostics: {
+		/** Kernel noise on (shrunk or unshrunk); false is plain resampling. */
 		noise: boolean;
+		noiseMode: NoiseMode;
 		/** Scale bandwidth h per pool used, keyed by the date it served ("YYYY-MM-DD"). */
 		bandwidths: Record<string, number>;
 		dayFactor: number;

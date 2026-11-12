@@ -15,7 +15,14 @@ import {
 import type { EpochMs, ForecastInput } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, poolFor } from "./days";
-import type { DayTable, Horizon, RecordedDay, Scenarios } from "./model";
+import type {
+	DayTable,
+	Horizon,
+	NoiseMode,
+	NoiseOptions,
+	RecordedDay,
+	Scenarios,
+} from "./model";
 import { createRng, type Rng } from "./rng";
 import { yieldToEventLoop } from "./yield";
 
@@ -53,6 +60,70 @@ export function scaleBandwidth(pool: RecordedDay[]): number {
 	const spread = robust > 0 ? Math.min(sigma, robust) : sigma;
 	if (!(spread > 0)) return 0;
 	return SILVERMAN_FACTOR * spread * logs.length ** -0.2;
+}
+
+/** Kernel noise mode from engine options: `noiseMode` wins; else `noise` true or absent = shrunk, false = off. */
+export function resolveNoiseMode(options: NoiseOptions): NoiseMode {
+	if (options.noiseMode) return options.noiseMode;
+	return options.noise === false ? "off" : "shrunk";
+}
+
+/** Scale kernel of one pool: bandwidth h and the weighted mean m and variance s² of its log daily totals. */
+export interface ScaleKernel {
+	bandwidth: number;
+	mean: number;
+	variance: number;
+}
+
+/**
+ * Scale kernel of a pool. h = scaleBandwidth(pool) (unchanged). m and s² are the
+ * mean and variance of the log daily totals under the draw's own recency weights,
+ * s² = Σw·(L − m)² ÷ Σw: the variance of the distribution that is resampled, not a
+ * sample estimate of some other one, so the shrunk kernel keeps exactly that
+ * distribution's m and s². Zero-total days have no logarithm and are left out, as in
+ * the bandwidth; a drawn zero-total day stays 0 whatever its scale. No positive day
+ * (or no positive weight) gives m = s² = 0.
+ */
+export function scaleKernel(pool: RecordedDay[]): ScaleKernel {
+	const bandwidth = scaleBandwidth(pool);
+	let sw = 0;
+	let swl = 0;
+	for (const d of pool)
+		if (d.total > 0) {
+			sw += d.weight;
+			swl += d.weight * Math.log(d.total);
+		}
+	if (!(sw > 0)) return { bandwidth, mean: 0, variance: 0 };
+	const mean = swl / sw;
+	let ss = 0;
+	for (const d of pool)
+		if (d.total > 0) ss += d.weight * (Math.log(d.total) - mean) ** 2;
+	return { bandwidth, mean, variance: ss / sw };
+}
+
+/**
+ * Log scale noise L* − L_I for a drawn day with log total L_I and ε ~ N(0, 1); the day
+ * is multiplied by exp of it. `shrunk`: the shrunk smoothed bootstrap of Silverman and
+ * Young (1987), "The bootstrap: to smooth or not to smooth?", Biometrika 74(3),
+ * 469–479 (also Silverman 1986, Density Estimation for Statistics and Data Analysis,
+ * section 6.4.1): L* = m + (L_I − m + h·ε) ÷ √(1 + h²/s²), so the simulated log totals
+ * keep the resampled mean m and variance s² instead of widening to s² + h².
+ * `unshrunk`: h·ε (the plain kernel, kept for measurement). `off`: 0. h = 0, or s² = 0
+ * when shrunk: 0 (no scale noise for that pool).
+ */
+export function scaleLogShift(
+	kernel: ScaleKernel,
+	logTotal: number,
+	eps: number,
+	mode: NoiseMode,
+): number {
+	const h = kernel.bandwidth;
+	if (mode === "off" || !(h > 0)) return 0;
+	if (mode === "unshrunk") return h * eps;
+	const s2 = kernel.variance;
+	if (!(s2 > 0)) return 0;
+	const m = kernel.mean;
+	return m + (logTotal - m + h * eps) / Math.sqrt(1 + (h * h) / s2) - logTotal;
 }
 
 /** Units of a recorded day from its local midnight over `elapsed` ms (the last bucket pro rata). */
@@ -126,7 +197,7 @@ interface DatePlan {
 	maps: (Int32Array | null)[];
 	/** Cumulative weights of `pool`. */
 	cumulative: Float64Array;
-	bandwidth: number;
+	kernel: ScaleKernel;
 	factor: number;
 	/** This date's own stream, so a longer or shorter horizon leaves the other dates' draws unchanged. */
 	rng: Rng;
@@ -148,12 +219,13 @@ function pick(cumulative: Float64Array, x: number): number {
  * N = settings.simulatedDays simulated days of demand from bucketStart(now) to
  * horizon.simEnd. Per simulated day and future local date: draw a recorded day
  * from that date's pool with probability proportional to its weight; with noise,
- * scale it by exp(ε), ε ~ N(0, h²), h = scaleBandwidth(pool), and shift it by a
+ * scale it by exp(scaleLogShift(...)) (shrunk by default, see scaleLogShift; a
+ * zero-total day has no log total and gets no scale noise), and shift it by a
  * uniform whole number of buckets within ±timeShiftMin; scale today by the day
  * factor; then blend e^(−h/τ)·r + (1 − e^(−h/τ))·value with h the minutes from
  * now to the bucket start (0 for the bucket holding now). Each date has its own
  * generator, seeded with today's local day key and the date's key, and draws the
- * same numbers in the same order with noise on or off, so noise off is plain
+ * same numbers in the same order in every noise mode, so noise off is plain
  * resampling of the same drawn days. A recorded day is laid onto the date by
  * wall-clock 5-minute slot, and the shift moves along that clock: on DST days a
  * repeated hour is read from its first pass and a skipped slot, or a shift past
@@ -170,8 +242,9 @@ export async function buildScenarios(
 	input: ForecastInput,
 	table: DayTable,
 	horizon: Horizon,
-	options: { noise: boolean },
+	options: NoiseOptions,
 ): Promise<Scenarios> {
+	const mode = resolveNoiseMode(options);
 	const tz = input.pace.timeZone;
 	const now = horizon.now;
 	const { settings } = input;
@@ -222,8 +295,8 @@ export async function buildScenarios(
 			if (!maps.has(d)) maps.set(d, slotIndex(d, tz));
 			return maps.get(d) ?? null;
 		});
-		const bandwidth = scaleBandwidth(pool);
-		bandwidths[key] = bandwidth;
+		const kernel = scaleKernel(pool);
+		bandwidths[key] = kernel.bandwidth;
 		dates.push({
 			key,
 			from,
@@ -232,7 +305,7 @@ export async function buildScenarios(
 			pool,
 			maps: dayMaps,
 			cumulative,
-			bandwidth,
+			kernel,
 			factor: dayStart === table.today.start ? factorToday : 1,
 			rng: createRng(`${table.today.key}/${key}`),
 		});
@@ -261,9 +334,12 @@ export async function buildScenarios(
 				date.pool.length > 0 ? pick(date.cumulative, x * totalWeight) : -1;
 			const day = date.pool[i];
 			const map = date.maps[i] ?? null;
-			const scale =
-				date.factor * (options.noise ? Math.exp(eps * date.bandwidth) : 1);
-			const shift = options.noise ? shiftDraw - shiftMax : 0;
+			const logShift =
+				day && day.total > 0
+					? scaleLogShift(date.kernel, Math.log(day.total), eps, mode)
+					: 0;
+			const scale = date.factor * Math.exp(logShift);
+			const shift = mode === "off" ? 0 : shiftDraw - shiftMax;
 			for (let j = date.from; j < date.to; j++) {
 				let v = 0;
 				let vf = 0;
@@ -299,7 +375,8 @@ export async function buildScenarios(
 		units,
 		fable,
 		diagnostics: {
-			noise: options.noise,
+			noise: mode !== "off",
+			noiseMode: mode,
 			bandwidths,
 			dayFactor: factorToday,
 			recentRate: r,
