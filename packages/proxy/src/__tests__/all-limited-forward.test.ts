@@ -16,6 +16,7 @@ import type {
 	LimitBlockedAccount,
 	LoadBalancingStrategy,
 } from "@better-ccflare/types";
+import { cacheBodyStore } from "../cache-body-store";
 import type { ProxyContext } from "../handlers";
 import { clearFamilyExhaustionCache } from "../handlers/model-capacity";
 import { resetRateLimitProbeGatesForTests } from "../handlers/rate-limit-cooldown";
@@ -861,6 +862,40 @@ describe("a limit refusal larger than the held-refusal buffer", () => {
 
 		expect(response.status).toBe(200);
 		expect(big.state.cancelled).toBe(true);
+	});
+});
+
+describe("a held limit refusal and an exception after it", () => {
+	it("cancels the held upstream body when the request throws", async () => {
+		const a = makeAccount("a");
+		const big = bigLimit429(NOW + HOUR, "a");
+		installUpstream(() => big.response);
+		const { ctx } = makeCtx([a], earliestResetStrategy());
+		spyOn(cacheBodyStore, "discardStaged").mockImplementation(() => {
+			throw new Error("staging store failed");
+		});
+
+		const received = await send(ctx);
+
+		expect(received).toBeInstanceOf(Error);
+		expect((received as Error).message).toBe("staging store failed");
+		expect(big.state.cancelled).toBe(true);
+	});
+
+	it("leaves the held body to the client when it is replayed", async () => {
+		const a = makeAccount("a");
+		const big = bigLimit429(NOW + HOUR, "a");
+		installUpstream(() => big.response);
+		const { ctx } = makeCtx([a], earliestResetStrategy());
+
+		const response = await send(ctx);
+
+		expect(big.state.cancelled).toBe(false);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + HOUR, "a"),
+			body: big.text,
+		});
 	});
 });
 

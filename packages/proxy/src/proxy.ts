@@ -253,10 +253,45 @@ export function handleProxy(
 	);
 }
 
+/** The upstream limit refusal a request currently owns (failover path C). */
+interface HeldRefusalSlot {
+	refusal?: HeldLimitRefusal;
+}
+
 async function handleProxyRequest(
 	req: Request,
 	url: URL,
 	ctx: ProxyContext,
+	apiKeyId?: string | null,
+	apiKeyName?: string | null,
+	options?: { trustedNativeResponses?: boolean },
+	observation?: RequestObservation,
+): Promise<Response> {
+	// A refusal held as a stream keeps its upstream connection open. Whatever
+	// ends the request, a return or an exception, releases one that was not
+	// handed to the client.
+	const heldSlot: HeldRefusalSlot = {};
+	try {
+		return await handleProxyRequestHolding(
+			req,
+			url,
+			ctx,
+			heldSlot,
+			apiKeyId,
+			apiKeyName,
+			options,
+			observation,
+		);
+	} finally {
+		if (heldSlot.refusal) releaseHeldLimitRefusal(heldSlot.refusal);
+	}
+}
+
+async function handleProxyRequestHolding(
+	req: Request,
+	url: URL,
+	ctx: ProxyContext,
+	heldSlot: HeldRefusalSlot,
 	apiKeyId?: string | null,
 	apiKeyName?: string | null,
 	options?: { trustedNativeResponses?: boolean },
@@ -1150,18 +1185,18 @@ async function handleProxyRequest(
 	// with the refusal of the account that becomes usable first, which is
 	// decided only once every candidate has refused. See the all-fail branch
 	// below. A refusal held as a stream keeps its upstream connection open, so
-	// one that is replaced or not answered with is released.
-	let heldLimitRefusal: HeldLimitRefusal | undefined;
+	// one that is replaced or not answered with is released. It lives in
+	// heldSlot so that handleProxyRequest also releases it on an exception.
 	const holdLimitRefusal =
 		filteredComboInfo?.comboName || !isAllLimitedRuleEligible(ctx, requestMeta)
 			? undefined
 			: (refusal: HeldLimitRefusal) => {
-					if (heldLimitRefusal) releaseHeldLimitRefusal(heldLimitRefusal);
-					heldLimitRefusal = refusal;
+					if (heldSlot.refusal) releaseHeldLimitRefusal(heldSlot.refusal);
+					heldSlot.refusal = refusal;
 				};
 	const releaseHeld = () => {
-		if (heldLimitRefusal) releaseHeldLimitRefusal(heldLimitRefusal);
-		heldLimitRefusal = undefined;
+		if (heldSlot.refusal) releaseHeldLimitRefusal(heldSlot.refusal);
+		heldSlot.refusal = undefined;
 	};
 
 	/**
@@ -1622,8 +1657,8 @@ async function handleProxyRequest(
 	// age alone, while a held refusal proves an account authenticated and is
 	// the limit response Claude Code understands. A held refusal also wins over
 	// a sticky gateway rejection (terminalRejection) of another attempt.
-	if (heldLimitRefusal !== undefined) {
-		const held: HeldLimitRefusal = heldLimitRefusal;
+	if (heldSlot.refusal !== undefined) {
+		const held: HeldLimitRefusal = heldSlot.refusal;
 		if (needsReauth.length > 0) {
 			log.warn(
 				`Answering with an upstream limit refusal; OAuth tokens look expired for: ${needsReauth.map((acc) => acc.name).join(", ")}`,
@@ -1683,12 +1718,14 @@ async function handleProxyRequest(
 				return extra;
 			}
 		}
-		const answer: HeldLimitRefusal = heldLimitRefusal ?? held;
+		const answer: HeldLimitRefusal = heldSlot.refusal ?? held;
 		cacheBodyStore.discardStaged(requestMeta.id);
 		log.info(
 			`All candidates refused for limits; returning ${answer.account.name}'s upstream ${answer.status} to the client`,
 		);
 		const replay = replayLimitRefusal(answer, requestMeta.id);
+		// The replay now owns the held body: the client reads it.
+		heldSlot.refusal = undefined;
 		recordServedAccount(answer.account, replay);
 		return replay;
 	}
