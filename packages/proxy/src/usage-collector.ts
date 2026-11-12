@@ -48,6 +48,10 @@ interface RequestState {
 		inputTokens?: number;
 		cacheReadInputTokens?: number;
 		cacheCreationInputTokens?: number;
+		/** 5-minute part of cacheCreationInputTokens; null when not reported. */
+		cacheCreation5mInputTokens?: number | null;
+		/** 1-hour part of cacheCreationInputTokens; null when not reported. */
+		cacheCreation1hInputTokens?: number | null;
 		outputTokens?: number;
 		outputTokensComputed?: number;
 		totalTokens?: number;
@@ -74,6 +78,28 @@ interface RequestState {
 	payloadReleased: boolean;
 	retainedPayloadBytes: number;
 }
+
+/**
+ * One served request, handed to the served-usage sink. Structurally the
+ * `ServedEvent` of `@better-ccflare/forecast`.
+ */
+export interface ServedUsageEvent {
+	sessionId: string;
+	accountId: string;
+	/** Epoch ms when the collector finalized the response. */
+	at: number;
+	usage: {
+		model: string | null;
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadTokens: number;
+		cacheWriteTokens: number;
+		cacheWrite5mTokens: number | null;
+		cacheWrite1hTokens: number | null;
+	};
+}
+
+export type ServedUsageSink = (event: ServedUsageEvent) => void;
 
 interface PreparedPayload {
 	json: string;
@@ -194,6 +220,33 @@ function reportedCompletionTier(usage: unknown): string | undefined {
 	return typeof tier === "string" && tier.length > 0 ? tier : undefined;
 }
 
+function splitTokens(value: unknown): number | null {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: null;
+}
+
+/** Records the 5-minute / 1-hour split of a usage object's cache writes. */
+function recordCacheCreationSplit(usage: unknown, state: RequestState): void {
+	const split =
+		usage && typeof usage === "object"
+			? (usage as { cache_creation?: unknown }).cache_creation
+			: undefined;
+	const fields =
+		split && typeof split === "object"
+			? (split as {
+					ephemeral_5m_input_tokens?: unknown;
+					ephemeral_1h_input_tokens?: unknown;
+				})
+			: {};
+	state.usage.cacheCreation5mInputTokens = splitTokens(
+		fields.ephemeral_5m_input_tokens,
+	);
+	state.usage.cacheCreation1hInputTokens = splitTokens(
+		fields.ephemeral_1h_input_tokens,
+	);
+}
+
 // Extract usage data from non-stream JSON response bodies
 function extractUsageFromJson(
 	json: {
@@ -229,6 +282,7 @@ function extractUsageFromJson(
 	state.usage.cacheReadInputTokens = usageObj.cache_read_input_tokens ?? 0;
 	state.usage.cacheCreationInputTokens =
 		usageObj.cache_creation_input_tokens ?? 0;
+	recordCacheCreationSplit(usageObj, state);
 	state.usage.outputTokens = usageObj.output_tokens ?? 0;
 
 	// Calculate total tokens
@@ -281,6 +335,7 @@ function extractUsageFromData(
 				state.usage.cacheReadInputTokens = usage.cache_read_input_tokens || 0;
 				state.usage.cacheCreationInputTokens =
 					usage.cache_creation_input_tokens || 0;
+				recordCacheCreationSplit(usage, state);
 				state.usage.outputTokens = usage.output_tokens || 0;
 			}
 			if (parsed.message?.model) {
@@ -377,6 +432,7 @@ function extractUsageFromData(
 			if (parsed.usage.cache_creation_input_tokens !== undefined) {
 				state.usage.cacheCreationInputTokens =
 					parsed.usage.cache_creation_input_tokens;
+				recordCacheCreationSplit(parsed.usage, state);
 			}
 		}
 	} catch {
@@ -454,6 +510,7 @@ export class UsageCollector {
 	private readonly pendingHandleEnds = new Set<Promise<void>>();
 	private readonly pendingPricingFallbacks = new Set<() => void>();
 	private cleanupInterval: Timer | null = null;
+	private servedUsageSink: ServedUsageSink | null = null;
 	// Permanent once drain() is called — collector cannot estimate costs after this.
 	private draining = false;
 	private activePayloadBytes = 0;
@@ -481,6 +538,11 @@ export class UsageCollector {
 		);
 
 		this.startCleanupInterval();
+	}
+
+	/** Sets (or, with null, clears) the sink that receives served usage. */
+	setServedUsageSink(sink: ServedUsageSink | null): void {
+		this.servedUsageSink = sink;
 	}
 
 	handleStart(msg: StartMessage): void {
@@ -772,7 +834,8 @@ export class UsageCollector {
 		this.requests.delete(msg.requestId);
 
 		const { startMessage } = state;
-		const responseTime = Date.now() - startMessage.timestamp;
+		const completedAt = Date.now();
+		const responseTime = completedAt - startMessage.timestamp;
 
 		// Skip all database operations for ignored requests
 		if (state.shouldSkipLogging) {
@@ -1112,6 +1175,47 @@ export class UsageCollector {
 			state.usage.cacheCreationInputTokens,
 		);
 		this.onSummary(summary);
+		this.emitServedUsage(state, completedAt);
+	}
+
+	/**
+	 * Hands the request to the served-usage sink when it has a client session,
+	 * a serving account and token usage. A sink failure is logged and dropped.
+	 */
+	private emitServedUsage(state: RequestState, completedAt: number): void {
+		const sink = this.servedUsageSink;
+		if (!sink) return;
+		const { startMessage, usage } = state;
+		const sessionId = startMessage.clientSessionId;
+		const accountId = startMessage.accountId;
+		if (!sessionId || !accountId || accountId === NO_ACCOUNT_ID) return;
+		const hasUsage =
+			usage.inputTokens !== undefined ||
+			usage.outputTokens !== undefined ||
+			usage.cacheReadInputTokens !== undefined ||
+			usage.cacheCreationInputTokens !== undefined;
+		if (!hasUsage) return;
+		try {
+			sink({
+				sessionId,
+				accountId,
+				at: completedAt,
+				usage: {
+					model: usage.model ?? null,
+					inputTokens: usage.inputTokens ?? 0,
+					outputTokens: usage.outputTokens ?? 0,
+					cacheReadTokens: usage.cacheReadInputTokens ?? 0,
+					cacheWriteTokens: usage.cacheCreationInputTokens ?? 0,
+					cacheWrite5mTokens: usage.cacheCreation5mInputTokens ?? null,
+					cacheWrite1hTokens: usage.cacheCreation1hInputTokens ?? null,
+				},
+			});
+		} catch (error) {
+			log.warn(
+				`Served-usage sink failed for ${startMessage.requestId}:`,
+				error,
+			);
+		}
 	}
 
 	private releaseRequestPayload(state: RequestState): void {
