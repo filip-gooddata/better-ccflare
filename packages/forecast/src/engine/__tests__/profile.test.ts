@@ -48,6 +48,8 @@ describe("aggregated usage profile", () => {
 			expect(Number.isFinite(on) && Number.isFinite(off)).toBe(true);
 			rows.push(`${name}: noise on ${on}, off ${off}`);
 		}
-		console.info(`[engine] REPORT heavy low point\n  ${rows.join("\n  ")}`);
+		console.info(
+			`[engine] REPORT heavy low point (each run plans on its own scenarios: noise and changed advice combined)\n  ${rows.join("\n  ")}`,
+		);
 	});
 });

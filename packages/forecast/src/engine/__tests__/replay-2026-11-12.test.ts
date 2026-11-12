@@ -61,7 +61,7 @@ describe("2026-11-12 replay through compute()", () => {
 		]);
 	});
 
-	test("trace magnitude, pre-warm off: on demand the heavy line stops 14:54 to 16:00, and no opening ahead can help", async () => {
+	test("stop-time analogue, pre-warm off: the heavy line stops 14:54 to 16:00 and the plan opens nothing ahead", async () => {
 		const input = buildInput(
 			replayFixture({ hourly: replayHourly(TRACE_DEMAND_SCALE) }),
 		);

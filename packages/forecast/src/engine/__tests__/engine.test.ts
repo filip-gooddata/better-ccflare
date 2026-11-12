@@ -280,7 +280,8 @@ describe("cost", () => {
 			`[engine] compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
 		);
 		expect(turns).toBeGreaterThan(20);
-		expect(longestMs).toBeLessThan(75);
+		// design target about 25 ms; slack for a loaded test machine
+		expect(longestMs).toBeLessThan(40);
 	});
 
 	test("REPORT: median wall time and response sizes", async () => {

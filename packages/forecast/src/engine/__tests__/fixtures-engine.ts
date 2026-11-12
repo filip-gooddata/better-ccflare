@@ -33,7 +33,10 @@ export const DEFAULT_FAN_LEVELS = [
 
 /** 5-hour points per demand unit of both accounts (2026-11-12: ~205 points for ~108 units by 13:56). */
 export const K_FIVE_HOUR = 2;
-/** Weekly points per unit (2026-11-12: weekly rose about a fifth of the 5-hour points). */
+/**
+ * Weekly points per unit. Below the trace's ratio (weekly rose by about a fifth of the 5-hour
+ * points, k ≈ 0.4) so that a recorded week of the fixture stays under 100 weekly points.
+ */
 export const K_WEEKLY = 0.15;
 /** acct-a serves local hours before this one, acct-b from it on (calibration history). */
 const SPLIT_HOUR = 13;
@@ -257,12 +260,13 @@ const REPLAY_SCALES = [
 ];
 
 /**
- * Recorded days at this share of the 2026-11-12 shape: heavy days two accounts can still carry
+ * Scaled shape: recorded days at this share of the 2026-11-12 shape, heavy days two accounts can still carry
  * when acct-b's window opens early, which on-demand opening cannot (the acceptance case).
  */
 export const REPLAY_DEMAND_SCALE = 0.6;
 /**
- * At this share the on-demand heavy line stops 14:54 to 16:00 like the trace; heavy days then
+ * Stop-time analogue: at this share the on-demand heavy line stops 14:54 to 16:00 like the trace
+ * (the accounts' opening and full times are not matched); heavy days then
  * exceed what both accounts serve in a day whatever the plan.
  */
 export const TRACE_DEMAND_SCALE = 0.8;
