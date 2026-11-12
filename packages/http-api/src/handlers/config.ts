@@ -26,7 +26,11 @@ import {
 	setProviderModelDefaultOverrides,
 } from "@better-ccflare/providers";
 import { clearVisionCapability } from "@better-ccflare/proxy";
-import type { APIContext } from "@better-ccflare/types";
+import type {
+	APIContext,
+	SessionPaceSettings,
+	StrategyConfigResponse,
+} from "@better-ccflare/types";
 import {
 	allowedModelErrorMessage,
 	isAllowedModel,
@@ -40,6 +44,7 @@ export function createConfigHandlers(
 	config: Config,
 	runtime?: { port: number; tlsEnabled: boolean },
 	modelCatalog?: APIContext["modelCatalog"],
+	getSessionPaceSettings?: () => SessionPaceSettings,
 ) {
 	return {
 		/**
@@ -86,11 +91,16 @@ export function createConfigHandlers(
 			// strategySource mirrors the model-capacity-routing source field so
 			// the dashboard can lock the strategy control the same way when
 			// LB_STRATEGY overrides the config file. Additive field: existing
-			// consumers of `strategy` are unaffected.
-			return jsonResponse({
+			// consumers of `strategy` are unaffected. sessionPace is left out
+			// only when the entrypoint wires no settings source.
+			const body: Omit<StrategyConfigResponse, "sessionPace"> & {
+				sessionPace?: SessionPaceSettings;
+			} = {
 				strategy,
 				strategySource: config.getStrategySource(),
-			});
+			};
+			if (getSessionPaceSettings) body.sessionPace = getSessionPaceSettings();
+			return jsonResponse(body);
 		},
 
 		/**

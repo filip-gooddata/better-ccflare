@@ -89,3 +89,25 @@ export interface CleanupResponse {
 	dbSizeBytes: number;
 	tableRowCounts: Array<{ name: string; rowCount: number; dataBytes?: number }>;
 }
+
+/**
+ * Settings the session-pace strategy runs with, after env and config-file
+ * resolution and validation. While session-pace runs these are the running
+ * instance's values; otherwise the values it would be built with now.
+ */
+export interface SessionPaceSettings {
+	workDays: number;
+	familyGuardPct: number;
+	fiveHourGuardPct: number;
+	tieBandPct: number;
+	idleMs: number;
+	/** IANA zone the strategy splits local days in. */
+	timeZone: string;
+}
+
+/** GET /api/config/strategy */
+export interface StrategyConfigResponse {
+	strategy: string;
+	strategySource: "env" | "file" | "default";
+	sessionPace: SessionPaceSettings;
+}

@@ -245,6 +245,7 @@ export class APIRouter {
 			config,
 			this.context.runtime,
 			this.context.modelCatalog,
+			this.context.getSessionPaceSettings,
 		);
 		const logsStreamHandler = createLogsStreamHandler();
 		const logsHistoryHandler = createLogsHistoryHandler();

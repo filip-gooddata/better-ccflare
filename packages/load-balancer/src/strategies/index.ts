@@ -24,6 +24,7 @@ export type { SessionDrainSoonestMode } from "./session-drain-soonest";
 export { SessionDrainSoonestStrategy } from "./session-drain-soonest";
 export type { SessionPaceOptions } from "./session-pace";
 export {
+	localTimeZone,
 	SESSION_PACE_DEFAULTS,
 	SESSION_PACE_RECENT_PICK_WINDOW_MS,
 	SessionPaceStrategy,

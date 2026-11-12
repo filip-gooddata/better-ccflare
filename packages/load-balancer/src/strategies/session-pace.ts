@@ -53,7 +53,7 @@ export interface PaceBasis {
 }
 
 /** The IANA zone this process resolves as local (TZ, else the system zone). */
-function localTimeZone(): string {
+export function localTimeZone(): string {
 	return Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 }
 

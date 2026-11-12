@@ -34,14 +34,7 @@ import {
 	initPayloadEncryption,
 } from "@better-ccflare/database";
 import { AlertService, APIRouter, AuthService } from "@better-ccflare/http-api";
-import {
-	LeastUsedStrategy,
-	SessionAffinityStrategy,
-	SessionDrainSoonestStrategy,
-	type SessionPaceOptions,
-	SessionPaceStrategy,
-	SessionStrategy,
-} from "@better-ccflare/load-balancer";
+import { localTimeZone } from "@better-ccflare/load-balancer";
 import { Logger, setConsoleLogging } from "@better-ccflare/logger";
 import { handleResponsesRequest } from "@better-ccflare/openai-responses-adapter";
 import {
@@ -99,57 +92,20 @@ import {
 	unregisterRefreshClearer,
 } from "@better-ccflare/proxy";
 import { validatePathOrThrow } from "@better-ccflare/security";
-import {
-	type Account,
-	type LoadBalancingStrategy,
-	type RetentionStatus,
-	StrategyName,
-	type StrategyStore,
+import type {
+	Account,
+	LoadBalancingStrategy,
+	RetentionStatus,
+	StrategyStore,
 } from "@better-ccflare/types";
 import { serve } from "bun";
 import { createCodexUsageRefresher } from "./codex-usage-refresher";
+import {
+	buildStrategy,
+	sessionPaceOptionsFrom,
+	sessionPaceSettings,
+} from "./strategy";
 import { createVacuumScheduler, runVacuumBootstrap } from "./vacuum-scheduler";
-
-/**
- * Build a load-balancing strategy from its enum name. Add new strategies here
- * as additional cases. Falls back to SessionStrategy on unknown values.
- */
-function buildStrategy(
-	name: StrategyName,
-	sessionDurationMs: number,
-	paceOptions?: Partial<SessionPaceOptions>,
-): LoadBalancingStrategy {
-	switch (name) {
-		case StrategyName.LeastUsed:
-			return new LeastUsedStrategy();
-		case StrategyName.SessionAffinity:
-			return new SessionAffinityStrategy(sessionDurationMs);
-		case StrategyName.SessionDrainSoonest:
-			return new SessionDrainSoonestStrategy(sessionDurationMs);
-		case StrategyName.SessionDrainSoonestStrict:
-			return new SessionDrainSoonestStrategy(sessionDurationMs, "strict");
-		case StrategyName.SessionPace:
-			return new SessionPaceStrategy(paceOptions);
-		default:
-			return new SessionStrategy(sessionDurationMs);
-	}
-}
-
-function sessionPaceOptionsFrom(config: {
-	getSessionPaceFiveHourGuardPct(): number;
-	getSessionPaceFamilyGuardPct(): number;
-	getSessionPaceTieBandPct(): number;
-	getSessionPaceIdleMs(): number;
-	getSessionPaceWorkDays(): number;
-}): SessionPaceOptions {
-	return {
-		fiveHourGuardPct: config.getSessionPaceFiveHourGuardPct(),
-		familyGuardPct: config.getSessionPaceFamilyGuardPct(),
-		tieBandPct: config.getSessionPaceTieBandPct(),
-		idleMs: config.getSessionPaceIdleMs(),
-		workDays: config.getSessionPaceWorkDays(),
-	};
-}
 
 // Import embedded dashboard assets (will be bundled in compiled binary)
 let embeddedDashboard: Record<
@@ -1443,6 +1399,9 @@ export default async function startServer(options?: {
 	// Strategy is constructed below after RuntimeConfig is built. The router
 	// accepts a getter so it can read the live (post-hot-reload) instance.
 	let currentStrategy: LoadBalancingStrategy | null = null;
+	// What GET /api/config/strategy reports as the session-pace zone while
+	// another strategy runs; a session-pace instance reads the same zone.
+	const startTimeZone = localTimeZone();
 
 	// The model catalog needs a ProxyContext (account credentials, provider)
 	// that is only constructed later in this function. The router is built
@@ -1613,6 +1572,8 @@ export default async function startServer(options?: {
 		getRetentionStatus,
 		getVacuumStatus: () => dbOps.getVacuumStatus(),
 		getStrategy: () => currentStrategy,
+		getSessionPaceSettings: () =>
+			sessionPaceSettings(currentStrategy, config, startTimeZone),
 		internalProbeSecret,
 		localControlSecret,
 	});

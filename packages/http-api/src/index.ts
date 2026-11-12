@@ -2,6 +2,7 @@
 
 // Export handlers
 export { createAccountRequestTransformerUpdateHandler } from "./handlers/accounts";
+export { createConfigHandlers } from "./handlers/config";
 export * from "./handlers/storage";
 export { APIRouter } from "./router";
 export { AlertService } from "./services/alerts";

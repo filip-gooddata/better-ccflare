@@ -24,6 +24,7 @@ import type {
 	RequestResponse,
 	RequestTransformer,
 	StatsWithAccounts,
+	StrategyConfigResponse,
 	UsageHistoryResponse,
 } from "@better-ccflare/types";
 import { API_LIMITS, API_TIMEOUT } from "./constants";
@@ -1736,20 +1737,14 @@ class API extends HttpClient {
 		}
 	}
 
-	async getStrategy(): Promise<{
-		strategy: string;
-		strategySource: "env" | "file" | "default";
-	}> {
+	async getStrategy(): Promise<StrategyConfigResponse> {
 		const startTime = Date.now();
 		const url = "/api/config/strategy";
 
 		this.logger.debug(`→ GET ${url}`);
 
 		try {
-			const data = await this.get<{
-				strategy: string;
-				strategySource: "env" | "file" | "default";
-			}>(url);
+			const data = await this.get<StrategyConfigResponse>(url);
 			const duration = Date.now() - startTime;
 			this.logger.debug(`← GET ${url} - 200 (${duration}ms)`);
 			return data;

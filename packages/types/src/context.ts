@@ -6,7 +6,7 @@ import type {
 import type { CircuitBreaker } from "@better-ccflare/proxy";
 import type { Account } from "./account";
 import type { AlertEvent } from "./alerts";
-import type { RequestMeta } from "./api";
+import type { RequestMeta, SessionPaceSettings } from "./api";
 import type { ApiKey } from "./api-key";
 import type { IntegrityStatus, RetentionStatus, VacuumStatus } from "./stats";
 import type { StrategyStore } from "./strategy";
@@ -51,6 +51,8 @@ export interface APIContext {
 	getRetentionStatus?: () => RetentionStatus;
 	getVacuumStatus?: () => VacuumStatus;
 	getStrategy?: () => LoadBalancingStrategy | null;
+	/** Effective session-pace settings for GET /api/config/strategy. */
+	getSessionPaceSettings?: () => SessionPaceSettings;
 	/**
 	 * Live circuit breaker exposed by the proxy path. Optional so older
 	 * entrypoints that don't wire the breaker can still construct an
