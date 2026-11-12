@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import "@better-ccflare/core";
-import type { Config } from "@better-ccflare/config";
+import { type Config, resolveForecastSettings } from "@better-ccflare/config";
 import {
 	BunSqlAdapter,
 	type DatabaseOperations,
@@ -24,6 +24,13 @@ const pace: SessionPaceSettings = {
 	timeZone: "Europe/Prague",
 };
 
+const forecastSettings = resolveForecastSettings({
+	env: {},
+	file: {},
+	home: "/home/tester",
+	warn: () => {},
+});
+
 describe("APIRouter — GET /api/config/strategy", () => {
 	let db: Database;
 	let router: APIRouter;
@@ -44,6 +51,7 @@ describe("APIRouter — GET /api/config/strategy", () => {
 			getStrategySource: () => "env",
 			getUsageThrottlingFiveHourEnabled: () => false,
 			getUsageThrottlingWeeklyEnabled: () => false,
+			getForecastSettings: () => forecastSettings,
 		} as unknown as Config;
 		const getSessionPaceSettings: APIContext["getSessionPaceSettings"] = () =>
 			pace;
@@ -66,7 +74,7 @@ describe("APIRouter — GET /api/config/strategy", () => {
 		db.close();
 	});
 
-	it("returns strategy, strategySource and sessionPace", async () => {
+	it("returns strategy, strategySource, sessionPace and the forecast fields", async () => {
 		const url = new URL("http://localhost/api/config/strategy");
 		const res = await router.handleRequest(url, new Request(url));
 		expect(res?.status).toBe(200);
@@ -74,6 +82,8 @@ describe("APIRouter — GET /api/config/strategy", () => {
 			strategy: "session_pace",
 			strategySource: "env",
 			sessionPace: pace,
+			forecastSettings,
+			forecast: { path: "/api/forecast", contractVersion: 1 },
 		};
 		expect(await res?.json()).toEqual(expected);
 	});

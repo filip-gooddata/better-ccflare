@@ -78,6 +78,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@better-ccflare/core": "workspace:*",
+        "@better-ccflare/forecast": "workspace:*",
         "@better-ccflare/logger": "workspace:*",
         "@better-ccflare/security": "workspace:*",
       },
@@ -170,6 +171,7 @@
         "@better-ccflare/config": "workspace:*",
         "@better-ccflare/core": "workspace:*",
         "@better-ccflare/database": "workspace:*",
+        "@better-ccflare/forecast": "workspace:*",
         "@better-ccflare/oauth-flow": "workspace:*",
         "@better-ccflare/providers": "workspace:*",
         "@better-ccflare/proxy": "workspace:*",

@@ -3,7 +3,6 @@ export type {
 	AccountDeleteRequest,
 	AccountResponse,
 	AnalyticsResponse,
-	APIContext,
 	CacheInsightsResponse,
 	CacheInsightsRow,
 	CleanupResponse,
@@ -22,3 +21,17 @@ export type {
 	TokenBreakdown,
 	VacuumStatus,
 } from "@better-ccflare/types";
+
+import type { ForecastResponse } from "@better-ccflare/forecast";
+import type { APIContext as BaseAPIContext } from "@better-ccflare/types";
+
+/** Returns the forecast kept from the last computation; never computes. */
+export type ForecastProvider = () => ForecastResponse;
+
+/**
+ * The router context: the shared APIContext plus the optional forecast
+ * provider, which the server registers once the forecast service runs.
+ */
+export interface APIContext extends BaseAPIContext {
+	getForecast?: ForecastProvider;
+}

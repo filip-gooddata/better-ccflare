@@ -16,6 +16,10 @@ import {
 	validateString,
 } from "@better-ccflare/core";
 import {
+	FORECAST_CONTRACT_VERSION,
+	FORECAST_PATH,
+} from "@better-ccflare/forecast";
+import {
 	BadRequest,
 	errorResponse,
 	jsonResponse,
@@ -88,6 +92,7 @@ export function createConfigHandlers(
 		 */
 		getStrategy: (): Response => {
 			const strategy = config.getStrategy();
+			const forecastSettings = config.getForecastSettings();
 			// strategySource mirrors the model-capacity-routing source field so
 			// the dashboard can lock the strategy control the same way when
 			// LB_STRATEGY overrides the config file. Additive field: existing
@@ -96,7 +101,15 @@ export function createConfigHandlers(
 				strategy,
 				strategySource: config.getStrategySource(),
 				sessionPace: getSessionPaceSettings(),
+				forecastSettings,
 			};
+			// Discovery of GET /api/forecast, only while the forecast is on
+			// (docs/forecast-endpoint.md section 1).
+			if (forecastSettings.enabled)
+				body.forecast = {
+					path: FORECAST_PATH,
+					contractVersion: FORECAST_CONTRACT_VERSION,
+				};
 			return jsonResponse(body);
 		},
 

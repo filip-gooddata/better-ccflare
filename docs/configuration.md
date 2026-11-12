@@ -106,6 +106,44 @@ When every account that could serve a request is out only on limits (provider co
 
 `session-affinity` is not yet the default and must be opted into via `LB_STRATEGY=session-affinity` or `"lb_strategy": "session-affinity"` — it is deliberately not exposed in the dashboard's strategy selector, which only offers pure session-class options (see the dashboard's `RoutingCard` source for the current reasoning). If you run several concurrent Claude Code sessions against one account pool, it is worth trying; if you've run it in production, real-world feedback on account-ban rates is welcome on [#240](https://github.com/tombii/better-ccflare/issues/240).
 
+### Forecast Settings
+
+The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#get-forecast)). Its settings:
+
+| Setting | Environment variable | Config file key | Default | Range / format |
+|---------|----------------------|-----------------|---------|----------------|
+| `enabled` | `FORECAST_ENABLED` | `forecast_enabled` | `true` | boolean |
+| `routing` | `FORECAST_ROUTING` | `forecast_routing` | `true` | boolean |
+| `prewarm` | `FORECAST_PREWARM` | `forecast_prewarm` | `false` | boolean |
+| `prewarmTest` | `FORECAST_PREWARM_TEST` | `forecast_prewarm_test` | `null` | `{ "account": <name or id>, "at": <time> }` |
+| `claudePath` | `FORECAST_CLAUDE_PATH` | `forecast_claude_path` | `null` | absolute path |
+| `prewarmModel` | `FORECAST_PREWARM_MODEL` | `forecast_prewarm_model` | `haiku` | model alias or id (letters, digits, `. _ : - [ ]`, up to 100 characters) |
+| `prewarmMaxPerDay` | `FORECAST_PREWARM_MAX_PER_DAY` | `forecast_prewarm_max_per_day` | `4` | integer 0–24 |
+| `simulatedDays` | `FORECAST_SIMULATED_DAYS` | `forecast_simulated_days` | `400` | integer 50–2000 |
+| `timeShiftMin` | `FORECAST_TIME_SHIFT_MIN` | `forecast_time_shift_min` | `30` | 0–120 |
+| `transcriptsDir` | `FORECAST_TRANSCRIPTS_DIR` | `forecast_transcripts_dir` | `~/.claude/projects` (expanded) | absolute path, or `none` |
+| `fanLevels` | `FORECAST_FAN_LEVELS` | `forecast_fan_levels` | `12,14,…,48,52,…,88` (38 levels) | whole numbers 1–99 |
+| `minStopPoints` | `FORECAST_MIN_STOP_POINTS` | `forecast_min_stop_points` | `1` | 0–100 |
+| `moveMinGainPoints` | `FORECAST_MOVE_MIN_GAIN_POINTS` | `forecast_move_min_gain_points` | `2` | 0–100 |
+| `openMinGainPoints` | `FORECAST_OPEN_MIN_GAIN_POINTS` | `forecast_open_min_gain_points` | `1` | 0–100 |
+| `historyHalfLifeDays` | `FORECAST_HISTORY_HALF_LIFE_DAYS` | `forecast_history_half_life_days` | `14` | 1–365 |
+| `historyLookbackDays` | `FORECAST_HISTORY_LOOKBACK_DAYS` | `forecast_history_lookback_days` | `56` | integer 7–365 |
+| `recentTauMin` | `FORECAST_RECENT_TAU_MIN` | `forecast_recent_tau_min` | `45` | 1–720 |
+| `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
+
+How the values are read:
+
+- The environment variable wins over the config file key, which wins over the default. An empty environment variable counts as unset.
+- An invalid value is logged once as a warning and replaced by the default. An invalid environment value does not fall back to the config file value.
+- Numbers: out-of-range values are clamped to the range; integer settings are rounded. In the config file a number must be a JSON number.
+- Booleans: from the environment `true`, `1`, `yes`, `on` and `false`, `0`, `no`, `off` (any case); in the config file only JSON `true` and `false`.
+- Paths (`claudePath`, `transcriptsDir`): a leading `~` is expanded to the home directory and the result must be absolute. `none` turns the setting off, as do JSON `null` and an empty string in the config file.
+- `fanLevels`: in the environment a comma-separated list, or `none` for an empty fan; in the config file a JSON array. 10, 50 and 90 are dropped (they are always the named light, typical and heavy lines), duplicates are removed and the list is sorted. One bad entry makes the whole list invalid.
+- `prewarmTest`: in the environment JSON or `none`; in the config file a JSON object or `null`. `account` is an account name or id; `at` is epoch milliseconds or an ISO 8601 time with a zone (`Z` or `±hh:mm`).
+- Pre-warm is off by default (`prewarm` is `false`).
+
+The config file is read once, at start, so an edit to it applies after the next restart. `GET /api/config/strategy` reports the resolved values under `forecastSettings` (see [Get Current Strategy](#get-current-strategy)). The response format is specified in [forecast-endpoint.md](forecast-endpoint.md).
+
 ### Logging Configuration (Environment Only)
 
 | Variable | Type | Default | Description |
@@ -496,6 +534,23 @@ Response:
 - While `session-pace` runs, the values are the running strategy's own, including its zone. A setting it has not picked up is not shown.
 - While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
 - The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
+
+`forecastSettings` is always present. It holds the 18 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `sessionTurnoverMin`).
+
+`forecast` is present only while the forecast setting `enabled` is `true`:
+
+```json
+"forecast": { "path": "/api/forecast", "contractVersion": 1 }
+```
+
+A client calls `path` only when the field is present and it understands `contractVersion`. Every other field of this response is unchanged.
+
+#### Get Forecast
+```http
+GET /api/forecast
+```
+
+Read-only, with the same access rules as `GET /api/config/strategy`. The response carries `Cache-Control: no-store`. It serves the forecast the server has computed; the request itself never triggers a computation. When the forecast is off, or none is provided, it serves the "no forecast" shape with `reason: "disabled"`; when computing the forecast failed, the same shape with `reason: "error"`. While the forecast is on, these fallbacks still carry `prewarm`: the lists from the last forecast, or empty lists, with `enabled` taken from the current setting. The response format is specified in [forecast-endpoint.md](forecast-endpoint.md).
 
 #### Update Strategy
 ```http

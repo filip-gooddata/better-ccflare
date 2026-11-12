@@ -85,6 +85,7 @@ import {
 	createHeapStatsHandler,
 	createRssHandler,
 } from "./handlers/debug";
+import { createForecastHandler } from "./handlers/forecast";
 import { createHealthHandler } from "./handlers/health";
 import {
 	createAnomalyInsightsHandler,
@@ -432,6 +433,11 @@ export class APIRouter {
 		this.handlers.set("GET:/api/config/strategy", () =>
 			configHandlers.getStrategy(),
 		);
+		const forecastHandler = createForecastHandler(
+			() => config.getForecastSettings(),
+			this.context.getForecast,
+		);
+		this.handlers.set("GET:/api/forecast", () => forecastHandler());
 		this.handlers.set("POST:/api/config/strategy", (req) =>
 			configHandlers.setStrategy(req),
 		);

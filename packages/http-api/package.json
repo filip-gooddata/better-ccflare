@@ -13,6 +13,7 @@
 		"@better-ccflare/agents": "workspace:*",
 		"@better-ccflare/core": "workspace:*",
 		"@better-ccflare/database": "workspace:*",
+		"@better-ccflare/forecast": "workspace:*",
 		"@better-ccflare/config": "workspace:*",
 		"@better-ccflare/oauth-flow": "workspace:*",
 		"@better-ccflare/providers": "workspace:*",

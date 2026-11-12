@@ -1,3 +1,4 @@
+import type { ForecastSettings } from "@better-ccflare/forecast";
 import type { AllowedModel } from "./agent";
 import type {
 	AgentAttributionSource,
@@ -110,4 +111,14 @@ export interface StrategyConfigResponse {
 	strategy: string;
 	strategySource: "env" | "file" | "default";
 	sessionPace: SessionPaceSettings;
+	/** Effective forecast settings (always present). */
+	forecastSettings: ForecastSettings;
+	/** Discovery of GET /api/forecast; present only while the forecast is enabled. */
+	forecast?: ForecastDiscovery;
+}
+
+/** `forecast` field of GET /api/config/strategy (docs/forecast-endpoint.md section 1). */
+export interface ForecastDiscovery {
+	path: string;
+	contractVersion: number;
 }
