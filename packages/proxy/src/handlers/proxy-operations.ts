@@ -14,7 +14,10 @@ import {
 	stripModelRouting,
 	TIME_CONSTANTS,
 } from "@better-ccflare/core";
-import { withSanitizedProxyHeaders } from "@better-ccflare/http-common";
+import {
+	sanitizeProxyHeaders,
+	withSanitizedProxyHeaders,
+} from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
 import { stripCacheControlFromOpenAIRequest } from "@better-ccflare/openai-formats";
 import {
@@ -51,6 +54,7 @@ import { forwardToClient as defaultForwardToClient } from "../response-handler";
 import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
+import { isAllLimitedSelection } from "./limit-blocked";
 import { markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
@@ -1227,7 +1231,16 @@ async function readBoundedBody(
 	body: ReadableStream<Uint8Array> | null,
 	maxBytes: number,
 ): Promise<string | null> {
-	if (!body) return "";
+	const bytes = await readBoundedBytes(body, maxBytes);
+	return bytes === null ? null : new TextDecoder().decode(bytes);
+}
+
+/** {@link readBoundedBody} without the decode: the body's exact bytes. */
+async function readBoundedBytes(
+	body: ReadableStream<Uint8Array> | null,
+	maxBytes: number,
+): Promise<Uint8Array<ArrayBuffer> | null> {
+	if (!body) return new Uint8Array(0);
 	const reader = body.getReader();
 	const chunks: Uint8Array[] = [];
 	let total = 0;
@@ -1251,7 +1264,40 @@ async function readBoundedBody(
 		merged.set(chunk, offset);
 		offset += chunk.byteLength;
 	}
-	return new TextDecoder().decode(merged);
+	return merged;
+}
+
+/**
+ * An upstream limit refusal kept whole (status, headers, body bytes) while
+ * failover goes on. Kept only under a strategy with `selectWhenAllLimited`:
+ * when every candidate refuses, the proxy answers with a genuine upstream
+ * limit response instead of a composed `pool_exhausted` (failover path C).
+ */
+export interface HeldLimitRefusal {
+	account: Account;
+	status: number;
+	statusText: string;
+	headers: Headers;
+	body: Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * Rebuild a held refusal for the client: the upstream status, body bytes and
+ * headers, minus the ones every proxied response loses (Bun already decoded
+ * the body, see sanitizeProxyHeaders), plus the request-id tag every proxied
+ * response carries.
+ */
+export function replayLimitRefusal(
+	held: HeldLimitRefusal,
+	requestId: string,
+): Response {
+	const headers = sanitizeProxyHeaders(held.headers);
+	headers.set("x-better-ccflare-request-id", requestId);
+	return new Response(held.body, {
+		status: held.status,
+		statusText: held.statusText,
+		headers,
+	});
 }
 
 /**
@@ -1393,7 +1439,42 @@ export async function proxyWithAccount(
 	 * returning it would stop failover.
 	 */
 	onTerminalRejection?: (capture: () => Promise<Response | null>) => void,
+	/**
+	 * Receives this attempt's upstream limit refusal (a 429 the proxy fails
+	 * over from) when the strategy has `selectWhenAllLimited`. The attempt still
+	 * returns `null`; the caller answers with a held refusal only once every
+	 * candidate has refused (failover path C). Without a receiver, or under any
+	 * other strategy, the refusal is drained as before.
+	 */
+	onLimitRefusal?: (refusal: HeldLimitRefusal) => void,
 ): Promise<Response | null> {
+	/**
+	 * Fail over from an upstream limit refusal: hand it to `onLimitRefusal`
+	 * when the all-limited rule can use it. Returns false when it was not
+	 * held (no receiver, another strategy, or a body over the bound, which is
+	 * no error envelope worth replaying); the caller then drains it.
+	 */
+	const holdLimitRefusal = async (rawResponse: Response): Promise<boolean> => {
+		if (!onLimitRefusal || !ctx.strategy.selectWhenAllLimited) return false;
+		let body: Uint8Array<ArrayBuffer> | null = null;
+		try {
+			body = await readBoundedBytes(
+				rawResponse.body,
+				MAX_TERMINAL_REJECTION_BYTES,
+			);
+		} catch {
+			body = null;
+		}
+		if (body === null) return false;
+		onLimitRefusal({
+			account,
+			status: rawResponse.status,
+			statusText: rawResponse.statusText,
+			headers: new Headers(rawResponse.headers),
+			body,
+		});
+		return true;
+	};
 	try {
 		// Extracted once for the whole call: every direct `saveRequest` audit
 		// site below (403/429/400 classification exits that never reach the
@@ -2330,7 +2411,9 @@ export async function proxyWithAccount(
 						gatewayHint.contextCompacted,
 					),
 				);
-				cancelDiscardedResponseBody(rawResponse);
+				if (!(await holdLimitRefusal(rawResponse))) {
+					cancelDiscardedResponseBody(rawResponse);
+				}
 				return null;
 			}
 			return NOT_CLASSIFIED;
@@ -2434,7 +2517,9 @@ export async function proxyWithAccount(
 							gatewayHint.contextCompacted,
 						),
 					);
-					cancelDiscardedResponseBody(rawResponse);
+					if (!(await holdLimitRefusal(rawResponse))) {
+						cancelDiscardedResponseBody(rawResponse);
+					}
 					return null;
 				}
 
@@ -2553,11 +2638,14 @@ export async function proxyWithAccount(
 						resetTime: cooldown.until,
 						resetIsInferred,
 						reason,
+						preserveStreak: isAllLimitedSelection(requestMeta),
 					},
 					ctx,
 				);
 				saveNoFallback429AuditRow();
-				cancelDiscardedResponseBody(rawResponse);
+				if (!(await holdLimitRefusal(rawResponse))) {
+					cancelDiscardedResponseBody(rawResponse);
+				}
 				return null;
 			}
 			return NOT_CLASSIFIED;
@@ -3222,6 +3310,7 @@ export async function proxyWithAccount(
 									(cooldown.source === "provider" &&
 										providerReset.resetIsInferred),
 								reason,
+								preserveStreak: isAllLimitedSelection(requestMeta),
 							},
 							ctx,
 						);
@@ -3263,7 +3352,13 @@ export async function proxyWithAccount(
 						);
 					}
 				}
-				cancelDiscardedResponseBody(rawResponse);
+				const held =
+					rawResponse.status === 429 &&
+					!isInternalProbe(req.headers, ctx, "keepalive") &&
+					(await holdLimitRefusal(rawResponse));
+				if (!held) {
+					cancelDiscardedResponseBody(rawResponse);
+				}
 				return null;
 			}
 

@@ -251,6 +251,15 @@ export function applyRateLimitCooldown(
 		resetIsInferred?: boolean;
 		remaining?: number;
 		reason?: RateLimitReason;
+		/**
+		 * The refusal came from an account the all-limited rule chose while it
+		 * was already known to be out on a limit (limit-blocked.ts). Such a
+		 * refusal is expected, so it sets the cooldown from the response as
+		 * usual but leaves the streak, the ramp tier and the circuit breaker
+		 * untouched: repeating it must not lengthen any backoff or arm the
+		 * single-flight recovery gate once the reset passes.
+		 */
+		preserveStreak?: boolean;
 	},
 	ctx: ProxyContext,
 	breaker: CircuitBreaker = getDefaultCircuitBreaker(),
@@ -278,7 +287,14 @@ export function applyRateLimitCooldown(
 	// request may compute one tier short, but the persisted counter still ramps
 	// correctly. Unused for the transient upstream reasons — their duration no
 	// longer derives from this (frozen) counter.
-	const nextCount = account.consecutive_rate_limits + 1;
+	//
+	// An expected refusal on the all-limited rule path keeps the current tier
+	// (at least the first) instead of climbing it.
+	const preserveStreak =
+		rateLimitInfo.preserveStreak === true && !isTransientUpstream;
+	const nextCount = preserveStreak
+		? Math.max(account.consecutive_rate_limits, 1)
+		: account.consecutive_rate_limits + 1;
 
 	let cooldownUntil: number;
 	if (isOverloadNoReset) {
@@ -364,17 +380,20 @@ export function applyRateLimitCooldown(
 	// per-site mapping. Failures suppressed by the forward guard above
 	// never reach this call, which is what prevents double-counting when a
 	// 529 or 5xx arrives mid-429-bench.
-	breaker.recordFailure(
-		{ provider: account.provider, accountId: account.id },
-		reason,
-		now,
-	);
+	// An expected refusal on the all-limited rule path is not a failure signal.
+	if (!preserveStreak) {
+		breaker.recordFailure(
+			{ provider: account.provider, accountId: account.id },
+			reason,
+			now,
+		);
+	}
 
 	// In-memory update so the rest of this request sees consistent state.
 	account.rate_limited_until = cooldownUntil;
 	account.rate_limited_at = now;
 	account.rate_limited_reason = reason;
-	if (!isTransientUpstream) {
+	if (!isTransientUpstream && !preserveStreak) {
 		account.consecutive_rate_limits = nextCount;
 	}
 	const wasRecoveryProbe = probeLeases.has(account.id);
@@ -391,7 +410,7 @@ export function applyRateLimitCooldown(
 				account.id,
 				cooldownUntil,
 				reason,
-				!isTransientUpstream,
+				!isTransientUpstream && !preserveStreak,
 			);
 		// Reconcile in-memory counter with the authoritative DB value (may differ
 		// under concurrent 429s for the same account). Skipped for the transient

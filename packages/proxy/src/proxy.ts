@@ -50,6 +50,14 @@ import {
 	validateProviderPath,
 } from "./handlers";
 import {
+	markAllLimitedSelection,
+	selectAllLimitedTarget,
+} from "./handlers/limit-blocked";
+import {
+	type HeldLimitRefusal,
+	replayLimitRefusal,
+} from "./handlers/proxy-operations";
+import {
 	completeRateLimitProbe,
 	getRateLimitProbeAdmission,
 	wouldSuppressProbe,
@@ -1134,6 +1142,17 @@ async function handleProxyRequest(
 	// later attempt failing for an unrelated reason (429, 5xx) must not
 	// erase the explanation.
 	let terminalRejection: (() => Promise<Response | null>) | undefined;
+	// The last upstream limit refusal of this request, kept only when the
+	// strategy has the all-limited rule (proxyWithAccount checks that) and the
+	// route is not a combo. Last-wins: failover path C answers with the refusal
+	// of the account that becomes usable first, which is decided only once every
+	// candidate has refused. See the all-fail branch below.
+	let heldLimitRefusal: HeldLimitRefusal | undefined;
+	const holdLimitRefusal = filteredComboInfo?.comboName
+		? undefined
+		: (refusal: HeldLimitRefusal) => {
+				heldLimitRefusal = refusal;
+			};
 
 	/**
 	 * How the combo loop resolves the model override for index `index`: the
@@ -1235,6 +1254,7 @@ async function handleProxyRequest(
 				(capture: () => Promise<Response | null>) => {
 					terminalRejection = capture;
 				},
+				holdLimitRefusal,
 			);
 		} finally {
 			if (probeAdmission === "admitted") {
@@ -1321,6 +1341,7 @@ async function handleProxyRequest(
 				(capture: () => Promise<Response | null>) => {
 					terminalRejection = capture;
 				},
+				holdLimitRefusal,
 			);
 
 			if (response) {
@@ -1572,6 +1593,81 @@ async function handleProxyRequest(
 	// asked holding the verdict open, so this cannot pre-empt a reauth message
 	// that would actually have been the actionable one.
 	if (everyEligibleRouteIsBlind()) return await visionRefusal();
+
+	// Failover path C: every candidate refused, at least one of them for a
+	// limit, under a strategy with the all-limited rule. Answer with a genuine
+	// upstream limit response, never the composed 503: the refusal of the
+	// account that becomes usable first. The refusals above have just set
+	// their cooldowns, so the rule now sees them; when its pick is not the
+	// account whose refusal is held, that account is asked once more (on the
+	// rule path, so its refusal leaves the streak alone) and its answer goes
+	// to the client. Without a response from it, the held refusal does.
+	//
+	// This comes before the re-authentication answer: that one rests on token
+	// age alone, while a held refusal proves an account authenticated and is
+	// the limit response Claude Code understands. A held refusal also wins over
+	// a sticky gateway rejection (terminalRejection) of another attempt.
+	if (heldLimitRefusal !== undefined) {
+		const held: HeldLimitRefusal = heldLimitRefusal;
+		if (needsReauth.length > 0) {
+			log.warn(
+				`Answering with an upstream limit refusal; OAuth tokens look expired for: ${needsReauth.map((acc) => acc.name).join(", ")}`,
+			);
+		}
+		// Cooldown writes go through the async writer, so the stored rows may
+		// not show the refusals this request just received yet. The candidate
+		// objects carry them already: overlay the later cooldown onto each row.
+		const attempted = new Map(allAttemptedAccounts.map((acc) => [acc.id, acc]));
+		const rows = (await ctx.dbOps.getAllAccounts()).map((row) => {
+			const seen = attempted.get(row.id);
+			return seen &&
+				(seen.rate_limited_until ?? 0) > (row.rate_limited_until ?? 0)
+				? { ...row, rate_limited_until: seen.rate_limited_until }
+				: row;
+		});
+		const target = await selectAllLimitedTarget(
+			ctx,
+			requestMeta,
+			effectiveModel ?? undefined,
+			Date.now(),
+			rows,
+		);
+		if (target && target.id !== held.account.id) {
+			markAllLimitedSelection(requestMeta, target.id);
+			log.info(
+				`All candidates refused for limits; asking ${target.name}, the account usable first, once more instead of answering with ${held.account.name}'s refusal`,
+			);
+			const extra = await proxyWithAccount(
+				req,
+				url,
+				target,
+				requestMeta,
+				finalBodyBuffer,
+				finalCreateBodyStream,
+				allAttemptedAccounts.length,
+				ctx,
+				null,
+				apiKeyId,
+				apiKeyName,
+				requestBodyContext,
+				true,
+				undefined,
+				holdLimitRefusal,
+			);
+			if (extra) {
+				recordServedAccount(target, extra);
+				return extra;
+			}
+		}
+		const answer: HeldLimitRefusal = heldLimitRefusal ?? held;
+		cacheBodyStore.discardStaged(requestMeta.id);
+		log.info(
+			`All candidates refused for limits; returning ${answer.account.name}'s upstream ${answer.status} to the client`,
+		);
+		const replay = replayLimitRefusal(answer, requestMeta.id);
+		recordServedAccount(answer.account, replay);
+		return replay;
+	}
 
 	if (needsReauth.length > 0) {
 		// Quote account names to prevent command injection (defense-in-depth)
