@@ -44,6 +44,7 @@ import { resolveDbPath } from "./paths";
 import {
 	AccountRepository,
 	type ClearedRateLimit,
+	type MarkAccountRateLimitedOptions,
 	type MarkAccountRateLimitedResult,
 } from "./repositories/account.repository";
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
@@ -1161,6 +1162,7 @@ OAuth tokens will need to be re-authenticated.
 		until: number,
 		reason: RateLimitReason,
 		incrementStreak = true,
+		options: MarkAccountRateLimitedOptions = {},
 	): Promise<MarkAccountRateLimitedResult> {
 		return withDatabaseRetry(
 			() =>
@@ -1169,6 +1171,7 @@ OAuth tokens will need to be re-authenticated.
 					until,
 					reason,
 					incrementStreak,
+					options,
 				),
 			this.retryConfig,
 			"markAccountRateLimited",

@@ -21,6 +21,16 @@ export interface MarkAccountRateLimitedResult {
 }
 
 /**
+ * Options for {@link AccountRepository.markAccountRateLimited}.
+ * `authoritativeObservedAt` (only read when the streak is not incremented)
+ * marks `until` as an upstream-reported reset observed at that time: it
+ * replaces an older stored deadline even when earlier.
+ */
+export interface MarkAccountRateLimitedOptions {
+	authoritativeObservedAt?: number;
+}
+
+/**
  * Identifiers for an account whose `rate_limited_until` was just cleared
  * by `AccountRepository.clearExpiredRateLimits`. Returned so the caller
  * can notify the circuit breaker (`recordSuccess`) — see the active-clear
@@ -300,6 +310,7 @@ export class AccountRepository extends BaseRepository<Account> {
 		until: number,
 		reason: RateLimitReason,
 		incrementStreak = true,
+		options: MarkAccountRateLimitedOptions = {},
 	): Promise<MarkAccountRateLimitedResult> {
 		// Applying a bench also drops the last unified-header snapshot
 		// (`rate_limit_status` / `rate_limit_reset` / `rate_limit_reset_at`).
@@ -328,6 +339,39 @@ export class AccountRepository extends BaseRepository<Account> {
          WHERE id = ?`,
 				[until, reason, Date.now(), accountId],
 			);
+		} else if (options.authoritativeObservedAt != null) {
+			// An upstream-reported reset replaces the stored deadline even when
+			// it is earlier, leaving the streak untouched. A cooldown stamped
+			// after this response was observed came from a newer concurrent
+			// write and may only be extended, never shortened.
+			const changes = await this.runWithChanges(
+				`UPDATE accounts
+           SET rate_limited_until      = ?,
+               rate_limited_reason     = ?,
+               rate_limited_at         = ?,
+               rate_limit_status       = NULL,
+               rate_limit_reset        = NULL,
+               rate_limit_reset_at     = NULL
+         WHERE id = ?
+           AND (rate_limited_until IS NULL
+                OR rate_limited_until <= ?
+                OR rate_limited_at IS NULL
+                OR rate_limited_at <= ?)`,
+				[
+					until,
+					reason,
+					Date.now(),
+					accountId,
+					until,
+					options.authoritativeObservedAt,
+				],
+			);
+			applied = changes > 0;
+			if (!applied) {
+				log.warn(
+					`[ccflare] account=${accountId} rate_limited_write_skipped reason=${reason} candidate_until=${new Date(until).toISOString()} — guarded write skipped: a later cooldown was stamped after this response, or the row is absent`,
+				);
+			}
 		} else {
 			// 529 overload: cooldown state moves, but the 429 streak counter
 			// is left untouched — an overload is not a quota signal.
