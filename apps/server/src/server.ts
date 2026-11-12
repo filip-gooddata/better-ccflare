@@ -99,6 +99,7 @@ import type {
 	StrategyStore,
 } from "@better-ccflare/types";
 import { serve } from "bun";
+import { createUnservedApiGuard } from "./api-guard";
 import { createCodexUsageRefresher } from "./codex-usage-refresher";
 import {
 	buildStrategy,
@@ -1577,6 +1578,9 @@ export default async function startServer(options?: {
 		internalProbeSecret,
 		localControlSecret,
 	});
+	const unservedApiGuard = createUnservedApiGuard({
+		logger: new Logger("ApiGuard"),
+	});
 
 	// Initialize AuthService for proxy authentication
 	const authService = new AuthService(
@@ -1938,6 +1942,10 @@ export default async function startServer(options?: {
 				const apiResponse = await apiRouter.handleRequest(url, req);
 				if (apiResponse) {
 					return apiResponse;
+				}
+				const unservedApiResponse = unservedApiGuard(url, req.method);
+				if (unservedApiResponse) {
+					return unservedApiResponse;
 				}
 
 				// All other paths go to proxy
