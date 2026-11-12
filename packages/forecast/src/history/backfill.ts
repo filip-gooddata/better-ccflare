@@ -72,6 +72,8 @@ export interface BackfillCounts {
 	responses: number;
 	/** Bucket rows upserted. */
 	rows: number;
+	/** Stale transcript buckets zeroed because the cut-over moved earlier since an interrupted attempt. */
+	cleared: number;
 }
 
 /**
@@ -106,6 +108,7 @@ function emptyCounts(): BackfillCounts {
 		afterCutover: 0,
 		responses: 0,
 		rows: 0,
+		cleared: 0,
 	};
 }
 
@@ -160,22 +163,33 @@ function usageMetadata(line: ScannedLine): ParsedLine | null {
  * The cut-over is fixed by the first attempt and kept in forecast_meta, so a
  * rerun after an interruption stores exactly the buckets the first attempt
  * would have. It only ever moves earlier: if the proxy has meanwhile recorded
- * an earlier bucket, transcript rows stop before that one.
+ * an earlier bucket, transcript rows stop before that one, and `previous`
+ * names the old cut-over so rows an earlier attempt wrote in between can be
+ * cleared. The moved cut-over is persisted only after that clearing.
  */
-async function resolveCutover(
-	deps: TranscriptBackfillDeps,
-): Promise<{ cutover: EpochMs; source: CutoverSource }> {
+async function resolveCutover(deps: TranscriptBackfillDeps): Promise<{
+	cutover: EpochMs;
+	source: CutoverSource;
+	previous: EpochMs | null;
+}> {
 	const earliest = await deps.earliestProxyBucket();
 	const fresh = bucketStart(earliest ?? deps.now());
+	const source = earliest === null ? "now" : "proxy";
 	const storedText = await deps.store.getMeta(
 		TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
 	);
 	const stored = storedText === null ? Number.NaN : Number(storedText);
-	if (Number.isFinite(stored) && stored <= fresh) {
-		return { cutover: stored, source: "resumed" };
+	if (!Number.isFinite(stored)) {
+		await deps.store.setMeta(
+			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+			String(fresh),
+		);
+		return { cutover: fresh, source, previous: null };
 	}
-	await deps.store.setMeta(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY, String(fresh));
-	return { cutover: fresh, source: earliest === null ? "now" : "proxy" };
+	if (stored <= fresh) {
+		return { cutover: stored, source: "resumed", previous: null };
+	}
+	return { cutover: fresh, source, previous: stored };
 }
 
 class Slicer {
@@ -276,7 +290,11 @@ export async function runTranscriptBackfill(
 		return { status: "no_dir", ...counts };
 	}
 
-	const { cutover, source: cutoverSource } = await resolveCutover(deps);
+	const {
+		cutover,
+		source: cutoverSource,
+		previous,
+	} = await resolveCutover(deps);
 
 	const slicer = new Slicer(deps.sliceBudgetMs ?? DEFAULT_SLICE_BUDGET_MS);
 	const chunkBytes = Math.max(
@@ -334,12 +352,15 @@ export async function runTranscriptBackfill(
 	}
 
 	const buckets = new Map<EpochMs, StoredDemandRow>();
+	/** Buckets an earlier attempt may have stored before the cut-over moved earlier. */
+	const stale = new Set<EpochMs>();
 	for (const group of [responses.values(), unkeyed.values()]) {
 		for (const response of group) {
 			await slicer.maybeYield();
 			const start = bucketStart(response.at);
 			if (start >= cutover) {
 				counts.afterCutover++;
+				if (previous !== null && start < previous) stale.add(start);
 				continue;
 			}
 			counts.responses++;
@@ -362,17 +383,45 @@ export async function runTranscriptBackfill(
 		}
 	}
 
-	// Rows replace by (start, accountId, source) and each holds its bucket's
-	// full total, so a rerun after an interruption rewrites the same values.
-	const rows = [...buckets.values()].sort((a, b) => a.start - b.start);
 	const batchSize = Math.max(
 		1,
 		deps.upsertBatchSize ?? DEFAULT_UPSERT_BATCH_SIZE,
 	);
-	for (let i = 0; i < rows.length; i += batchSize) {
-		await deps.store.upsert(rows.slice(i, i + batchSize));
-		await slicer.maybeYield();
+	const upsertAll = async (rows: StoredDemandRow[]): Promise<void> => {
+		for (let i = 0; i < rows.length; i += batchSize) {
+			await deps.store.upsert(rows.slice(i, i + batchSize));
+			await slicer.maybeYield();
+		}
+	};
+
+	if (previous !== null) {
+		// DemandStore cannot delete; an all-zero row replaces a stale transcript
+		// row and adds nothing to any sum. Only then is the new cut-over kept,
+		// so an interruption here repeats the clearing on the next attempt.
+		const zeroRows = [...stale]
+			.sort((a, b) => a - b)
+			.map(
+				(start): StoredDemandRow => ({
+					start,
+					accountId: "",
+					source: "transcript",
+					units: 0,
+					fableUnits: 0,
+					requests: 0,
+				}),
+			);
+		await upsertAll(zeroRows);
+		counts.cleared = zeroRows.length;
+		await deps.store.setMeta(
+			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+			String(cutover),
+		);
 	}
+
+	// Rows replace by (start, accountId, source) and each holds its bucket's
+	// full total, so a rerun after an interruption rewrites the same values.
+	const rows = [...buckets.values()].sort((a, b) => a.start - b.start);
+	await upsertAll(rows);
 	counts.rows = rows.length;
 
 	await deps.store.setMeta(

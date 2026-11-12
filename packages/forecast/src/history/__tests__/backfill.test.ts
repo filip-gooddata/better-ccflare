@@ -14,6 +14,7 @@ import { BUCKET_MS } from "../../types";
 import { bucketStart, demandUnits } from "../../units";
 import {
 	runTranscriptBackfill,
+	TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
 	TRANSCRIPT_BACKFILL_META_KEY,
 	type TranscriptBackfillDeps,
 } from "../backfill";
@@ -600,8 +601,87 @@ describe("resumability", () => {
 			expect(result.cutover).toBe(earlier);
 			expect(result.cutoverSource).toBe("proxy");
 		}
-		expect(store.sorted().every((row) => row.start < earlier)).toBe(true);
+		expect(
+			store
+				.sorted()
+				.every(
+					(row) =>
+						row.start < earlier || (row.requests === 0 && row.units === 0),
+				),
+		).toBe(true);
 		expect(store.sorted().length).toBeGreaterThan(0);
+	});
+
+	test("rows written above a cut-over that later moved earlier are zeroed, even across another interruption", async () => {
+		await writeCorpus();
+		const earlier = T0 + 3_600_000;
+		const batches = { upsertBatchSize: 10 };
+		const reference = new FakeStore();
+		await runTranscriptBackfill(
+			deps(reference, { ...batches, earliestProxyBucket: async () => earlier }),
+		);
+
+		const store = new FakeStore();
+		store.failOnUpsertCall = 3;
+		await expect(runTranscriptBackfill(deps(store, batches))).rejects.toThrow();
+		expect(store.sorted().some((row) => row.start >= earlier)).toBe(true);
+
+		// The clearing itself is interrupted once.
+		store.failOnUpsertCall = store.upsertCalls + 1;
+		await expect(
+			runTranscriptBackfill(
+				deps(store, { ...batches, earliestProxyBucket: async () => earlier }),
+			),
+		).rejects.toThrow();
+		expect(store.meta.get(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			String(CUTOVER),
+		);
+
+		store.failOnUpsertCall = null;
+		const result = await runTranscriptBackfill(
+			deps(store, { ...batches, earliestProxyBucket: async () => earlier }),
+		);
+		expect(result.status).toBe("done");
+		expect(result.cleared).toBeGreaterThan(0);
+		expect(store.meta.get(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			String(earlier),
+		);
+
+		const live = store
+			.sorted()
+			.filter((row) => row.requests > 0 || row.units > 0);
+		expect(live).toEqual(reference.sorted());
+		for (const row of store.sorted().filter((r) => r.start >= earlier)) {
+			expect(row).toMatchObject({ units: 0, fableUnits: 0, requests: 0 });
+		}
+	});
+
+	test("a single very long line is read whole without blocking the event loop", async () => {
+		const big: LineSpec = {
+			at: T0,
+			messageId: "big",
+			text: "z".repeat(8_000_000),
+		};
+		await writeJsonl("p/s.jsonl", [
+			assistantLine(big),
+			assistantLine({ at: T0, messageId: "small" }),
+		]);
+		const store = new FakeStore();
+		let maxGap = 0;
+		let last = performance.now();
+		const timer = setInterval(() => {
+			const t = performance.now();
+			maxGap = Math.max(maxGap, t - last);
+			last = t;
+		}, 1);
+		const result = await runTranscriptBackfill(deps(store));
+		clearInterval(timer);
+		expect(result.responses).toBe(2);
+		expect(store.sorted()[0]?.units).toBeCloseTo(
+			demandUnits(usageOf(big)) + demandUnits(usageOf({ at: T0 })),
+			12,
+		);
+		expect(maxGap).toBeLessThan(60);
 	});
 
 	test("the marker is written only after every row is upserted", async () => {
