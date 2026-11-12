@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { EpochMs, LimitReading } from "../../types";
 import type { SampleAxis } from "../model";
 import { buildResponse } from "../response";
-import { spill } from "../stops";
+import { fillAtNow, spill } from "../stops";
 import {
 	account,
 	defaultAxis,
@@ -90,7 +90,8 @@ describe("projected stops", () => {
 			typical: [],
 			heavy: [],
 		});
-		// Heavy: 22 steps of 0.02 points = 0.44; typical: 12 steps = 0.24; light: 3 steps.
+		// Heavy: 21.6 steps of 0.02 points = 0.432 (the 14:10-14:15 step counts its
+		// 3 minutes inside the stop); typical: 12 steps = 0.24; light: 3 steps.
 		const stops = exampleRun(0.01, 2, 0.3).day?.stops;
 		expect(stops?.heavy).toEqual([{ start: at(14, 12), end: RESET_A }]);
 		expect(stops?.typical).toEqual([]);
@@ -236,5 +237,42 @@ describe("stopNow", () => {
 		).week;
 		expect(week?.stopNow).toEqual({ start: NOW, end: at(20) });
 		expect(week?.stops.heavy).toEqual([]);
+	});
+});
+
+describe("fill for the spill rule", () => {
+	test("day: use of the open 5-hour window, 0 with no open window", () => {
+		expect(
+			fillAtNow(
+				account("a", { fiveHour: { usedPct: 94, resetsAt: RESET_A } }),
+				"day",
+				NOW,
+			),
+		).toBe(94);
+		expect(fillAtNow(account("a"), "day", NOW)).toBe(0);
+		expect(
+			fillAtNow(
+				account("a", { fiveHour: { usedPct: 70, resetsAt: at(12) } }),
+				"day",
+				NOW,
+			),
+		).toBe(0);
+		// A used-up weekly limit does not make a closed window full.
+		expect(
+			fillAtNow(
+				account("a", { weekly: { usedPct: 100, resetsAt: MONDAY_NEXT } }),
+				"day",
+				NOW,
+			),
+		).toBe(0);
+	});
+	test("week: weekly use", () => {
+		expect(
+			fillAtNow(
+				account("a", { weekly: { usedPct: 37, resetsAt: MONDAY_NEXT } }),
+				"week",
+				NOW,
+			),
+		).toBe(37);
 	});
 });

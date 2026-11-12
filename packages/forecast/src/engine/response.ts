@@ -9,6 +9,7 @@ import type {
 	ForecastBlock,
 	ForecastResponse,
 	ForecastSettings,
+	Series,
 	UnavailableReason,
 } from "../types";
 import { FORECAST_CONTRACT_VERSION } from "../types";
@@ -86,6 +87,10 @@ function hourFloor(at: EpochMs, timeZone: string): EpochMs {
 /** One decimal, after the percentiles. Rounding is monotone, so the ordering of the lines survives it. */
 function round1(value: number): number {
 	return Math.max(0, Math.round(value * 10) / 10);
+}
+
+function roundSeries(series: Series): Series {
+	return { times: series.times, values: series.values.map(round1) };
 }
 
 /**
@@ -214,7 +219,10 @@ function blockLines(
 				let j = a + 1;
 				while (lines[l][j] >= ZERO_POINTS) j++;
 				const tau = zeroTime(j, l);
-				if (tau > times[j - 1] && tau < times[j]) inserts.set(tau, j);
+				// A zero exactly on a sample the block leaves out (week: between
+				// full hours) is kept too, so the stop starts where the line does.
+				if (tau > times[j - 1] && (tau < times[j] || j !== b))
+					inserts.set(tau, j);
 			});
 			for (const [tau, j] of [...inserts].sort((x, y) => x[0] - y[0])) {
 				const w = (tau - times[j - 1]) / (times[j] - times[j - 1]);
@@ -251,7 +259,7 @@ function buildBlock(
 			fan[`p${level}`] = rounded[l];
 	});
 	return {
-		past: pastSeries(ctx, quantity),
+		past: roundSeries(pastSeries(ctx, quantity)),
 		times: block.times,
 		light: line(LIGHT),
 		typical: line(TYPICAL),

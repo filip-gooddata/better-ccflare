@@ -2,7 +2,13 @@
  * Projected stops, the stop running now and the shortfall (endpoint spec
  * sections 5 and 6).
  */
-import type { AccountId, EpochMs, Interval, Shortfall } from "../types";
+import type {
+	AccountId,
+	AccountLimits,
+	EpochMs,
+	Interval,
+	Shortfall,
+} from "../types";
 import type { EngineContext, OutLimit, SimulationResult } from "./model";
 import { accountLeft, comesBackAt, outSince, type Quantity } from "./past";
 import { levelOf } from "./percentile";
@@ -28,6 +34,21 @@ export function countsFor(quantity: Quantity, limit: OutLimit): boolean {
 	return quantity === "day" || limit === "seven_day";
 }
 
+/**
+ * An account's fill for the spill rule (spec section 6): its used share now.
+ * Day: the use of its open 5-hour window, 0 with no open window. Week: its
+ * weekly use.
+ */
+export function fillAtNow(
+	account: AccountLimits,
+	quantity: Quantity,
+	now: EpochMs,
+): number {
+	const limit = quantity === "day" ? account.fiveHour : account.weekly;
+	if (limit.resetsAt === null || limit.resetsAt <= now) return 0;
+	return Math.min(100, Math.max(0, limit.usedPct));
+}
+
 /** Points of one account's limit per demand unit, averaged over the counted accounts. */
 function meanK(ctx: EngineContext, quantity: Quantity): number {
 	const table =
@@ -40,8 +61,10 @@ function meanK(ctx: EngineContext, quantity: Quantity): number {
 
 /**
  * Per simulated day: the points of demand left unserved inside `interval`
- * (every simulation step that overlaps it), converted from units with the
- * counted accounts' mean k of the quantity's limit.
+ * converted from units with the counted accounts' mean k of the quantity's
+ * limit. A step that only partly overlaps the interval (a stop starting at an
+ * inserted zero point) counts in proportion to the overlap: the trace holds
+ * step totals only, so demand is taken as spread evenly over its step.
  */
 function unservedPoints(
 	ctx: EngineContext,
@@ -53,9 +76,12 @@ function unservedPoints(
 	const k = meanK(ctx, quantity);
 	return sim.traces.map((trace) => {
 		let units = 0;
-		for (let i = 1; i < times.length; i++)
-			if (times[i - 1] < interval.end && times[i] > interval.start)
-				units += trace.unserved[i];
+		for (let i = 1; i < times.length; i++) {
+			const from = Math.max(times[i - 1], interval.start);
+			const to = Math.min(times[i], interval.end);
+			if (to > from)
+				units += (trace.unserved[i] * (to - from)) / (times[i] - times[i - 1]);
+		}
 		return units * k;
 	});
 }
@@ -64,9 +90,10 @@ function unservedPoints(
  * Unserved points "at a level" (spec section 5: the simulated days at that
  * level leave at least minStopPoints unserved). The level line pNN of quota
  * left is the (100 − NN)th percentile of quota left, the heavy side being low
- * quota; unserved demand grows as quota falls, so the same days sit at the
- * NNth percentile of unserved points. Hence levelOf(…, 100 − NN), the shared
- * quantile rule read from the other end. It also keeps stops nested: a heavier
+ * quota; unserved demand grows as quota falls, so the heavy side of unserved
+ * is its upper tail and pNN reads its NNth percentile (an aggregation choice:
+ * pointwise quantiles do not tie a level to fixed days). Hence
+ * levelOf(…, 100 − NN), the shared quantile rule read from the other end. It also keeps stops nested: a heavier
  * level reads a higher percentile over a longer interval, never less.
  */
 function unservedAtLevel(points: number[], level: number): number {
@@ -275,9 +302,7 @@ export function shortfall(
 	}
 	const points = levelOf(unservedPoints(ctx, sim, quantity, counted), 50);
 	const pointsTenths = Math.round(points * TENTHS);
-	const fills = ctx.accounts.map(
-		(a) => 100 - accountLeft(quantity, a.fiveHour, a.weekly, ctx.now),
-	);
+	const fills = ctx.accounts.map((a) => fillAtNow(a, quantity, ctx.now));
 	const parts = spill(pointsTenths, who.last, fills, who.outAt);
 	const perAccount: Record<AccountId, number> = {};
 	ctx.accounts.forEach((a, i) => {

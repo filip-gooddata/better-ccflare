@@ -257,3 +257,24 @@ describe("size and time at defaults", () => {
 		expect(bytes).toBeLessThan(400_000);
 	});
 });
+
+describe("week zero points on samples between full hours", () => {
+	test("a weekly line reaching 0 exactly at 14:35 keeps that time and its stop starts there", () => {
+		const ctx = makeCtx();
+		const axis = defaultAxis(ctx);
+		const zero = at(14, 35);
+		const traces = Array.from({ length: 20 }, () =>
+			makeTrace(axis, {
+				day: () => 150,
+				week: (t) => (t >= zero ? 0 : 100),
+				unserved: (t) => (t > zero ? 0.5 : 0),
+				outs: [{ account: 1, at: zero, limit: "seven_day" }],
+			}),
+		);
+		const week = buildResponse(ctx, makeSim(ctx, axis, traces)).week;
+		expect(week?.times).toContain(zero);
+		expect(week?.heavy[week.times.indexOf(zero)]).toBe(0);
+		expect(week?.heavy[week.times.indexOf(zero) - 1]).toBe(100);
+		expect(week?.stops.heavy[0]?.start).toBe(zero);
+	});
+});
