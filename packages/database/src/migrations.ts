@@ -471,6 +471,9 @@ export function ensureSchema(db: Database): void {
 	// (web_search, later web_fetch). These requests never select an account,
 	// so they write no `requests` row — this is their only record.
 	createWebToolCallsTable(db);
+
+	// Create the interruption forecast's demand history (see createForecastTables).
+	createForecastTables(db);
 }
 
 /**
@@ -525,6 +528,32 @@ function createSearchProvidersTable(db: Database): void {
  * is closer to a requested URL than to a conversation body. Set
  * REQUEST_RETENTION_DAYS lower if that trade is not acceptable.
  */
+/**
+ * Demand history of the interruption forecast. `forecast_demand` holds one
+ * row per 5-minute bucket, account and source ("proxy" rows are recomputed
+ * from `requests`, "transcript" rows come from the one-time backfill with
+ * account_id ''); `forecast_meta` holds markers such as a finished backfill.
+ */
+function createForecastTables(db: Database): void {
+	db.run(`
+		CREATE TABLE IF NOT EXISTS forecast_demand (
+			bucket_start INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL,
+			units REAL NOT NULL DEFAULT 0,
+			fable_units REAL NOT NULL DEFAULT 0,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_start, account_id, source)
+		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS forecast_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)
+	`);
+}
+
 function createWebToolCallsTable(db: Database): void {
 	db.run(`
 		CREATE TABLE IF NOT EXISTS web_tool_calls (
@@ -1852,6 +1881,9 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		// Ensure web_tool_calls exists (for upgrades from pre-web-tools
 		// installs). Idempotent, same rationale as above.
 		createWebToolCallsTable(db);
+
+		// Ensure the forecast tables exist (for upgrades from pre-forecast installs).
+		createForecastTables(db);
 
 		// Add performance indexes
 		addPerformanceIndexes(db);

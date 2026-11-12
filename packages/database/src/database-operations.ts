@@ -50,6 +50,12 @@ import {
 import { AgentPreferenceRepository } from "./repositories/agent-preference.repository";
 import { ApiKeyRepository } from "./repositories/api-key.repository";
 import { ComboRepository } from "./repositories/combo.repository";
+import {
+	type ClaudeOAuthRequestUsage,
+	ForecastDemandRepository,
+	type ForecastDemandRow,
+	type ForecastDemandTotal,
+} from "./repositories/forecast-demand.repository";
 import { OAuthRepository } from "./repositories/oauth.repository";
 import {
 	type ComboRoutingAggregateRow,
@@ -496,6 +502,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private apiKeys: ApiKeyRepository;
 	private combo: ComboRepository;
 	private usageHistory: UsageHistoryRepository;
+	private forecastDemand: ForecastDemandRepository;
 	private searchProviders: SearchProviderRepository;
 	private webToolCalls: WebToolCallRepository;
 
@@ -639,6 +646,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		this.apiKeys = new ApiKeyRepository(this.adapter);
 		this.combo = new ComboRepository(this.adapter);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
+		this.forecastDemand = new ForecastDemandRepository(this.adapter);
 		this.searchProviders = new SearchProviderRepository(this.adapter);
 		this.webToolCalls = new WebToolCallRepository(this.adapter);
 	}
@@ -1262,6 +1270,62 @@ OAuth tokens will need to be re-authenticated.
 
 	async pruneUsageSnapshots(cutoffTs: number): Promise<number> {
 		return this.usageHistory.deleteOlderThan(cutoffTs);
+	}
+
+	async getUsageSnapshotsBetween(
+		from: number,
+		to: number,
+		windowKeys: readonly string[],
+	) {
+		return this.usageHistory.getSnapshotsBetween(from, to, windowKeys);
+	}
+
+	// Interruption-forecast demand history delegated to repository
+	async upsertForecastDemand(rows: ForecastDemandRow[]): Promise<void> {
+		await this.forecastDemand.upsert(rows);
+	}
+
+	async replaceForecastDemand(
+		source: string,
+		from: number,
+		to: number,
+		rows: ForecastDemandRow[],
+	): Promise<void> {
+		await this.forecastDemand.replace(source, from, to, rows);
+	}
+
+	async getForecastDemandPooled(
+		from: number,
+		to: number,
+	): Promise<ForecastDemandTotal[]> {
+		return this.forecastDemand.pooled(from, to);
+	}
+
+	async getForecastDemandByAccount(
+		source: string,
+		from: number,
+		to: number,
+	): Promise<ForecastDemandRow[]> {
+		return this.forecastDemand.byAccount(source, from, to);
+	}
+
+	async getEarliestForecastDemand(source?: string): Promise<number | null> {
+		return this.forecastDemand.earliest(source);
+	}
+
+	async getForecastMeta(key: string): Promise<string | null> {
+		return this.forecastDemand.getMeta(key);
+	}
+
+	async setForecastMeta(key: string, value: string): Promise<void> {
+		await this.forecastDemand.setMeta(key, value);
+	}
+
+	async getClaudeOAuthRequestUsage(
+		from: number,
+		to: number,
+	): Promise<ClaudeOAuthRequestUsage[]> {
+		return this.forecastDemand.claudeOAuthUsage(from, to);
 	}
 
 	// ── Web tool call analytics ───────────────────────────────────────────────

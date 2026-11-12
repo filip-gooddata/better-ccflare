@@ -162,6 +162,9 @@
       "dependencies": {
         "simple-statistics": "8.0.0",
       },
+      "devDependencies": {
+        "@better-ccflare/database": "workspace:*",
+      },
     },
     "packages/http-api": {
       "name": "@better-ccflare/http-api",

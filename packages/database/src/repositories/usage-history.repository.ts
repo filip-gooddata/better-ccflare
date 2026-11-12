@@ -179,6 +179,33 @@ export class UsageHistoryRepository extends BaseRepository<UsageSnapshotRow> {
 	}
 
 	/**
+	 * Snapshots of every account for the given windows with timestamp in
+	 * [from, to), ascending by time.
+	 */
+	async getSnapshotsBetween(
+		from: number,
+		to: number,
+		windowKeys: readonly string[],
+	): Promise<UsageSnapshotRow[]> {
+		if (windowKeys.length === 0) return [];
+		const placeholders = windowKeys.map(() => "?").join(", ");
+		const rows = await this.query<SnapshotDbRow>(
+			`SELECT account_id, timestamp, window_key, utilization, resets_at
+			 FROM usage_snapshots
+			 WHERE timestamp >= ? AND timestamp < ? AND window_key IN (${placeholders})
+			 ORDER BY timestamp ASC, account_id ASC, window_key ASC`,
+			[from, to, ...windowKeys],
+		);
+		return rows.map((r) => ({
+			accountId: r.account_id,
+			timestamp: Number(r.timestamp),
+			windowKey: r.window_key,
+			utilization: Number(r.utilization),
+			resetsAt: r.resets_at == null ? null : Number(r.resets_at),
+		}));
+	}
+
+	/**
 	 * Most recent snapshot for one window of one account, or null when the
 	 * account has never recorded that window. getSeries is ORDER BY timestamp
 	 * ASC (the chart and the regression both need it that way), so reading "the

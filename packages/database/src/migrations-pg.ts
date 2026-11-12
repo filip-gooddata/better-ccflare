@@ -377,6 +377,9 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 	// Create web_tool_calls table (see SQLite migration for rationale).
 	await createWebToolCallsTablePg(adapter);
 
+	// Create the forecast demand tables (see SQLite migration for rationale).
+	await createForecastTablesPg(adapter);
+
 	log.info("PostgreSQL schema ensured");
 }
 
@@ -419,6 +422,29 @@ async function createSearchProvidersTablePg(
  * `ensureSchemaPg()` (fresh DBs) and `runMigrationsPg()` (upgrades).
  * `status` semantics match the SQLite migration's doc comment.
  */
+/** PostgreSQL port of createForecastTables. Exported for testing. */
+export async function createForecastTablesPg(
+	adapter: BunSqlAdapter,
+): Promise<void> {
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS forecast_demand (
+			bucket_start BIGINT NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL,
+			units DOUBLE PRECISION NOT NULL DEFAULT 0,
+			fable_units DOUBLE PRECISION NOT NULL DEFAULT 0,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_start, account_id, source)
+		)
+	`);
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS forecast_meta (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)
+	`);
+}
+
 async function createWebToolCallsTablePg(
 	adapter: BunSqlAdapter,
 ): Promise<void> {
@@ -1808,6 +1834,9 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 
 	// Ensure web_tool_calls exists (for upgrades from pre-web-tools installs).
 	await createWebToolCallsTablePg(adapter);
+
+	// Ensure the forecast tables exist (for upgrades from pre-forecast installs).
+	await createForecastTablesPg(adapter);
 
 	// Rename oauth_sessions.mode 'max' → 'claude-oauth'
 	try {
