@@ -195,6 +195,20 @@ describe("validateForecastResponse rejects", () => {
 		expectError(response, "day.stops.heavy[0]");
 	});
 
+	test("(not) a stop whose start time is shared with a jump of other levels", () => {
+		const response = clone(generateFullResponse());
+		const day = response.day;
+		const k = day.times.indexOf(day.stops.heavy[0].start);
+		// heavy reaches 0 there; every line carries its value twice (a jump time)
+		const twice = (values: number[]) => values.splice(k, 0, values[k]);
+		twice(day.times);
+		for (const name of ["light", "typical", "heavy"]) twice(day[name]);
+		for (const series of Object.values(day.fan)) twice(series as number[]);
+		expect(day.heavy[k]).toBe(0);
+		expect(day.heavy[k + 1]).toBe(0);
+		expect(validateForecastResponse(response)).toEqual([]);
+	});
+
 	test("a projected stop that is only a slice of its zero run", () => {
 		const late = clone(generateFullResponse());
 		const heavy = late.day.stops.heavy[0];

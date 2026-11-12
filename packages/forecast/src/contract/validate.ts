@@ -475,8 +475,11 @@ function checkStopsOnLine(
 			err(p, "must start on a time-axis point where its line is 0");
 			return;
 		}
-		const before = firstAt < startAt ? line[firstAt] : line[firstAt - 1];
-		if (before <= EPSILON)
+		// The entry before the first zero at the start time; an unchanged level
+		// may carry its 0 twice there when another level jumps at that time.
+		let zeroAt = firstAt;
+		while (zeroAt < startAt && line[zeroAt] > EPSILON) zeroAt++;
+		if (line[zeroAt - 1] <= EPSILON)
 			err(p, "is not maximal: its line is already 0 before its start");
 		for (let i = startAt + 1; i < times.length && times[i] < stop.end; i++)
 			if (line[i] > EPSILON) {
