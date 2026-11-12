@@ -309,12 +309,32 @@ describe("workStartMinute", () => {
 		const t = buildDayTable(input({ history: h, historyFrom: from }));
 		expect(WORK_START_RECENT_DAYS).toBeGreaterThanOrEqual(4);
 		// work days with demand: 480, 540, 600, 570 → median 555
-		expect(workStartMinute(t)).toBe(555);
+		expect(workStartMinute(t, TZ)).toBe(555);
+	});
+
+	test("a DST work day counts by its local clock (2026-10-25, 25 hours, workDays 7)", () => {
+		const now = Date.UTC(2026, 9, 26, 9, 0);
+		const from = localDayStart(Date.UTC(2026, 9, 25, 12), TZ);
+		const h = history(from, localDayStart(now, TZ), (t) =>
+			localParts(t, TZ).minuteOfDay >= 9 * 60 ? 0.01 : 0,
+		);
+		const t = buildDayTable(
+			input({
+				now,
+				history: h,
+				historyFrom: from,
+				pace: { ...PACE, workDays: 7 },
+			}),
+		);
+		expect(t.days.map((d) => [d.key, d.units.length, d.type])).toEqual([
+			["2026-10-25", 300, "workday"],
+		]);
+		expect(workStartMinute(t, TZ)).toBe(540);
 	});
 
 	test("null without recorded work days with demand", () => {
 		expect(
-			workStartMinute(table(["weekend", "workday"], "workday")),
+			workStartMinute(table(["weekend", "workday"], "workday"), TZ),
 		).toBeNull();
 	});
 });

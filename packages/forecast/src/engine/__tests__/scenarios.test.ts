@@ -563,6 +563,7 @@ describe("buildScenarios", () => {
 		);
 		expect(sc.units.length).toBe(400);
 		expect(horizon.simEnd - NOW).toBe(7 * DAY);
-		expect(longest).toBeLessThan(100);
+		// design target: no slice much longer than 25 ms; slack for a loaded machine
+		expect(longest).toBeLessThan(40);
 	});
 });

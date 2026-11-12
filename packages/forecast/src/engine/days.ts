@@ -19,8 +19,6 @@ export const RECENT_WINDOW_MS = 60 * 60_000;
 /** Work start = median over this many most recent recorded work days with demand: two working weeks, recent enough to follow a changed routine. */
 export const WORK_START_RECENT_DAYS = 10;
 
-const BUCKETS_PER_NORMAL_DAY = 288;
-
 export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
 	const weekday = localParts(dayStart, pace.timeZone).isoWeekday;
 	if (weekday > pace.workDays) return "weekend";
@@ -125,11 +123,15 @@ export function historyAvailable(table: DayTable): boolean {
 }
 
 /**
- * Median first minute with demand over the most recent WORK_START_RECENT_DAYS
- * recorded work days with demand; null when there is none. Days whose length is
- * not 24 hours (a DST change) are skipped: their bucket index is not the clock.
+ * Median local clock minute of the first demand over the most recent
+ * WORK_START_RECENT_DAYS recorded work days with demand; null when there is none.
+ * Takes the time zone because DayTable carries none and on a DST day the bucket
+ * index is not the clock.
  */
-export function workStartMinute(table: DayTable): number | null {
+export function workStartMinute(
+	table: DayTable,
+	timeZone: string,
+): number | null {
 	const firsts: number[] = [];
 	for (
 		let i = table.days.length - 1;
@@ -137,14 +139,12 @@ export function workStartMinute(table: DayTable): number | null {
 		i--
 	) {
 		const d = table.days[i] as RecordedDay;
-		if (
-			d.type === "weekend" ||
-			d.total <= 0 ||
-			d.units.length !== BUCKETS_PER_NORMAL_DAY
-		)
-			continue;
+		if (d.type === "weekend" || d.total <= 0) continue;
 		const first = d.units.findIndex((u) => u > 0);
-		if (first >= 0) firsts.push((first * BUCKET_MS) / 60_000);
+		if (first >= 0)
+			firsts.push(
+				localParts(d.start + first * BUCKET_MS, timeZone).minuteOfDay,
+			);
 	}
 	return firsts.length === 0 ? null : Math.round(median(firsts));
 }
