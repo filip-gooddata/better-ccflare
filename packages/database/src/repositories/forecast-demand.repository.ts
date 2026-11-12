@@ -1,4 +1,7 @@
+import { convertPlaceholders } from "../adapters/bun-sql-adapter";
 import { BaseRepository } from "./base.repository";
+
+type Statement = [sql: string, values: unknown[]];
 
 /** One row of `forecast_demand`: demand of one account and source in one bucket. */
 export interface ForecastDemandRow {
@@ -116,24 +119,14 @@ export class ForecastDemandRepository extends BaseRepository<ForecastDemandRow> 
 	/** Insert or replace rows by (bucket_start, account_id, source). */
 	async upsert(rows: ForecastDemandRow[]): Promise<void> {
 		if (rows.length === 0) return;
-		if (this.adapter.isSQLite) {
-			const db = this.adapter.getSQLiteDb();
-			const statement = db.prepare(UPSERT_SQL);
-			db.transaction(() => {
-				for (const row of rows) {
-					statement.run(...(params(row) as [number]));
-				}
-			})();
-			return;
-		}
-		await this.adapter.transaction(async () => {
-			for (const row of rows) await this.run(UPSERT_SQL, params(row));
-		});
+		await this.writeAtomically(
+			rows.map((row): Statement => [UPSERT_SQL, params(row)]),
+		);
 	}
 
 	/**
 	 * Replace every row of `source` with bucket_start in [from, to) by `rows`,
-	 * so a bucket that lost an account loses its row too.
+	 * so a bucket that lost an account loses its row too. All or nothing.
 	 */
 	async replace(
 		source: string,
@@ -141,21 +134,34 @@ export class ForecastDemandRepository extends BaseRepository<ForecastDemandRow> 
 		to: number,
 		rows: ForecastDemandRow[],
 	): Promise<void> {
-		const deleteSql =
-			"DELETE FROM forecast_demand WHERE source = ? AND bucket_start >= ? AND bucket_start < ?";
+		await this.writeAtomically([
+			[
+				"DELETE FROM forecast_demand WHERE source = ? AND bucket_start >= ? AND bucket_start < ?",
+				[source, from, to],
+			],
+			...rows.map((row): Statement => [UPSERT_SQL, params(row)]),
+		]);
+	}
+
+	/**
+	 * Run the statements in one transaction. BunSqlAdapter.transaction does not
+	 * bind statements to the transaction, so each dialect's own API is used.
+	 */
+	private async writeAtomically(statements: Statement[]): Promise<void> {
 		if (this.adapter.isSQLite) {
 			const db = this.adapter.getSQLiteDb();
-			const remove = db.prepare(deleteSql);
-			const insert = db.prepare(UPSERT_SQL);
 			db.transaction(() => {
-				remove.run(source, from, to);
-				for (const row of rows) insert.run(...(params(row) as [number]));
+				for (const [sql, values] of statements) {
+					db.prepare(sql).run(...(values as [number]));
+				}
 			})();
 			return;
 		}
-		await this.adapter.transaction(async () => {
-			await this.run(deleteSql, [source, from, to]);
-			for (const row of rows) await this.run(UPSERT_SQL, params(row));
+		await this.adapter.getSQL().begin(async (tx) => {
+			for (const [sql, values] of statements) {
+				// biome-ignore lint/suspicious/noExplicitAny: Bun.SQL accepts various binding types
+				await tx.unsafe(convertPlaceholders(sql), values as any[]);
+			}
 		});
 	}
 

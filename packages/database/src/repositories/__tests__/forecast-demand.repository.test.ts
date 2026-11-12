@@ -261,3 +261,62 @@ describe("forecast tables in SQLite migrations", () => {
 		db.close();
 	});
 });
+
+describe("ForecastDemandRepository writes are atomic", () => {
+	it("SQLite: a failing row rolls back the delete of a replace", async () => {
+		const db = new Database(":memory:");
+		ensureSchema(db);
+		const repo = new ForecastDemandRepository(new BunSqlAdapter(db));
+		await repo.upsert([row(B, "a", "proxy", 1), row(2 * B, "a", "proxy", 2)]);
+
+		const broken = {
+			...row(B, "a", "proxy", 5),
+			units: null as unknown as number,
+		};
+		await expect(
+			repo.replace("proxy", 0, 10 * B, [row(2 * B, "b", "proxy", 9), broken]),
+		).rejects.toThrow();
+
+		expect(await repo.byAccount("proxy", 0, 10 * B)).toEqual([
+			row(B, "a", "proxy", 1),
+			row(2 * B, "a", "proxy", 2),
+		]);
+		db.close();
+	});
+
+	it("PostgreSQL: every statement of a replace runs on the transaction", async () => {
+		const onTx: Array<{ sql: string; values: unknown[] }> = [];
+		const outside: string[] = [];
+		const tx = {
+			unsafe: async (sql: string, values: unknown[]) => {
+				onTx.push({ sql, values });
+				return [];
+			},
+		};
+		const adapter = {
+			isSQLite: false,
+			getSQL: () => ({
+				begin: async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx),
+			}),
+			run: async (sql: string) => {
+				outside.push(sql);
+			},
+			unsafe: async (sql: string) => {
+				outside.push(sql);
+			},
+		};
+		// biome-ignore lint/suspicious/noExplicitAny: fake adapter for testing
+		const repo = new ForecastDemandRepository(adapter as any);
+
+		await repo.replace("proxy", 0, 10 * B, [row(B, "a", "proxy", 1, 0.5, 2)]);
+
+		expect(outside).toEqual([]);
+		expect(onTx).toHaveLength(2);
+		expect(onTx[0]?.sql).toContain(
+			"DELETE FROM forecast_demand WHERE source = $1 AND bucket_start >= $2 AND bucket_start < $3",
+		);
+		expect(onTx[0]?.values).toEqual(["proxy", 0, 10 * B]);
+		expect(onTx[1]?.sql).toContain("VALUES ($1, $2, $3, $4, $5, $6)");
+		expect(onTx[1]?.values).toEqual([B, "a", "proxy", 1, 0.5, 2]);
+	});
+});

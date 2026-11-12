@@ -16,6 +16,7 @@ import {
 	earliestProxyBucket,
 	type ForecastDb,
 	loadReadings,
+	PROXY_SYNC_LAST,
 	PROXY_SYNC_MARKER,
 	syncProxyDemand,
 } from "../index";
@@ -326,6 +327,37 @@ describe("history store", () => {
 				},
 				firstRunRows[2] as AccountDemandBucket,
 			]);
+		});
+
+		it("catches up the requests of a gap longer than the window", async () => {
+			await seed();
+			const store = createDemandStore({ db });
+			await syncProxyDemand({ db }, now);
+
+			// served 30 minutes after the last run; the next run comes 3 hours later
+			await addRequest(
+				"acct-b",
+				T0 + 32 * MIN,
+				"claude-opus-4-1",
+				[2000, 0, 0, 0],
+			);
+			const later = now + 180 * MIN;
+			const result = await syncProxyDemand({ db }, later);
+
+			expect(result.from).toBe(T0 - 60 * MIN);
+			expectBuckets(await store.loadByAccount(T0 + 30 * MIN, T0 + 35 * MIN), [
+				{
+					start: T0 + 30 * MIN,
+					accountId: "acct-b",
+					units: 0.002,
+					fableUnits: 0,
+					requests: 1,
+				},
+			]);
+			expect(await store.getMeta(PROXY_SYNC_LAST)).toBe(String(later));
+
+			// back to the plain trailing window once the gap is closed
+			expect((await syncProxyDemand({ db }, later)).from).toBe(T0 + 120 * MIN);
 		});
 
 		it("drops a bucket row whose requests are all gone", async () => {
