@@ -4,8 +4,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Config } from "@better-ccflare/config";
 import { TIME_CONSTANTS } from "@better-ccflare/core";
-import type { APIContext } from "@better-ccflare/types";
+import type { APIContext, SessionPaceSettings } from "@better-ccflare/types";
 import { createConfigHandlers } from "../config";
+
+const paceSettings = (): SessionPaceSettings => ({
+	workDays: 5,
+	familyGuardPct: 90,
+	fiveHourGuardPct: 85,
+	tieBandPct: 3,
+	idleMs: 600_000,
+	timeZone: "UTC",
+});
 
 function makeCatalog(
 	models: string[],
@@ -59,7 +68,7 @@ function makeConfig() {
 
 describe("createConfigHandlers", () => {
 	it("includes per-window usage throttling flags in config payload", async () => {
-		const handlers = createConfigHandlers(makeConfig(), {
+		const handlers = createConfigHandlers(makeConfig(), paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -73,7 +82,7 @@ describe("createConfigHandlers", () => {
 
 	it("updates usage throttling windows from POST body", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -98,7 +107,7 @@ describe("createConfigHandlers", () => {
 
 	it("reports the current strategy with its source", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -114,7 +123,7 @@ describe("createConfigHandlers", () => {
 
 	it("reports the current model capacity routing mode with its source", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -127,7 +136,7 @@ describe("createConfigHandlers", () => {
 
 	it("updates the model capacity routing mode from POST body (200 + echo)", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -154,7 +163,7 @@ describe("createConfigHandlers", () => {
 
 	it("rejects an invalid model capacity routing mode with 400", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -173,7 +182,7 @@ describe("createConfigHandlers", () => {
 
 	it("rejects a default agent model without a recognized Claude family substring", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -192,7 +201,7 @@ describe("createConfigHandlers", () => {
 
 	it("accepts a valid Claude model as the default agent model", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -213,6 +222,7 @@ describe("createConfigHandlers", () => {
 		const config = makeConfig();
 		const handlers = createConfigHandlers(
 			config,
+			paceSettings,
 			{ port: 8080, tlsEnabled: false },
 			makeCatalog(["claude-nova-9"]),
 		);
@@ -233,6 +243,7 @@ describe("createConfigHandlers", () => {
 		const config = makeConfig();
 		const handlers = createConfigHandlers(
 			config,
+			paceSettings,
 			{ port: 8080, tlsEnabled: false },
 			makeCatalog(["claude-nova-9"], "fallback"),
 		);
@@ -251,7 +262,7 @@ describe("createConfigHandlers", () => {
 
 	it("rejects a non-pattern model id with 400 when no catalog is injected", async () => {
 		const config = makeConfig();
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -280,7 +291,7 @@ describe("model capacity routing source & effective mode (real config)", () => {
 	}
 
 	function handlersWithRealConfig() {
-		return createConfigHandlers(realConfig(), {
+		return createConfigHandlers(realConfig(), paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -377,7 +388,7 @@ describe("strategy source (real config)", () => {
 	}
 
 	function handlersWithRealConfig() {
-		return createConfigHandlers(realConfig(), {
+		return createConfigHandlers(realConfig(), paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -406,7 +417,11 @@ describe("strategy source (real config)", () => {
 			strategy: string;
 			strategySource: string;
 		};
-		expect(body).toEqual({ strategy: "session", strategySource: "file" });
+		expect(body).toEqual({
+			strategy: "session",
+			strategySource: "file",
+			sessionPace: paceSettings(),
+		});
 	});
 
 	it("reports source 'file' after a POST writes the config file", async () => {
@@ -429,6 +444,7 @@ describe("strategy source (real config)", () => {
 		expect(getBody).toEqual({
 			strategy: "session-drain-soonest",
 			strategySource: "file",
+			sessionPace: paceSettings(),
 		});
 	});
 
@@ -440,7 +456,11 @@ describe("strategy source (real config)", () => {
 			strategy: string;
 			strategySource: string;
 		};
-		expect(body).toEqual({ strategy: "least-used", strategySource: "env" });
+		expect(body).toEqual({
+			strategy: "least-used",
+			strategySource: "env",
+			sessionPace: paceSettings(),
+		});
 	});
 
 	it("keeps reporting the env-sourced strategy after a POST that writes the (ineffective) file value", async () => {
@@ -460,7 +480,11 @@ describe("strategy source (real config)", () => {
 			strategy: string;
 			strategySource: string;
 		};
-		expect(getBody).toEqual({ strategy: "least-used", strategySource: "env" });
+		expect(getBody).toEqual({
+			strategy: "least-used",
+			strategySource: "env",
+			sessionPace: paceSettings(),
+		});
 	});
 });
 
@@ -475,7 +499,7 @@ describe("session duration reporting (real config)", () => {
 	}
 
 	function handlersWithRealConfig() {
-		return createConfigHandlers(realConfig(), {
+		return createConfigHandlers(realConfig(), paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -498,7 +522,7 @@ describe("session duration reporting (real config)", () => {
 		// fell back to the 1-hour constant.
 		const config = realConfig();
 		config.set("session_duration_ms", 18_000_000);
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});
@@ -559,7 +583,7 @@ describe("session duration zero value (real config)", () => {
 		// with a zero duration — `||` would misreport the 5-hour default.
 		const config = realConfig();
 		config.set("session_duration_ms", 0);
-		const handlers = createConfigHandlers(config, {
+		const handlers = createConfigHandlers(config, paceSettings, {
 			port: 8080,
 			tlsEnabled: false,
 		});

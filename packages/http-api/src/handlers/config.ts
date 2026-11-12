@@ -42,9 +42,9 @@ import type { ConfigResponse, RetentionSetRequest } from "../types";
  */
 export function createConfigHandlers(
 	config: Config,
+	getSessionPaceSettings: () => SessionPaceSettings,
 	runtime?: { port: number; tlsEnabled: boolean },
 	modelCatalog?: APIContext["modelCatalog"],
-	getSessionPaceSettings?: () => SessionPaceSettings,
 ) {
 	return {
 		/**
@@ -91,15 +91,12 @@ export function createConfigHandlers(
 			// strategySource mirrors the model-capacity-routing source field so
 			// the dashboard can lock the strategy control the same way when
 			// LB_STRATEGY overrides the config file. Additive field: existing
-			// consumers of `strategy` are unaffected. sessionPace is left out
-			// only when the entrypoint wires no settings source.
-			const body: Omit<StrategyConfigResponse, "sessionPace"> & {
-				sessionPace?: SessionPaceSettings;
-			} = {
+			// consumers of `strategy` are unaffected.
+			const body: StrategyConfigResponse = {
 				strategy,
 				strategySource: config.getStrategySource(),
+				sessionPace: getSessionPaceSettings(),
 			};
-			if (getSessionPaceSettings) body.sessionPace = getSessionPaceSettings();
 			return jsonResponse(body);
 		},
 

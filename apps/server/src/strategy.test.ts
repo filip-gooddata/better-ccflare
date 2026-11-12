@@ -63,7 +63,7 @@ async function strategyBody(
 	config: Config,
 	current: LoadBalancingStrategy | null,
 ): Promise<Record<string, unknown>> {
-	const handlers = createConfigHandlers(config, undefined, undefined, () =>
+	const handlers = createConfigHandlers(config, () =>
 		sessionPaceSettings(current, config, START_ZONE),
 	);
 	const response = handlers.getStrategy();
