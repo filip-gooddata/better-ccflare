@@ -38,6 +38,51 @@ describe("buildSampleAxis", () => {
 		for (let i = 1; i < times.length; i++)
 			expect(times[i]).toBeGreaterThanOrEqual(times[i - 1]);
 	});
+
+	test("weekEnd off the hour is a single sample, dayEnd too", () => {
+		// Monday 09:07:20, weekly reset beyond a week: weekEnd = now + 7 days, off every grid.
+		const now = prague(16, 9, 7, 20);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [account({ id: "acct-a", weekReset: now + 8 * 24 * HOUR })],
+			rate: () => 0,
+		});
+		expect(ctx.horizon.weekEnd).toBe(now + 7 * 24 * HOUR);
+		const { times } = buildSampleAxis(ctx, onDemandPlan(ctx));
+		expect(times.filter((t) => t === ctx.horizon.weekEnd)).toHaveLength(1);
+		expect(times.filter((t) => t === ctx.horizon.dayEnd)).toHaveLength(1);
+		expect(times[times.length - 1]).toBe(ctx.horizon.weekEnd);
+	});
+
+	test("weekEnd on an off-hour weekly reset appears twice", () => {
+		const now = prague(12, 8);
+		const reset = prague(14, 20, 17, 41);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [account({ id: "acct-a", weekReset: reset })],
+			rate: () => 0,
+		});
+		expect(ctx.horizon.weekEnd).toBe(reset);
+		const { times } = buildSampleAxis(ctx, onDemandPlan(ctx));
+		expect(times.filter((t) => t === reset)).toHaveLength(2);
+	});
+
+	test("weekEnd inside the 5-minute part, off the grid, is a sample", () => {
+		// The horizon rule never puts weekEnd inside fineEnd here, so it is placed by hand.
+		const now = prague(12, 8);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [account({ id: "acct-a" })],
+			rate: () => 0,
+		});
+		const weekEnd = now + 3 * HOUR + 2 * MIN + 13_000;
+		ctx.horizon = { ...ctx.horizon, weekEnd };
+		const { times } = buildSampleAxis(ctx, onDemandPlan(ctx));
+		expect(times.filter((t) => t === weekEnd)).toHaveLength(1);
+	});
 });
 
 describe("simulate", () => {

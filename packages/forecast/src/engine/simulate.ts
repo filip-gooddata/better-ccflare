@@ -89,7 +89,8 @@ function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
 
 /**
  * Shared axis: now; every 5 minutes on the clock to fineEnd; every full hour to simEnd (both ends
- * included); every deterministic jump twice (value before, value after). A reset of a window the
+ * included); horizon.dayEnd and horizon.weekEnd once each (twice when also a jump); every
+ * deterministic jump twice (value before, value after). A reset of a window the
  * simulation itself opened is not on the axis; inside the 5-minute part (the 5-hour score window) a
  * dip it hides lasts less than one step.
  */
@@ -112,8 +113,11 @@ export function buildSampleAxis(ctx: EngineContext, plan: SimPlan): SampleAxis {
 	)
 		grid.push(at);
 	if (simEnd > fineEnd) grid.push(simEnd);
+	// The response reads the lows up to dayEnd and weekEnd, so both are samples even off the grid.
+	for (const end of [ctx.horizon.dayEnd, ctx.horizon.weekEnd])
+		if (end > now && end <= simEnd) grid.push(end);
 	const onGrid = new Set(grid);
-	const times = [...grid];
+	const times = [...onGrid];
 	for (const jump of jumpTimes(ctx, plan)) {
 		times.push(jump);
 		if (!onGrid.has(jump)) times.push(jump);
