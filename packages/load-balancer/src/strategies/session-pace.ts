@@ -348,6 +348,13 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		if (plan.placement) {
 			this.lastPickedAt.set(first.id, now);
 			this.lastPickSeq.set(first.id, ++this.pickSeq);
+			if (clientId === null && plan.placement.rule === "open-session") {
+				// Without a client session every request is placed afresh, so
+				// only the open-session rule is logged (held after one line).
+				this.log.info(
+					`session-pace place session=none account=${first.name} rule=${plan.placement.rule} reason=${plan.placement.reason} ${this.describe(plan.candidates, plan.family)}`,
+				);
+			}
 			if (clientId !== null) {
 				const previous = this.sessions.get(clientId);
 				const live = previous && !this.isExpired(previous, now);

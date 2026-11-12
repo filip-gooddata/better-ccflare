@@ -1158,6 +1158,23 @@ describe("SessionPaceStrategy", () => {
 			).toBe("b");
 		});
 
+		it("logs an open-session placement for a request without a client session", () => {
+			const lines = captureLines();
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			expect(strategy.select([a, b], meta(null))[0].id).toBe("b");
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toContain(
+				"session-pace place session=none account=b rule=open-session reason=no-five-hour-window work_days=5 tz=Europe/Prague ",
+			);
+			expect(lines[0]).toContain("b(deficit=-20.0 5h=not-running");
+			setSystemTime(new Date(NOW + 1_000));
+			expect(strategy.select([a, b], meta(null))[0].id).toBe("a");
+			expect(lines).toHaveLength(1);
+		});
+
 		it("peek follows the rule without taking the account out", () => {
 			store.setWeeklyDeficit("a", 40);
 			store.setFiveHour("a", 84);
