@@ -696,14 +696,33 @@ curl http://localhost:8080/api/config
 
 #### GET /api/config/strategy
 
-Get current load balancing strategy.
+Get the current load balancing strategy, where it was set, and the session-pace settings in effect.
 
 **Response:**
 ```json
 {
-  "strategy": "session"
+  "strategy": "session-pace",
+  "strategySource": "env",
+  "sessionPace": {
+    "workDays": 5,
+    "familyGuardPct": 90,
+    "fiveHourGuardPct": 90,
+    "tieBandPct": 10,
+    "idleMs": 3600000,
+    "timeZone": "Europe/Prague"
+  }
 }
 ```
+
+`strategySource` is `env` when `LB_STRATEGY` sets the strategy, `file` when the config file does, and `default` otherwise.
+
+`sessionPace` is always present, whichever strategy runs. It holds the session-pace settings in effect, after environment and config-file resolution and validation (an invalid work-days value reads as `5`): `workDays`, `familyGuardPct`, `fiveHourGuardPct`, `tieBandPct` and `idleMs` are the `session_pace_*` settings, and `timeZone` is the IANA zone local days are split in.
+
+- While `session-pace` runs, the values are the running strategy's own, including its zone. A setting it has not picked up is not shown.
+- While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
+- The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
+
+The response fields are typed as `StrategyConfigResponse` in `packages/types/src/api.ts`.
 
 **Example:**
 ```bash

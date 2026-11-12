@@ -96,7 +96,7 @@ The configuration file is stored at:
 | `session-drain-soonest-strict` | Same strategy class in strict mode: one canonical comparator ranks every available account at every selection — earliest future weekly_all reset first, then active-session status as the tie-break (an active 5h session no longer pins the account), then priority, utilization, and account id. The drain-earliest account keeps winning even after its own 5h window ages out; with all weekly resets unknown (cold usage cache right after a restart) the incumbent active account keeps the traffic. Auto-fallback reactivation still forces position 0 | Pools where traffic must actually follow the earliest-resetting account instead of the most recently started session |
 | `session-pace` | Keys stickiness on the client's own session id (`metadata.user_id`), like `session-affinity`. A new session goes to the available account furthest behind an even spend of its all-models weekly window: deficit = share of the window's work time elapsed (window from `resets_at` minus 7 days; work time is the part on local days with ISO weekday at most `session_pace_work_days`, default Monday to Friday; clamped to 0–100) minus weekly utilization; no weekly data counts as 0. Placement order: availability, probe-backoff rank, the model-family guard, the 5-hour guard, configured priority, deficit, then near-tie alternation (deficits within the tie band alternate between sessions that start within 500 ms). The 5-hour guard skips accounts at or above `session_pace_five_hour_guard_pct` while another candidate is below it; a figure whose reset has passed does not guard. The family guard keeps a request whose model family (Fable, Opus, Sonnet, Haiku) has a `weekly_scoped` window at or above `session_pace_family_guard_pct` (with a future reset) off that account while another is below it, and also moves an already mapped session. When the proxy fails over and another account serves a session's request, the session rebinds to that account and stays. A mapping expires after `session_pace_idle_ms` without a request. With no usage data at all (cold start) new sessions alternate. The paid extra-usage pool is ignored | Several concurrent Claude Code sessions over accounts whose weekly windows reset at different times, where each account should spend its weekly allowance evenly and no session should run into a 5-hour or per-model cap |
 
-`session-pace` is opted into with `LB_STRATEGY=session-pace` or `"lb_strategy": "session-pace"`, or from the dashboard's strategy selector. It logs every new placement and every rebind at INFO with the chosen account's name, each candidate's deficit, 5-hour utilization and (for a guarded family) family utilization, and the rule that decided; the session appears only as the first 8 characters of its session id.
+`session-pace` is opted into with `LB_STRATEGY=session-pace` or `"lb_strategy": "session-pace"`, or from the dashboard's strategy selector. It logs every new placement and every rebind at INFO with the chosen account's name, each candidate's deficit, 5-hour utilization and (for a guarded family) family utilization, and the rule that decided; the session appears only as the first 8 characters of its session id. `GET /api/config/strategy` reports the session-pace settings in effect under `sessionPace` (see [Get Current Strategy](#get-current-strategy)).
 
 `session-affinity` is not yet the default and must be opted into via `LB_STRATEGY=session-affinity` or `"lb_strategy": "session-affinity"` — it is deliberately not exposed in the dashboard's strategy selector, which only offers pure session-class options (see the dashboard's `RoutingCard` source for the current reasoning). If you run several concurrent Claude Code sessions against one account pool, it is worth trying; if you've run it in production, real-world feedback on account-ban rates is welcome on [#240](https://github.com/tombii/better-ccflare/issues/240).
 
@@ -470,9 +470,26 @@ GET /api/config/strategy
 Response:
 ```json
 {
-  "strategy": "session"
+  "strategy": "session-pace",
+  "strategySource": "env",
+  "sessionPace": {
+    "workDays": 5,
+    "familyGuardPct": 90,
+    "fiveHourGuardPct": 90,
+    "tieBandPct": 10,
+    "idleMs": 3600000,
+    "timeZone": "Europe/Prague"
+  }
 }
 ```
+
+`strategySource` is `env` when `LB_STRATEGY` sets the strategy, `file` when the config file does, and `default` otherwise.
+
+`sessionPace` is always present, whichever strategy runs. It holds the session-pace settings in effect, after environment and config-file resolution and validation (an invalid work-days value reads as `5`): `workDays`, `familyGuardPct`, `fiveHourGuardPct`, `tieBandPct` and `idleMs` are the `session_pace_*` settings, and `timeZone` is the IANA zone local days are split in.
+
+- While `session-pace` runs, the values are the running strategy's own, including its zone. A setting it has not picked up is not shown.
+- While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
+- The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
 
 #### Update Strategy
 ```http
