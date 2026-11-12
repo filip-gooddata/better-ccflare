@@ -550,7 +550,7 @@ A client calls `path` only when the field is present and it understands `contrac
 GET /api/forecast
 ```
 
-Read-only, with the same access rules as `GET /api/config/strategy`. The response carries `Cache-Control: no-store`. It serves the forecast the server has computed; the request itself never triggers a computation. When the forecast is off, or none is provided, it serves the "no forecast" shape with `reason: "disabled"`; when computing the forecast failed, the same shape with `reason: "error"`. The response format is specified in [forecast-endpoint.md](forecast-endpoint.md).
+Read-only, with the same access rules as `GET /api/config/strategy`. The response carries `Cache-Control: no-store`. It serves the forecast the server has computed; the request itself never triggers a computation. When the forecast is off, or none is provided, it serves the "no forecast" shape with `reason: "disabled"`; when computing the forecast failed, the same shape with `reason: "error"`. While the forecast is on, these fallbacks still carry `prewarm`: the lists from the last forecast, or empty lists, with `enabled` taken from the current setting. The response format is specified in [forecast-endpoint.md](forecast-endpoint.md).
 
 #### Update Strategy
 ```http

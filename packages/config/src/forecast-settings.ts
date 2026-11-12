@@ -226,10 +226,13 @@ function resolveFanLevels(input: ForecastResolveInput): number[] {
 
 function parseAt(value: unknown): number | null {
 	if (typeof value === "number")
-		return Number.isInteger(value) && value >= 0 ? value : null;
+		return Number.isSafeInteger(value) && value >= 0 ? value : null;
 	if (typeof value !== "string") return null;
 	const s = value.trim();
-	if (/^\d+$/.test(s)) return Number(s);
+	if (/^\d+$/.test(s)) {
+		const ms = Number(s);
+		return Number.isSafeInteger(ms) ? ms : null;
+	}
 	if (!ISO_WITH_ZONE.test(s)) return null;
 	const ms = Date.parse(s);
 	return Number.isFinite(ms) ? ms : null;

@@ -313,6 +313,8 @@ describe("resolveForecastSettings", () => {
 		[{ account: "a", at: "tomorrow" }],
 		[{ account: "", at: 1 }],
 		[{ account: "a", at: -5 }],
+		[{ account: "a", at: "9".repeat(400) }],
+		[{ account: "a", at: 2 ** 60 }],
 		[{ account: "a" }],
 		["a@1"],
 	])("rejects the prewarmTest %j (an ISO time needs a zone)", (value) => {

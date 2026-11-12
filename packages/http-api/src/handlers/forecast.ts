@@ -23,23 +23,41 @@ function noStore(body: ForecastResponse): Response {
  * from the last computation) and never computes anything itself. Without a
  * provider, or with the forecast switched off, it serves the "no forecast"
  * shape with `reason: "disabled"`. A provider that throws gives the same
- * shape with `reason: "error"`.
+ * shape with `reason: "error"`. While the forecast is switched on, every
+ * fallback carries `prewarm` (the spec promises it then): the diagnostics of
+ * the last response the provider gave, or empty lists, with `enabled` set
+ * from the current setting.
  */
 export function createForecastHandler(
-	getSettings: () => Pick<ForecastSettings, "enabled">,
+	getSettings: () => Pick<ForecastSettings, "enabled" | "prewarm">,
 	getForecast: ForecastProvider | undefined,
 	now: () => number = Date.now,
 ): () => Response {
+	let lastPrewarm: ForecastResponse["prewarm"];
 	return () => {
-		if (!getSettings().enabled || !getForecast)
-			return noStore(disabledForecastResponse(now()));
+		const settings = getSettings();
+		if (!settings.enabled) return noStore(disabledForecastResponse(now()));
+		const fallback = (reason: "disabled" | "error"): Response =>
+			noStore({
+				...disabledForecastResponse(now()),
+				reason,
+				prewarm: {
+					planned: [],
+					last: [],
+					...lastPrewarm,
+					enabled: settings.prewarm,
+				},
+			});
+		if (!getForecast) return fallback("disabled");
 		try {
-			return noStore(getForecast());
+			const response = getForecast();
+			if (response.prewarm) lastPrewarm = response.prewarm;
+			return noStore(response);
 		} catch (error) {
 			log.warn(
 				`Forecast provider failed: ${error instanceof Error ? error.message : String(error)}`,
 			);
-			return noStore({ ...disabledForecastResponse(now()), reason: "error" });
+			return fallback("error");
 		}
 	};
 }

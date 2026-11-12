@@ -143,6 +143,8 @@ describe("APIRouter — GET /api/forecast", () => {
 		expect(body.day).toBeNull();
 		expect(body.week).toBeNull();
 		expect(body.fable).toEqual({});
+		// the spec promises prewarm whenever the forecast is switched on
+		expect(body.prewarm).toEqual({ enabled: false, planned: [], last: [] });
 		expect(validateForecastResponse(body)).toEqual([]);
 	});
 
@@ -159,6 +161,7 @@ describe("APIRouter — GET /api/forecast", () => {
 		expect(res.headers.get("Cache-Control")).toBe("no-store");
 		const body = await res.json();
 		expect(body.reason).toBe("disabled");
+		expect(body.prewarm).toBeUndefined();
 		expect(validateForecastResponse(body)).toEqual([]);
 		expect(calls).toBe(0);
 	});
@@ -182,6 +185,29 @@ describe("APIRouter — GET /api/forecast", () => {
 		expect(res.headers.get("Cache-Control")).toBe("no-store");
 		const body = await res.json();
 		expect(body.reason).toBe("error");
+		expect(body.prewarm).toEqual({ enabled: false, planned: [], last: [] });
+		expect(validateForecastResponse(body)).toEqual([]);
+	});
+
+	it("keeps the last pre-warm diagnostics when the provider later throws", async () => {
+		const prewarm = {
+			enabled: true,
+			planned: [{ accountId: "acct-a", openAt: 1794490000000 }],
+			last: [],
+		};
+		let fail = false;
+		const { router } = makeRouter({
+			getForecast: () => {
+				if (fail) throw new Error("boom");
+				return { ...KEPT, prewarm };
+			},
+		});
+		await get(router, "/api/forecast");
+		fail = true;
+		const body = await (await get(router, "/api/forecast")).json();
+		expect(body.reason).toBe("error");
+		// lists from the last response, enabled from the current setting
+		expect(body.prewarm).toEqual({ ...prewarm, enabled: false });
 		expect(validateForecastResponse(body)).toEqual([]);
 	});
 

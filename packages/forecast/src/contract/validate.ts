@@ -9,6 +9,12 @@ const FAN_KEY = /^p([1-9][0-9]?)$/;
 /** One decimal per part: rounding may move the sum by up to 0.05 per part. */
 const ROUNDING_PER_PART = 0.05;
 const EPSILON = 1e-9;
+/** Points carry one decimal (spec section 3); tolerance for float noise. */
+const DECIMAL_TOLERANCE = 1e-6;
+
+function isOneDecimal(v: number): boolean {
+	return Math.abs(v * 10 - Math.round(v * 10)) <= DECIMAL_TOLERANCE;
+}
 
 function isObj(value: unknown): value is Obj {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -194,6 +200,7 @@ function validateValues(
 	values: unknown,
 	length: number,
 	err: Err,
+	max?: number,
 ): number[] | null {
 	if (!Array.isArray(values)) {
 		err(path, "must be a list of numbers");
@@ -207,6 +214,15 @@ function validateValues(
 	for (let i = 0; i < values.length; i++) {
 		if (!isPoints(values[i])) {
 			err(`${path}[${i}]`, "must be a finite number of points, not below 0");
+			ok = false;
+		} else if (!isOneDecimal(values[i])) {
+			err(`${path}[${i}]`, `(${values[i]}) must have at most one decimal`);
+			ok = false;
+		} else if (max !== undefined && values[i] > max + EPSILON) {
+			err(
+				`${path}[${i}]`,
+				`(${values[i]}) is above ${max}, 100 points per counted account`,
+			);
 			ok = false;
 		}
 	}
@@ -279,7 +295,23 @@ function validateBlock(
 		else {
 			const times = validateSeries(`${key}.past.times`, past.times, err, null);
 			if (times) {
-				validateValues(`${key}.past.values`, past.values, times.length, err);
+				const values = validateValues(
+					`${key}.past.values`,
+					past.values,
+					times.length,
+					err,
+				);
+				// Quota left only rises at a reset, which is drawn as two entries with one time.
+				if (values)
+					for (let i = 1; i < values.length; i++)
+						if (
+							values[i] > values[i - 1] + EPSILON &&
+							times[i] !== times[i - 1]
+						)
+							err(
+								`${key}.past.values[${i}]`,
+								`rises from ${values[i - 1]} without a jump: a reset must be two entries with the same time`,
+							);
 				const last = times[times.length - 1];
 				if (last !== undefined && last > computedAt)
 					err(`${key}.past.times`, "must not reach past computedAt");
@@ -290,6 +322,7 @@ function validateBlock(
 	const times = has("times")
 		? validateSeries(`${key}.times`, block.times, err, computedAt)
 		: null;
+	const pool = accounts.length > 0 ? 100 * accounts.length : undefined;
 
 	// Every line in percentile order: light, fan below 50, typical, fan above 50, heavy.
 	const lines: { percentile: number; path: string; values: number[] | null }[] =
@@ -299,7 +332,7 @@ function validateBlock(
 		if (!has(name)) continue;
 		const path = `${key}.${name}`;
 		const values = times
-			? validateValues(path, block[name], times.length, err)
+			? validateValues(path, block[name], times.length, err, pool)
 			: null;
 		named[name] = values;
 		lines.push({ percentile: NAMED_LEVELS[name], path, values });
@@ -320,7 +353,7 @@ function validateBlock(
 					continue;
 				}
 				const values = times
-					? validateValues(path, series, times.length, err)
+					? validateValues(path, series, times.length, err, pool)
 					: null;
 				lines.push({ percentile, path, values });
 			}
@@ -405,7 +438,13 @@ function validateBlock(
 	}
 }
 
-/** A stop lies inside the projection, starts on an axis point where its line is 0, and the line stays 0 until it ends. */
+/**
+ * A projected stop starts after computedAt (a begun stop is stopNow only),
+ * lies inside the projection, starts on an axis point where its line is 0,
+ * stays 0 until it ends, and is maximal: the entry before its start is above
+ * 0, and so is the entry at its end when the end is an axis point before the
+ * end of the projection. The end itself need not lie on the axis.
+ */
 function checkStopsOnLine(
 	path: string,
 	list: Interval[],
@@ -417,22 +456,40 @@ function checkStopsOnLine(
 	const last = times[times.length - 1];
 	list.forEach((stop, s) => {
 		const p = `${path}[${s}]`;
-		if (stop.start < first || stop.end > last) {
-			err(p, `lies outside the projection ${first}…${last}`);
+		if (stop.start <= first || stop.end > last) {
+			err(
+				p,
+				`lies outside the projection: must start after ${first} and end by ${last}`,
+			);
 			return;
 		}
 		if (!line) return;
-		let startsAtZero = false;
-		for (let i = 0; i < times.length; i++) {
-			const t = times[i];
-			if (t === stop.start && line[i] <= EPSILON) startsAtZero = true;
-			if (t > stop.start && t < stop.end && line[i] > EPSILON) {
+		// With a jump, the first entry at a time is the value before it, the last the value after.
+		const firstAt = times.indexOf(stop.start);
+		if (firstAt < 0) {
+			err(p, "must start on a time-axis point where its line is 0");
+			return;
+		}
+		const startAt = times.lastIndexOf(stop.start);
+		if (line[startAt] > EPSILON) {
+			err(p, "must start on a time-axis point where its line is 0");
+			return;
+		}
+		const before = firstAt < startAt ? line[firstAt] : line[firstAt - 1];
+		if (before <= EPSILON)
+			err(p, "is not maximal: its line is already 0 before its start");
+		for (let i = startAt + 1; i < times.length && times[i] < stop.end; i++)
+			if (line[i] > EPSILON) {
 				err(p, `has its line above 0 inside it (at index ${i})`);
 				return;
 			}
+		// The end is the first moment above 0 again: the first entry at or after it is above 0.
+		if (stop.end < last) {
+			let endAt = times.findIndex((t) => t >= stop.end);
+			if (times[endAt] === stop.end) endAt = times.lastIndexOf(stop.end);
+			if (line[endAt] <= EPSILON)
+				err(p, "is not maximal: its line is still 0 at or after its end");
 		}
-		if (!startsAtZero)
-			err(p, "must start on a time-axis point where its line is 0");
 	});
 }
 
@@ -465,6 +522,8 @@ function validateShortfall(
 	}
 	const points = value.points;
 	if (!isPoints(points)) err(`${path}.points`, "must be a number not below 0");
+	else if (!isOneDecimal(points))
+		err(`${path}.points`, "must have at most one decimal");
 	if (
 		typeof value.lastAccount !== "string" ||
 		!accounts.includes(value.lastAccount)
@@ -483,7 +542,11 @@ function validateShortfall(
 		if (!isPoints(part)) {
 			err(`${path}.perAccount.${id}`, "must be a number not below 0");
 			ok = false;
-		} else sum += part;
+		} else {
+			if (!isOneDecimal(part))
+				err(`${path}.perAccount.${id}`, "must have at most one decimal");
+			sum += part;
+		}
 	}
 	const parts = Object.keys(per).length;
 	if (

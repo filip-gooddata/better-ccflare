@@ -189,6 +189,69 @@ describe("validateForecastResponse rejects", () => {
 		expectError(response, "day.stops.light[0]");
 	});
 
+	test("a projected stop that starts at computedAt (a begun stop is stopNow only)", () => {
+		const response = clone(generateFullResponse());
+		response.day.stops.heavy[0].start = response.computedAt;
+		expectError(response, "day.stops.heavy[0]");
+	});
+
+	test("a projected stop that is only a slice of its zero run", () => {
+		const late = clone(generateFullResponse());
+		const heavy = late.day.stops.heavy[0];
+		const at = late.day.times.indexOf(heavy.start);
+		heavy.start = late.day.times[at + 1];
+		expect(validateForecastResponse(late)).toContainEqual(
+			expect.stringContaining("day.stops.heavy[0] is not maximal"),
+		);
+		const early = clone(generateFullResponse());
+		const stop = early.day.stops.heavy[0];
+		stop.end = early.day.times[early.day.times.indexOf(stop.start) + 1];
+		expect(validateForecastResponse(early)).toContainEqual(
+			expect.stringContaining("day.stops.heavy[0] is not maximal"),
+		);
+	});
+
+	test("a projected stop that ends between axis points while its line is still 0", () => {
+		const response = clone(specFull);
+		const stop = response.day.stops.typical[0];
+		stop.end = stop.start + 60_000;
+		response.day.shortfall.stop = clone(stop);
+		expect(validateForecastResponse(response)).toContainEqual(
+			expect.stringContaining("day.stops.typical[0] is not maximal"),
+		);
+	});
+
+	test("a past reset drawn as a slope instead of two entries", () => {
+		const response = clone(specFull);
+		const { times, values } = response.day.past;
+		const jump = times.findIndex(
+			(t: number, i: number) => i > 0 && t === times[i - 1],
+		);
+		expect(jump).toBeGreaterThan(0);
+		times.splice(jump - 1, 1);
+		values.splice(jump - 1, 1);
+		expectError(response, "day.past.values");
+	});
+
+	test("values with more than one decimal", () => {
+		const response = clone(specFull);
+		response.day.light[2] = 52.25;
+		expectError(response, "day.light[2]");
+		const past = clone(specFull);
+		past.day.past.values[0] = 10.01;
+		expectError(past, "day.past.values[0]");
+		const shortfall = clone(specFull);
+		shortfall.day.shortfall.points += 0.05;
+		expectError(shortfall, "day.shortfall.points");
+	});
+
+	test("a projected value above 100 points per counted account", () => {
+		const response = clone(generateFullResponse());
+		expect(response.accounts).toHaveLength(2);
+		response.day.light[1] = 200.1;
+		expectError(response, "day.light[1]");
+	});
+
 	test("stops out of time order", () => {
 		const response = clone(specFull);
 		response.day.stops.heavy.reverse();
