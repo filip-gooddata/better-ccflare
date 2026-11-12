@@ -157,9 +157,14 @@ function pick(cumulative: Float64Array, x: number): number {
  * resampling of the same drawn days. A recorded day is laid onto the date by
  * wall-clock 5-minute slot, and the shift moves along that clock: on DST days a
  * repeated hour is read from its first pass and a skipped slot, or a shift past
- * either end of the day, reads 0, so totals are kept only on regular days. A
- * date whose pool is empty (say no recorded weekends yet) draws from all recorded
- * days: planning errs towards more demand, not less.
+ * either end of the day, reads 0, so totals are kept only on regular days.
+ * Empty pool: a date whose day-type pool (after the monday+workday pooling of
+ * 4.1) is empty draws from all recorded days with their recency weights, and its
+ * scale bandwidth comes from that same fallback pool. This arises only when the
+ * history range holds no day of that type at all (a short history): a calendar
+ * day without demand is still a recorded day with total 0, so a weekend without
+ * work is in the weekend pool. Planning is against the heavy day, so the error
+ * leans toward more demand.
  */
 export async function buildScenarios(
 	input: ForecastInput,
@@ -205,6 +210,7 @@ export async function buildScenarios(
 				: Math.floor(localParts(t, tz).minuteOfDay / SLOT_MINUTES);
 		}
 		let pool = poolFor(table, dayTypeOf(dayStart, input.pace));
+		// no day of this type in the history range at all: all recorded days (see above)
 		if (pool.length === 0) pool = table.days;
 		const cumulative = new Float64Array(pool.length);
 		let acc = 0;

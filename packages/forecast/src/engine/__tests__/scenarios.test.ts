@@ -468,6 +468,34 @@ describe("buildScenarios", () => {
 			);
 			expect(match).toBeDefined();
 		}
+		// the bandwidth of the fallback pool is that same pool's
+		expect(sc.diagnostics.bandwidths["2026-11-14"]).toBe(
+			scaleBandwidth(noWeekends.days),
+		);
+		expect(sc.diagnostics.bandwidths["2026-11-14"]).toBeGreaterThan(0);
+	});
+
+	test("weekends without buckets are recorded zero days: the fallback does not fire", async () => {
+		const input = makeInput(NOW, { simulatedDays: 20, recentTauMin: 0.001 });
+		const weekdaysOnly: ForecastInput = {
+			...input,
+			history: input.history.filter(
+				(b) => localParts(b.start, TZ).isoWeekday <= 5,
+			),
+		};
+		const table = buildDayTable(weekdaysOnly);
+		const weekends = poolFor(table, "weekend");
+		expect(weekends.length).toBe(8);
+		for (const d of weekends) expect(d.total).toBe(0);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		const sc = await buildScenarios(weekdaysOnly, table, horizon, {
+			noise: true,
+		});
+		expect(sc.diagnostics.bandwidths["2026-11-14"]).toBe(0);
+		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
+		const [b0, b1] = dateRange(sc.start, "2026-11-14", sat);
+		for (const u of sc.units)
+			for (let j = b0; j < b1; j++) expect(u[j]).toBe(0);
 	});
 
 	test("time noise shifts the recorded day by whole buckets within ±timeShiftMin", async () => {

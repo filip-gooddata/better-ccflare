@@ -27,7 +27,10 @@ export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
 
 /**
  * Complete local days inside [historyFrom, today 00:00) and the lookback, from the
- * pooled history (a missing bucket is zero demand), plus today so far.
+ * pooled history, plus today so far. Every such calendar day is a recorded day:
+ * a missing bucket is zero demand (ForecastInput.history), so a day with no
+ * buckets at all is recorded with total 0 (a weekend without work stays in the
+ * weekend pool).
  */
 export function buildDayTable(input: ForecastInput): DayTable {
 	const { now, pace, settings } = input;

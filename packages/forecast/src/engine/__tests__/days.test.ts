@@ -221,6 +221,23 @@ describe("buildDayTable", () => {
 	});
 });
 
+describe("days without buckets", () => {
+	test("a complete calendar day with no buckets is a recorded day with total 0", () => {
+		const todayStart = localDayStart(NOW, TZ);
+		const from = addLocalDays(todayStart, -7, TZ);
+		const h = history(from, todayStart, (t) =>
+			localParts(t, TZ).isoWeekday <= 5 ? 0.01 : 0,
+		);
+		const t = buildDayTable(input({ history: h, historyFrom: from }));
+		expect(t.days.length).toBe(7);
+		const weekend = poolFor(t, "weekend");
+		expect(weekend.map((d) => [d.key, d.total])).toEqual([
+			["2026-11-07", 0],
+			["2026-11-08", 0],
+		]);
+	});
+});
+
 describe("poolFor", () => {
 	test("a type with at least 3 days pools alone", () => {
 		const t = table(
