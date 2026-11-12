@@ -369,3 +369,126 @@ describe("AccountRepository.markAccountRateLimited — drops the stale header sn
 		expect(getSnapshot("acc-s3").rate_limit_status).toBe("rejected");
 	});
 });
+
+describe("AccountRepository.markAccountRateLimited — authoritative replace mode", () => {
+	let db: Database;
+	let repo: AccountRepository;
+
+	beforeEach(() => {
+		({ db, repo } = makeDb());
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	function seed(id: string, until: number, at: number, streak: number): void {
+		db.run(
+			`INSERT INTO accounts (id, name, created_at, rate_limited_until, rate_limited_at, rate_limited_reason, consecutive_rate_limits)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			[
+				id,
+				id,
+				Date.now(),
+				until,
+				at,
+				"upstream_429_no_reset_probe_cooldown",
+				streak,
+			],
+		);
+	}
+
+	function row(id: string): {
+		rate_limited_until: number | null;
+		rate_limited_reason: string | null;
+		consecutive_rate_limits: number;
+	} {
+		return db
+			.query<
+				{
+					rate_limited_until: number | null;
+					rate_limited_reason: string | null;
+					consecutive_rate_limits: number;
+				},
+				[string]
+			>(
+				"SELECT rate_limited_until, rate_limited_reason, consecutive_rate_limits FROM accounts WHERE id = ?",
+			)
+			.get(id) as {
+			rate_limited_until: number | null;
+			rate_limited_reason: string | null;
+			consecutive_rate_limits: number;
+		};
+	}
+
+	it("shortens an older stored cooldown without touching the streak", async () => {
+		const now = Date.now();
+		seed("acc-1", now + 5 * 3_600_000, now - 60_000, 2);
+		const until = now + 10 * 60_000;
+
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			until,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: now },
+		);
+
+		expect(result).toEqual({ consecutiveRateLimits: 2, applied: true });
+		expect(row("acc-1")).toEqual({
+			rate_limited_until: until,
+			rate_limited_reason: "upstream_429_with_reset",
+			consecutive_rate_limits: 2,
+		});
+	});
+
+	it("keeps the extend-only guard without the authoritative option", async () => {
+		const now = Date.now();
+		const stored = now + 5 * 3_600_000;
+		seed("acc-1", stored, now - 60_000, 2);
+
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			now + 10 * 60_000,
+			"upstream_429_with_reset",
+			false,
+		);
+
+		expect(result.applied).toBe(false);
+		expect(row("acc-1").rate_limited_until).toBe(stored);
+	});
+
+	it("does not shorten a later cooldown stamped after the response was observed", async () => {
+		const now = Date.now();
+		const stored = now + 5 * 3_600_000;
+		seed("acc-1", stored, now + 1_000, 2);
+
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			now + 10 * 60_000,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: now },
+		);
+
+		expect(result.applied).toBe(false);
+		expect(row("acc-1").rate_limited_until).toBe(stored);
+	});
+
+	it("still extends a newer but shorter cooldown", async () => {
+		const now = Date.now();
+		seed("acc-1", now + 60_000, now + 1_000, 2);
+		const until = now + 10 * 60_000;
+
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			until,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: now },
+		);
+
+		expect(result.applied).toBe(true);
+		expect(row("acc-1").rate_limited_until).toBe(until);
+	});
+});

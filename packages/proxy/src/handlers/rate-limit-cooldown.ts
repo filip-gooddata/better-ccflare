@@ -389,10 +389,26 @@ export function applyRateLimitCooldown(
 		);
 	}
 
+	// On the all-limited rule path an upstream-reported reset replaces the
+	// stored deadline even when it is earlier; anything else there may only
+	// extend it, matching the guarded database write below.
+	const replacesEarlier =
+		preserveStreak &&
+		!rateLimitInfo.resetIsInferred &&
+		rateLimitInfo.resetTime != null &&
+		rateLimitInfo.resetTime > now;
+	const keepsLaterCooldown =
+		preserveStreak &&
+		!replacesEarlier &&
+		account.rate_limited_until != null &&
+		account.rate_limited_until > cooldownUntil;
+
 	// In-memory update so the rest of this request sees consistent state.
-	account.rate_limited_until = cooldownUntil;
-	account.rate_limited_at = now;
-	account.rate_limited_reason = reason;
+	if (!keepsLaterCooldown) {
+		account.rate_limited_until = cooldownUntil;
+		account.rate_limited_at = now;
+		account.rate_limited_reason = reason;
+	}
 	if (!isTransientUpstream && !preserveStreak) {
 		account.consecutive_rate_limits = nextCount;
 	}
@@ -411,6 +427,7 @@ export function applyRateLimitCooldown(
 				cooldownUntil,
 				reason,
 				!isTransientUpstream && !preserveStreak,
+				replacesEarlier ? { authoritativeObservedAt: now } : undefined,
 			);
 		// Reconcile in-memory counter with the authoritative DB value (may differ
 		// under concurrent 429s for the same account). Skipped for the transient
