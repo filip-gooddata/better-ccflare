@@ -926,3 +926,137 @@ describe("failover path C target discovery", () => {
 		});
 	});
 });
+
+/**
+ * The deployed setting: MODEL_SCOPED_CAPACITY_ROUTING=exhausted. A request
+ * with a model then runs the model-scoped capacity filter, and a strategy
+ * that already left no candidate must still reach the all-limited rule
+ * rather than end in the local pool_exhausted 503.
+ */
+describe("session-pace with every account out on limits and capacity routing on", () => {
+	const routed = (accounts: Account[]) =>
+		makeCtx(accounts, paceStrategy(), { capacityRouting: true });
+
+	for (const stream of [false, true]) {
+		it(`returns the upstream 429 of the account usable first for a message (stream=${stream})`, async () => {
+			const weekly = makeAccount("weekly");
+			const five = makeAccount("five");
+			usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
+			usageCache.set("five", usage({ fiveHour: win(100, NOW + 2 * HOUR) }));
+			const calls = installUpstream((account) =>
+				limit429(NOW + 2 * HOUR, account),
+			);
+			const { ctx } = routed([weekly, five]);
+
+			const response = await send(ctx, makeRequest({ stream }));
+
+			expect((response as Response).status).toBe(429);
+			expect(calls).toEqual(["five"]);
+			await expectUpstreamIdentity(response, {
+				status: 429,
+				headers: limitHeaders(NOW + 2 * HOUR, "five"),
+				body: limitBody("five"),
+			});
+		});
+	}
+
+	for (const session of ["first-request-of-a-session", null]) {
+		it(`routes session=${session} to the account usable first`, async () => {
+			const a = makeAccount("a");
+			const b = makeAccount("b");
+			usageCache.set("a", usage({ fiveHour: win(100, NOW + 3 * HOUR) }));
+			usageCache.set("b", usage({ fiveHour: win(100, NOW + HOUR) }));
+			const calls = installUpstream((account) => limit429(NOW + HOUR, account));
+			const { ctx } = routed([a, b]);
+
+			const response = await send(ctx, makeRequest({ session }));
+
+			expect((response as Response).status).toBe(429);
+			expect(calls).toEqual(["b"]);
+			await expectUpstreamIdentity(response, {
+				status: 429,
+				headers: limitHeaders(NOW + HOUR, "b"),
+				body: limitBody("b"),
+			});
+		});
+	}
+
+	it("routes on cooldowns alone when usage data is missing, as right after a restart", async () => {
+		const a = makeAccount("a", { rate_limited_until: NOW + 2 * HOUR });
+		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
+		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
+		const { ctx } = routed([a, b]);
+
+		const response = await send(ctx);
+
+		expect((response as Response).status).toBe(429);
+		expect(calls).toEqual(["b"]);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + HOUR, "b"),
+			body: limitBody("b"),
+		});
+	});
+
+	it("returns the upstream 429 for count_tokens", async () => {
+		const a = makeAccount("a");
+		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
+		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
+		const { ctx } = routed([a]);
+		const request = new Request(
+			"https://proxy.local/v1/messages/count_tokens",
+			{
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					model: MODEL,
+					messages: [{ role: "user", content: "hello" }],
+				}),
+			},
+		);
+
+		const response = await send(ctx, request);
+
+		expect((response as Response).status).toBe(429);
+		expect(calls).toEqual(["a"]);
+		await expectUpstreamIdentity(response, {
+			status: 429,
+			headers: limitHeaders(NOW + HOUR, "a"),
+			body: limitBody("a"),
+		});
+	});
+
+	it("returns the upstream 429 for HEAD /api/hello", async () => {
+		const a = makeAccount("a");
+		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
+		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
+		const { ctx } = routed([a]);
+		const request = new Request("https://proxy.local/api/hello", {
+			method: "HEAD",
+		});
+
+		const response = (await send(ctx, request)) as Response;
+
+		expect((response as Response).status).toBe(429);
+		expect(calls).toEqual(["a"]);
+		expect(response.status).toBe(429);
+		expect(response.headers.get("retry-after")).toBe(
+			limitHeaders(NOW + HOUR, "a")["retry-after"],
+		);
+	});
+
+	it("keeps the proxy's own 503 when every account is paused or needs re-login", async () => {
+		const a = makeAccount("a", { paused: true });
+		const b = makeAccount("b", { requires_reauth: true });
+		usageCache.set("b", usage({ fiveHour: win(100, NOW + HOUR) }));
+		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
+		const { ctx } = routed([a, b]);
+
+		const response = (await send(ctx)) as Response;
+
+		expect(calls).toEqual([]);
+		expect(response.status).toBe(503);
+		const body = (await response.json()) as { error: { type: string } };
+		expect(body.error.type).toBe("pool_exhausted");
+	});
+});

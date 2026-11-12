@@ -1257,6 +1257,15 @@ export async function selectAccountsForRequest(
 		addDeferredCandidates(meta, deferred);
 	};
 
+	// The strategy left no candidate: ask the all-limited rule here, before the
+	// model-scoped capacity filter. With nothing to filter, that block returns
+	// the empty list without reaching the rule, and a request with a model
+	// would get the local pool_exhausted 503 instead of an upstream answer.
+	if (orderedAccounts.length === 0) {
+		const allLimited = await allLimitedSelection();
+		if (allLimited) return allLimited;
+	}
+
 	// Model-scoped capacity filter for the non-combo (or combo-inactive/
 	// combo-exhausted-fallthrough) path: drop accounts whose weekly per-model
 	// cap for this model's family is exhausted. Only when the filter empties
@@ -1370,11 +1379,6 @@ export async function selectAccountsForRequest(
 			notePoolDeferrals(available);
 			return applyXaiCacheAffinity(available, meta);
 		}
-	}
-
-	if (orderedAccounts.length === 0) {
-		const allLimited = await allLimitedSelection();
-		if (allLimited) return allLimited;
 	}
 
 	notePoolDeferrals(orderedAccounts);
