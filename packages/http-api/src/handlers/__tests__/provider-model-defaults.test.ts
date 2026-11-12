@@ -11,7 +11,17 @@ import {
 	isVisionUnsupported,
 	markVisionUnsupported,
 } from "@better-ccflare/proxy";
+import type { SessionPaceSettings } from "@better-ccflare/types";
 import { createConfigHandlers } from "../config";
+
+const paceSettings = (): SessionPaceSettings => ({
+	workDays: 5,
+	familyGuardPct: 90,
+	fiveHourGuardPct: 85,
+	tieBandPct: 3,
+	idleMs: 600_000,
+	timeZone: "UTC",
+});
 
 function makeConfig(initial: Record<string, Record<string, string>> = {}) {
 	let saved = initial;
@@ -64,7 +74,7 @@ describe("provider model defaults", () => {
 	// in the only place it is documented.
 	it("still lists the fields when nothing has been discovered", async () => {
 		clearDerivedProviderModelDefaults();
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 
 		const response = await handlers.getProviderModelDefaults();
 		const body = (await response.json()) as {
@@ -91,7 +101,7 @@ describe("provider model defaults", () => {
 	// the discovered map closed the escape hatch exactly then.
 	it("accepts an override before any listing has been read", async () => {
 		clearDerivedProviderModelDefaults();
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 
 		const response = await handlers.setProviderModelDefaults(
 			request([{ provider: "codex", family: "opus", model: "gpt-5.6-sol" }]),
@@ -116,7 +126,7 @@ describe("provider model defaults", () => {
 	});
 
 	it("merges one family override without erasing the provider factory map", async () => {
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		const response = await handlers.setProviderModelDefaults(
 			request([{ provider: "codex", family: "opus", model: "gpt-custom" }]),
 		);
@@ -141,6 +151,7 @@ describe("provider model defaults", () => {
 	it("empty model removes an override and resolver returns factory", async () => {
 		const handlers = createConfigHandlers(
 			makeConfig({ codex: { opus: "gpt-custom" } }),
+			paceSettings,
 		);
 		setProviderModelDefaultOverrides({ codex: { opus: "gpt-custom" } });
 		const response = await handlers.setProviderModelDefaults(
@@ -151,7 +162,7 @@ describe("provider model defaults", () => {
 	});
 
 	it("rejects unknown providers and families", async () => {
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		expect(
 			(
 				await handlers.setProviderModelDefaults(
@@ -185,7 +196,7 @@ describe("provider model defaults", () => {
 
 	it("GET lists only codex by default (CCFLARE_MODEL_DEFAULTS_PROVIDERS unset)", async () => {
 		delete process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS;
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		const response = handlers.getProviderModelDefaults();
 		expect(response.status).toBe(200);
 		const body = (await response.json()) as {
@@ -198,7 +209,7 @@ describe("provider model defaults", () => {
 
 	it("POST rejects a disabled provider with 400 citing the env var", async () => {
 		delete process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS;
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		const response = await handlers.setProviderModelDefaults(
 			request([{ provider: "xai", family: "sonnet", model: "grok-x" }]),
 		);
@@ -210,7 +221,7 @@ describe("provider model defaults", () => {
 
 	it("CCFLARE_MODEL_DEFAULTS_PROVIDERS=codex,xai lists and accepts xai again", async () => {
 		process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS = "codex,xai";
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		const getBody = (await handlers.getProviderModelDefaults().json()) as {
 			providers: Array<{ provider: string }>;
 		};
@@ -228,7 +239,7 @@ describe("provider model defaults", () => {
 	it("a disabled provider's stored override stays inert and does not affect resolution", async () => {
 		process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS = "codex,xai";
 		const config = makeConfig({ xai: { sonnet: "grok-custom" } });
-		const handlers = createConfigHandlers(config);
+		const handlers = createConfigHandlers(config, paceSettings);
 		// A POST to codex already pushes the whole map (filtered by enabled
 		// providers) to the in-memory registry, just as boot does.
 		await handlers.setProviderModelDefaults(
@@ -283,7 +294,7 @@ describe("provider model defaults", () => {
 
 	it("codex keeps translating even when left out of CCFLARE_MODEL_DEFAULTS_PROVIDERS", async () => {
 		process.env.CCFLARE_MODEL_DEFAULTS_PROVIDERS = "xai";
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		const response = await handlers.setProviderModelDefaults(
 			request([{ provider: "codex", family: "opus", model: "gpt-custom" }]),
 		);
@@ -313,7 +324,7 @@ describe("provider model defaults change the vision cache's upstream", () => {
 	});
 
 	it("drops the learned image refusals when a defaults change succeeds", async () => {
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		markVisionUnsupported(ACCOUNT, ASKED_MODEL);
 		expect(isVisionUnsupported(ACCOUNT, ASKED_MODEL)).toBe(true);
 
@@ -326,7 +337,7 @@ describe("provider model defaults change the vision cache's upstream", () => {
 	});
 
 	it("drops them for EVERY account, because a provider default is not account-scoped", async () => {
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		markVisionUnsupported("acc-vision-a", ASKED_MODEL);
 		markVisionUnsupported("acc-vision-b", ASKED_MODEL);
 
@@ -343,6 +354,7 @@ describe("provider model defaults change the vision cache's upstream", () => {
 		setProviderModelDefaultOverrides({ codex: { opus: "gpt-custom" } });
 		const handlers = createConfigHandlers(
 			makeConfig({ codex: { opus: "gpt-custom" } }),
+			paceSettings,
 		);
 		markVisionUnsupported(ACCOUNT, ASKED_MODEL);
 
@@ -356,7 +368,7 @@ describe("provider model defaults change the vision cache's upstream", () => {
 	});
 
 	it("keeps them when the change is rejected", async () => {
-		const handlers = createConfigHandlers(makeConfig());
+		const handlers = createConfigHandlers(makeConfig(), paceSettings);
 		markVisionUnsupported(ACCOUNT, ASKED_MODEL);
 
 		// A provider that is not editable is a 400: nothing was written, so
@@ -373,6 +385,7 @@ describe("provider model defaults change the vision cache's upstream", () => {
 		setProviderModelDefaultOverrides({ codex: { opus: "gpt-custom" } });
 		const handlers = createConfigHandlers(
 			makeConfig({ codex: { opus: "gpt-custom" } }),
+			paceSettings,
 		);
 		markVisionUnsupported(ACCOUNT, ASKED_MODEL);
 

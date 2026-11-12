@@ -10,10 +10,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Config } from "@better-ccflare/config";
 import { isUseExtraUsageEnabled, setUseExtraUsage } from "@better-ccflare/core";
-import type { Account } from "@better-ccflare/types";
+import type { Account, SessionPaceSettings } from "@better-ccflare/types";
 import { createConfigHandlers } from "../config";
 import { computePoolStatus } from "../health";
 import { computeRateLimitStatusDisplay } from "../rate-limit-status";
+
+const paceSettings = (): SessionPaceSettings => ({
+	workDays: 5,
+	familyGuardPct: 90,
+	fiveHourGuardPct: 85,
+	tieBandPct: 3,
+	idleMs: 600_000,
+	timeZone: "UTC",
+});
 
 const NOW = Date.UTC(2030, 0, 1);
 const RESET = NOW + 60 * 60000;
@@ -88,6 +97,7 @@ describe("/api/config/use-extra-usage", () => {
 		try {
 			const handlers = createConfigHandlers(
 				new Config(join(dir, "config.json")),
+				paceSettings,
 			);
 
 			const before = await handlers.getUseExtraUsage().json();
@@ -117,6 +127,7 @@ describe("/api/config/use-extra-usage", () => {
 		try {
 			const handlers = createConfigHandlers(
 				new Config(join(dir, "config.json")),
+				paceSettings,
 			);
 			const res = await handlers.setUseExtraUsage(
 				new Request("http://localhost/api/config/use-extra-usage", {

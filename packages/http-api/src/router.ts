@@ -243,9 +243,9 @@ export class APIRouter {
 		const requestsDetailHandler = createRequestsDetailHandler(dbOps);
 		const configHandlers = createConfigHandlers(
 			config,
+			this.context.getSessionPaceSettings,
 			this.context.runtime,
 			this.context.modelCatalog,
-			this.context.getSessionPaceSettings,
 		);
 		const logsStreamHandler = createLogsStreamHandler();
 		const logsHistoryHandler = createLogsHistoryHandler();
