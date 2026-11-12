@@ -124,6 +124,23 @@ export interface APIContext {
 	localControlSecret?: string;
 }
 
+/** A limit that keeps an account from serving a request. */
+export type AccountLimitKind = "cooldown" | "five_hour" | "weekly" | "family";
+
+export interface AccountLimit {
+	kind: AccountLimitKind;
+	/** When the limit resets (epoch ms); null when the reset time is unknown. */
+	resetAt: number | null;
+	/** Model family, for a `family` limit. */
+	family?: string;
+}
+
+/** An account kept from a request only by limits, with each limit in force. */
+export interface LimitBlockedAccount {
+	account: Account;
+	limits: AccountLimit[];
+}
+
 // Load balancing strategy interface
 export interface LoadBalancingStrategy {
 	/**
@@ -150,6 +167,18 @@ export interface LoadBalancingStrategy {
 	 * implementations must ignore metas they did not select for.
 	 */
 	onRequestServed?(meta: RequestMeta, account: Account, status: number): void;
+
+	/**
+	 * Optional: called by the proxy when every account that could serve a
+	 * request is out only on limits. Returns the one account to forward the
+	 * request to anyway, so the client gets that account's own upstream
+	 * response, or null to keep the proxy's local error. A strategy without
+	 * this method keeps the local error.
+	 */
+	selectWhenAllLimited?(
+		blocked: LimitBlockedAccount[],
+		meta: RequestMeta,
+	): Account | null;
 
 	/**
 	 * Optional initialization method to inject dependencies

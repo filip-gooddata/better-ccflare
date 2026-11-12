@@ -6,6 +6,8 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import type {
 	Account,
+	AccountLimit,
+	LimitBlockedAccount,
 	LoadBalancingStrategy,
 	RequestMeta,
 	StrategyStore,
@@ -286,6 +288,26 @@ interface RoutedRequest {
  * family-guard move), the session rebinds to it and stays there. A mapping
  * expires after `idleMs` without a request.
  */
+/** Latest reset among an account's limits; null when any reset is unknown. */
+function usableAgainAt(limits: AccountLimit[]): number | null {
+	let latest = Number.NEGATIVE_INFINITY;
+	for (const limit of limits) {
+		if (limit.resetAt === null) return null;
+		latest = Math.max(latest, limit.resetAt);
+	}
+	return Number.isFinite(latest) ? latest : null;
+}
+
+function limitLabel(limit: AccountLimit): string {
+	if (limit.kind === "five_hour") return "5h";
+	if (limit.kind === "family") return limit.family ?? "family";
+	return limit.kind;
+}
+
+function isoOrUnknown(ms: number | null): string {
+	return ms === null ? "unknown" : new Date(ms).toISOString();
+}
+
 export class SessionPaceStrategy implements LoadBalancingStrategy {
 	readonly options: SessionPaceOptions;
 	/** Work days from options; the zone is read once, here, unless injected. */
@@ -653,6 +675,44 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 				familyUtil !== null && familyUtil >= this.options.familyGuardPct,
 			hasUsage: weekly !== null || fiveHour !== null,
 		};
+	}
+
+	/**
+	 * Every account that could serve the request is out on limits: pick the
+	 * one usable again first, so the request goes there and the client gets
+	 * that account's own upstream answer. An account is usable again at the
+	 * latest reset among its limits; an unknown reset sorts after every known
+	 * one. Ties go to the lower priority number, then the account name.
+	 * Session mappings are left alone.
+	 */
+	selectWhenAllLimited(
+		blocked: LimitBlockedAccount[],
+		meta: RequestMeta,
+	): Account | null {
+		if (blocked.length === 0) return null;
+		const ranked = blocked
+			.map((b) => ({ ...b, usableAt: usableAgainAt(b.limits) }))
+			.sort(
+				(x, y) =>
+					(x.usableAt ?? Number.POSITIVE_INFINITY) -
+						(y.usableAt ?? Number.POSITIVE_INFINITY) ||
+					(x.account.priority ?? 0) - (y.account.priority ?? 0) ||
+					x.account.name.localeCompare(y.account.name),
+			);
+		const first = ranked[0].account;
+		const session = meta.clientSessionId
+			? sessionLogTag(meta.clientSessionId)
+			: "none";
+		const parts = ranked.map(
+			(r) =>
+				`${r.account.name}(usable=${isoOrUnknown(r.usableAt)} limits=${r.limits
+					.map((l) => `${limitLabel(l)}@${isoOrUnknown(l.resetAt)}`)
+					.join(",")})`,
+		);
+		this.log.info(
+			`session-pace place session=${session} account=${first.name} rule=all-exhausted reason=earliest-reset candidates=[${parts.join("; ")}]`,
+		);
+		return first;
 	}
 
 	private describe(candidates: Candidate[], family: string | null): string {
