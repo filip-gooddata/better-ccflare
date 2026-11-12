@@ -8,6 +8,7 @@ import {
 } from "bun:test";
 import { clearAllProbeBackoff, setProbeBackoff } from "@better-ccflare/core";
 import {
+	SESSION_PACE_OPEN_SESSION_HOLD_MS,
 	SessionPaceStrategy,
 	sessionLogTag,
 	weeklyPaceDeficit,
@@ -919,6 +920,278 @@ describe("SessionPaceStrategy", () => {
 				new SessionPaceStrategy({ workDays: 6 }, { timeZone: PRAGUE })
 					.paceBasis,
 			).toEqual({ workDays: 6, timeZone: PRAGUE });
+		});
+	});
+
+	describe("rule 11: an account with no running 5-hour window gets the next new session", () => {
+		/** No window running: usage data present, five_hour with no reset time. */
+		function setNoWindow(accountId: string, resetsAt: number | null = null) {
+			store.fiveHour.set(accountId, { utilization: 0, resetsAt });
+		}
+
+		function captureLines(): string[] {
+			const lines: string[] = [];
+			const logger = (
+				strategy as unknown as { log: { info: (m: string) => void } }
+			).log;
+			logger.info = (m: string) => {
+				lines.push(m);
+			};
+			return lines;
+		}
+
+		it("places a new session on the account without a window although the other is further behind pace (live case)", () => {
+			const gd = makeAccount("gd", { name: "gooddata" });
+			const ai = makeAccount("ai", { name: "gooddata-ai" });
+			store.setWeeklyDeficit("gd", 40);
+			store.setFiveHour("gd", 84);
+			store.setWeeklyDeficit("ai", -20);
+			setNoWindow("ai");
+			expect(ids(strategy.select([gd, ai], meta("s1")))).toEqual(["ai", "gd"]);
+		});
+
+		it("follows the normal order for the next new session while the data is unchanged, and applies again after the hold", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			expect(placeSpaced("s1")[0].id).toBe("b");
+			expect(placeSpaced("s2")[0].id).toBe("a");
+			expect(placeSpaced("s3")[0].id).toBe("a");
+
+			setSystemTime(
+				new Date(Date.now() + SESSION_PACE_OPEN_SESSION_HOLD_MS - 3_000),
+			);
+			expect(strategy.select([a, b], meta("s4"))[0].id).toBe("a");
+			setSystemTime(new Date(Date.now() + 3_000));
+			expect(strategy.select([a, b], meta("s5"))[0].id).toBe("b");
+		});
+
+		it("does not pick an account that served a response since the data was fetched", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			// A mapped session on a fails over to b, which serves it.
+			const m = meta("mapped");
+			strategy.select([a], m);
+			strategy.onRequestServed(m, b, 200);
+			expect(placeSpaced("s1")[0].id).toBe("a");
+		});
+
+		it("counts a response served for a request without a client session", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			const m = meta(null);
+			strategy.select([a], m);
+			strategy.onRequestServed(m, b, 200);
+			expect(placeSpaced("s1")[0].id).toBe("a");
+		});
+
+		it("ignores an error response when deciding whether the account served", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			const m = meta("mapped");
+			strategy.select([a], m);
+			strategy.onRequestServed(m, b, 529);
+			expect(placeSpaced("s1")[0].id).toBe("b");
+		});
+
+		it("does not apply to an account without usage data", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+		});
+
+		it("does not apply to usage data without a 5-hour window", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+		});
+
+		it("treats a reset time in the past as no running window", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			store.setFiveHour("b", 100, NOW - 1);
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("b");
+		});
+
+		it("does not apply to a running window at 0%", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			store.setFiveHour("b", 0);
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+		});
+
+		it("opens one window per new session when several accounts have none", () => {
+			const c = makeAccount("c");
+			store.setWeeklyDeficit("a", 10);
+			setNoWindow("a");
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			store.setWeeklyDeficit("c", 40);
+			store.setFiveHour("c", 30);
+			expect(placeSpaced("s1", [a, b, c])[0].id).toBe("a");
+			expect(placeSpaced("s2", [a, b, c])[0].id).toBe("b");
+			expect(placeSpaced("s3", [a, b, c])[0].id).toBe("c");
+		});
+
+		it("opens one window per new session also when two sessions start together", () => {
+			setNoWindow("a");
+			setNoWindow("b");
+			store.setWeeklyDeficit("a", 10);
+			store.setWeeklyDeficit("b", 9);
+			const first = strategy.select([a, b], meta("s1"))[0].id;
+			const second = strategy.select([a, b], meta("s2"))[0].id;
+			expect(new Set([first, second]).size).toBe(2);
+		});
+
+		it("does not pick an unavailable account", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			const paused = { ...b, paused: true };
+			expect(ids(strategy.select([a, paused], meta("s1")))).toEqual(["a"]);
+		});
+
+		it("does not outrank the probe-backoff rank", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			setProbeBackoff("b", NOW + HOUR);
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+		});
+
+		it("does not outrank the family guard for the request's family", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			store.setFamily("b", "opus", 95);
+			expect(strategy.select([a, b], meta("s1", "claude-opus-5-5"))[0].id).toBe(
+				"a",
+			);
+		});
+
+		it("outranks configured priority", () => {
+			const high = makeAccount("a", { priority: 0 });
+			const low = makeAccount("b", { priority: 5 });
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 20);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			expect(strategy.select([high, low], meta("s1"))[0].id).toBe("b");
+		});
+
+		it("does not move a mapped session", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			store.setFiveHour("b", 10);
+			expect(strategy.select([a, b], meta("s"))[0].id).toBe("a");
+			setNoWindow("b");
+			setSystemTime(new Date(NOW + 60_000));
+			expect(strategy.select([a, b], meta("s"))[0].id).toBe("a");
+		});
+
+		it("re-places a session idle past the idle time on the account without a window", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84, NOW + 3 * HOUR);
+			store.setWeeklyDeficit("b", -20);
+			store.setFiveHour("b", 10);
+			expect(strategy.select([a, b], meta("s"))[0].id).toBe("a");
+			setNoWindow("b");
+			setSystemTime(new Date(NOW + HOUR));
+			expect(strategy.select([a, b], meta("s"))[0].id).toBe("b");
+		});
+
+		it("sends a family-guard move to the account without a window", () => {
+			const c = makeAccount("c");
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 50);
+			store.setWeeklyDeficit("b", 30);
+			store.setFiveHour("b", 50);
+			store.setWeeklyDeficit("c", -20);
+			store.setFiveHour("c", 50);
+			expect(strategy.select([a, b, c], meta("s"))[0].id).toBe("a");
+			store.setFamily("a", "opus", 95);
+			setNoWindow("c");
+			setSystemTime(new Date(NOW + 60_000));
+			expect(
+				ids(strategy.select([a, b, c], meta("s", "claude-opus-5-5"))),
+			).toEqual(["c", "b", "a"]);
+		});
+
+		it("peek follows the rule without taking the account out", () => {
+			store.setWeeklyDeficit("a", 40);
+			store.setFiveHour("a", 84);
+			store.setWeeklyDeficit("b", -20);
+			setNoWindow("b");
+			expect(strategy.peek([a, b], meta("p1"))).toBe("b");
+			expect(strategy.peek([a, b], meta("p2"))).toBe("b");
+			expect(strategy.select([a, b], meta("s1"))[0].id).toBe("b");
+			setSystemTime(new Date(NOW + 1_000));
+			expect(strategy.peek([a, b], meta("p3"))).toBe("a");
+		});
+
+		it("leaves cold start unchanged", () => {
+			expect(placeSpaced("s1")[0].id).toBe("a");
+			expect(placeSpaced("s2")[0].id).toBe("b");
+		});
+
+		it("names the rule and every candidate's window state in the placement line", () => {
+			const lines = captureLines();
+			const gd = makeAccount("uuid-gd-0000", { name: "gooddata" });
+			const ai = makeAccount("uuid-ai-0000", { name: "gooddata-ai" });
+			const other = makeAccount("uuid-ot-0000", { name: "other" });
+			store.weekly.set("uuid-gd-0000", {
+				utilization: 33,
+				resetsAt: Date.parse("2026-11-15T14:00:00Z"),
+			});
+			store.weekly.set("uuid-ai-0000", {
+				utilization: 50,
+				resetsAt: Date.parse("2026-11-17T02:00:00Z"),
+			});
+			store.weekly.set("uuid-ot-0000", {
+				utilization: 90,
+				resetsAt: Date.parse("2026-11-17T02:00:00Z"),
+			});
+			store.setFiveHour("uuid-gd-0000", 84);
+			setNoWindow("uuid-ai-0000");
+			const session = JSON.stringify({
+				device_id: "dev",
+				account_uuid: "acct-secret",
+				session_id: "5e551011-aaaa-bbbb-cccc-000000000000",
+			});
+			strategy.select([gd, ai, other], meta(session, "claude-fable-5-2"));
+
+			expect(lines).toHaveLength(1);
+			const [place] = lines;
+			expect(place).toContain("session-pace place session=5e551011");
+			expect(place).toContain("account=gooddata-ai ");
+			expect(place).toContain("rule=open-session reason=no-five-hour-window");
+			expect(place).toContain("work_days=5 tz=Europe/Prague ");
+			expect(place).toContain("gooddata(deficit=");
+			expect(place).toContain(" 5h=84% fable=n/a)");
+			expect(place).toContain(" 5h=not-running fable=n/a)");
+			expect(place).toContain(" 5h=unknown fable=n/a)");
+			console.log(`SAMPLE ${place}`);
+
+			setSystemTime(new Date(NOW + 1_000));
+			strategy.select([gd, ai, other], meta("other-session"));
+			expect(lines[1]).toContain("gooddata-ai(deficit=");
+			expect(lines[1]).toContain("5h=not-running");
+			expect(lines[1]).toContain("open-held");
+			expect(lines[1]).not.toContain("rule=open-session");
 		});
 	});
 

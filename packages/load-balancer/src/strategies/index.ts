@@ -25,6 +25,7 @@ export { SessionDrainSoonestStrategy } from "./session-drain-soonest";
 export type { SessionPaceOptions } from "./session-pace";
 export {
 	SESSION_PACE_DEFAULTS,
+	SESSION_PACE_OPEN_SESSION_HOLD_MS,
 	SESSION_PACE_RECENT_PICK_WINDOW_MS,
 	SessionPaceStrategy,
 	sessionLogTag,
