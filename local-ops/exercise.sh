@@ -1,9 +1,13 @@
 #!/bin/bash
 # Sandbox exercise for deploy.sh. Builds a mode-700 mktemp sandbox holding copies of the real
-# release binary, LaunchAgent plist and app config JSON, points deploy.sh at the copies through
-# BCF_* overrides, and replaces launchctl, curl (the HTTP endpoints), lsof, netstat and claude with
+# release binary and LaunchAgent plist plus a synthetic app config JSON written here (the real
+# config is never read), points deploy.sh at them through BCF_* overrides, and replaces launchctl, curl (the HTTP endpoints), lsof, netstat and claude with
 # stubs. Nothing here touches the real installation, calls launchctl, runs the real claude or sends
 # a network request. The sandbox is deleted on exit.
+#
+# The upgrade scenarios start each sandbox from a finished first deploy of NEW_BINARY (first-deploy
+# backups present, plist and config at session-pace) and upgrade it with --upgrade-from to a
+# stand-in for the next build: a copy of NEW_BINARY with bytes appended, never executed.
 #
 # Usage: exercise.sh NEW_BINARY      (any executable that differs from the release binary)
 # Exit: 0 when every scenario passes, 1 otherwise. EX_LOG_DIR keeps the script output.
@@ -20,7 +24,6 @@ LABEL=net.kalny.better-ccflare
 REAL_BIN=$HOME/.local/bin/better-ccflare
 REAL_KEEP=$REAL_BIN.v3.6.7-release
 REAL_PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
-REAL_CONFIG=$HOME/.config/better-ccflare/better-ccflare.json
 PB=/usr/libexec/PlistBuddy
 
 [ $# -eq 1 ] || { echo "usage: exercise.sh NEW_BINARY" >&2; exit 64; }
@@ -35,6 +38,7 @@ trap 'exit 130' INT TERM HUP
 
 sha() { /usr/bin/shasum -a 256 "$1" 2>/dev/null | /usr/bin/awk '{print $1}'; }
 mtime() { /usr/bin/stat -f %m "$1" 2>/dev/null; }
+inode() { /usr/bin/stat -f %i "$1" 2>/dev/null; }
 fmode() { /usr/bin/stat -f %Lp "$1" 2>/dev/null; }
 die() { echo "exercise: setup failed: $*" >&2; exit 1; }
 
@@ -45,21 +49,27 @@ if [ -f "$REAL_KEEP" ]; then src_bin=$REAL_KEEP; else src_bin=$REAL_BIN; fi
 /bin/cp -p "$src_bin" "$P/bin" || die "copy binary"
 real_plist_file=$(/usr/bin/perl -MCwd=abs_path -e 'my $p = abs_path(shift); defined $p or exit 1; print $p' "$REAL_PLIST") || die "resolve plist"
 /bin/cp -p "$real_plist_file" "$P/plist" || die "copy plist"
-/bin/cp -p "$REAL_CONFIG" "$P/config" || die "copy config"
 /bin/cp "$NEW_SRC" "$P/new" && /bin/chmod 755 "$P/new" || die "copy new binary"
 RELEASE_SHA=$(sha "$P/bin")
 NEW_SHA=$(sha "$P/new")
 [ "$RELEASE_SHA" != "$NEW_SHA" ] || die "the stand-in new binary must differ from the release binary"
 $PB -c "Set :EnvironmentVariables:LB_STRATEGY session-affinity" "$P/plist" >/dev/null 2>&1 || die "plist LB_STRATEGY"
 $PB -c "Delete :EnvironmentVariables:MODEL_SCOPED_CAPACITY_ROUTING" "$P/plist" >/dev/null 2>&1
-# Synthetic secret planted in the config copy, which is also set to the release lb_strategy; the
-# leak checks at the end assert the secret never leaves the config files. Written via a mode-600
-# temp file; nothing is printed.
+# Synthetic app config, mode 600, at the release lb_strategy. Besides lb_strategy (the only key
+# deploy.sh reads or edits) it holds other keys around it, so the in-place edit has neighbours to
+# leave alone, and fake OAuth tokens plus a random sentinel for the leak checks at the end, which
+# assert none of it leaves the config files. Nothing is printed.
 SENTINEL=$(/usr/bin/od -An -N16 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')
 [ ${#SENTINEL} = 32 ] || die "sentinel"
-(umask 077; /usr/bin/jq --arg s "exercise-sentinel-$SENTINEL" '. + {exercise_sentinel_token: $s} | .lb_strategy = "session-affinity"' "$P/config" >"$P/config.tmp" 2>/dev/null) || die "plant sentinel"
-/bin/chmod "$(fmode "$P/config")" "$P/config.tmp" && /bin/mv -f "$P/config.tmp" "$P/config" || die "plant sentinel"
-/usr/bin/jq -e '.lb_strategy == "session-affinity" and (.exercise_sentinel_token | type) == "string"' "$P/config" >/dev/null 2>&1 || die "sentinel config shape"
+(umask 077; /usr/bin/jq -n --arg s "exercise-sentinel-$SENTINEL" '{
+  port: 8791,
+  lb_strategy: "session-affinity",
+  default_agent_model: "exercise-model-name",
+  exercise_fake_oauth: {access_token: ("exercise-fake-access-" + $s), refresh_token: ("exercise-fake-refresh-" + $s), expires_at: 1767225600000},
+  exercise_sentinel_token: $s
+}' >"$P/config" 2>/dev/null) || die "write synthetic config"
+/bin/chmod 600 "$P/config" || die "synthetic config mode"
+/usr/bin/jq -e '.lb_strategy == "session-affinity" and (.exercise_sentinel_token | type) == "string"' "$P/config" >/dev/null 2>&1 || die "synthetic config shape"
 
 # ---- stubs ----
 ST=$SBX/stubs
@@ -389,6 +399,205 @@ BCF_LSOF=$S/hang BCF_CMD_TIMEOUT=1 run "$DEPLOY" "$P/new"
 expect_rc 2; expect_last "NOT HEALTHY (failed check: listener)"; expect_out "restore: "
 [ $((SECONDS - T_HANG)) -lt 30 ] || note "deploy took $((SECONDS - T_HANG))s with a hung lsof"
 finish "a hung lsof is cut off by the per-command timeout: listener check fails in bounded time"
+
+# ---- upgrade scenarios: each sandbox starts as a finished first deploy of $P/new ----
+/bin/cp "$P/new" "$P/new2" && printf 'upgrade-stand-in' >>"$P/new2" && /bin/chmod 755 "$P/new2" || die "copy upgrade binary"
+NEW2_SHA=$(sha "$P/new2")
+FROM_SHA=$NEW_SHA
+PREV_NAME=better-ccflare.pre-upgrade-$(printf '%s' "$FROM_SHA" | /usr/bin/cut -c1-12)
+
+set_config_lb() { # FILE VALUE: rewrites lb_strategy through a same-mode temp file; prints nothing
+  (umask 077; /usr/bin/jq --arg v "$2" '.lb_strategy = $v' "$1" >"$1.tmp" 2>/dev/null) &&
+    /bin/chmod "$(fmode "$1")" "$1.tmp" && /bin/mv -f "$1.tmp" "$1"
+}
+snapshot() {
+  H_BIN=$(sha "$BCF_BIN"); H_PLIST=$(sha "$RP"); H_CFG=$(sha "$BCF_CONFIG")
+  M_BIN=$(mtime "$BCF_BIN"); M_PLIST=$(mtime "$RP"); M_CFG=$(mtime "$BCF_CONFIG")
+  I_BIN=$(inode "$BCF_BIN"); I_PLIST=$(inode "$RP"); I_CFG=$(inode "$BCF_CONFIG")
+  H_KEEP=$(sha "$KEEP"); H_PBAK=$(sha "$PBAK"); H_CBAK=$(sha "$CBAK")
+  M_BAKS="$(mtime "$KEEP") $(mtime "$PBAK") $(mtime "$CBAK")"; I_BAKS="$(inode "$KEEP") $(inode "$PBAK") $(inode "$CBAK")"
+}
+setup_upgrade() { # NAME
+  setup "$1" __absent__
+  /bin/cp -p "$BCF_BIN" "$KEEP" && /bin/cp -p "$RP" "$PBAK" && /bin/cp -p "$BCF_CONFIG" "$CBAK" || die "first-deploy backups"
+  /bin/cp "$P/new" "$BCF_BIN.n" && /bin/chmod "$(fmode "$P/bin")" "$BCF_BIN.n" && /bin/mv -f "$BCF_BIN.n" "$BCF_BIN" || die "install first build"
+  $PB -c "Set :EnvironmentVariables:LB_STRATEGY session-pace" "$RP" >/dev/null 2>&1 || die "plist LB_STRATEGY"
+  $PB -c "Add :EnvironmentVariables:MODEL_SCOPED_CAPACITY_ROUTING string exhausted" "$RP" >/dev/null 2>&1 || die "plist MSCR"
+  set_config_lb "$BCF_CONFIG" session-pace || die "config lb_strategy"
+  echo session-pace >"$C/env_lb"; echo exhausted >"$C/env_mscr"
+  PREV=$S/bin/$PREV_NAME
+  snapshot
+}
+expect_aux_untouched() { # first-deploy backups, plist and config: same bytes, same file, same mtime
+  [ "$(sha "$KEEP")" = "$H_KEEP" ] && [ "$(sha "$PBAK")" = "$H_PBAK" ] && [ "$(sha "$CBAK")" = "$H_CBAK" ] || note "a first-deploy backup changed"
+  [ "$(mtime "$KEEP") $(mtime "$PBAK") $(mtime "$CBAK")" = "$M_BAKS" ] && [ "$(inode "$KEEP") $(inode "$PBAK") $(inode "$CBAK")" = "$I_BAKS" ] || note "a first-deploy backup was rewritten"
+  [ "$(sha "$RP")" = "$H_PLIST" ] || note "plist bytes changed"
+  [ "$(sha "$BCF_CONFIG")" = "$H_CFG" ] || note "config bytes changed"
+  [ "$(mtime "$RP")" = "$M_PLIST" ] && [ "$(inode "$RP")" = "$I_PLIST" ] || note "plist was rewritten"
+  [ "$(mtime "$BCF_CONFIG")" = "$M_CFG" ] && [ "$(inode "$BCF_CONFIG")" = "$I_CFG" ] || note "config was rewritten"
+  [ -L "$BCF_PLIST" ] || note "plist symlink replaced"
+  [ "$(fmode "$BCF_CONFIG")" = "$(fmode "$P/config")" ] || note "config mode changed"
+  [ -z "$(/bin/ls -A "$S/tmp")" ] || note "temporary directory left behind"
+  if for d in "$S/bin" "$S/dotfiles/LaunchAgents" "$S/LaunchAgents" "$S/config"; do /bin/ls -A "$d"; done | /usr/bin/grep -q 'tmp'; then note "a temporary file was left beside the installed files"; fi
+}
+expect_upgrade_refused() { # WHY_TEXT
+  expect_rc 1; expect_last "NOT DEPLOYED (preflight: "; expect_out "$1"
+  [ "$(sha "$BCF_BIN")" = "$H_BIN" ] && [ "$(inode "$BCF_BIN")" = "$I_BIN" ] && [ "$(mtime "$BCF_BIN")" = "$M_BIN" ] || note "installed binary changed"
+  expect_aux_untouched; expect_readonly_calls
+}
+expect_upgraded_files() { # new binary installed, previous build kept, nothing else touched
+  [ "$(sha "$BCF_BIN")" = "$NEW2_SHA" ] || note "binary is not the upgrade binary"
+  [ "$(fmode "$BCF_BIN")" = "$(fmode "$P/bin")" ] || note "binary mode differs"
+  [ -f "$PREV" ] && [ ! -L "$PREV" ] && [ "$(sha "$PREV")" = "$FROM_SHA" ] || note "previous build $PREV_NAME missing or not the previous binary"
+  expect_aux_untouched
+}
+
+setup_upgrade upgrade
+run "$DEPLOY" --sha256 "$NEW2_SHA" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_rc 0; expect_last "^DEPLOYED$"; expect_upgraded_files
+expect_out "current state is a session-pace deploy to upgrade"; expect_out "first-deploy backup left untouched: $KEEP"
+expect_out "first-deploy backups are the release; a failed check will also print"
+expect_out "plist: already LB_STRATEGY=session-pace"; expect_out "config: lb_strategy already session-pace"
+for c in launchd-env listener binary accounts strategy claude; do expect_out "check $c: ok"; done
+[ "$(/bin/cat "$EX_CTL/env_lb")" = session-pace ] && [ "$(/bin/cat "$EX_CTL/env_mscr")" = exhausted ] || note "loaded job not session-pace / exhausted"
+[ "$(calls 'launchctl bootout')" = 1 ] && [ "$(calls 'launchctl bootstrap')" = 1 ] || note "expected one bootout and one bootstrap"
+[ "$(calls 'claude')" = 1 ] || note "claude stub ran $(calls claude) times"
+finish "upgrade succeeds: new binary installed, previous build kept, first-deploy backups, plist and config untouched"
+
+setup_upgrade upgrade-dry-run
+/bin/chmod 500 "$S/tmp"
+run "$DEPLOY" --dry-run --upgrade-from "$FROM_SHA" "$P/new2"
+expect_rc 0; expect_last "DRY RUN: no changes made"; expect_out "would keep the previous build: copy $BCF_BIN to $PREV"
+expect_out "would leave $RP alone"; expect_out "would leave $BCF_CONFIG alone"; expect_out "would run: launchctl bootstrap"
+/bin/chmod 700 "$S/tmp"
+[ "$(sha "$BCF_BIN")" = "$H_BIN" ] && [ "$(inode "$BCF_BIN")" = "$I_BIN" ] || note "installed binary changed"
+[ ! -e "$PREV" ] || note "dry run created $PREV_NAME"
+expect_aux_untouched; expect_readonly_calls
+finish "upgrade dry run: prints the plan, changes nothing, only launchctl print"
+
+setup_upgrade upgrade-wrong-hash
+run "$DEPLOY" --upgrade-from 0000000000000000000000000000000000000000000000000000000000000000 "$P/new2"
+expect_upgrade_refused "is not the --upgrade-from"; [ ! -e "$PREV" ] || note "refused run created $PREV_NAME"
+finish "upgrade refused: installed binary is not the one --upgrade-from names"
+
+setup_upgrade upgrade-plist-lb
+$PB -c "Set :EnvironmentVariables:LB_STRATEGY session-affinity" "$RP" >/dev/null 2>&1; snapshot
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_upgrade_refused "plist has LB_STRATEGY=session-affinity"; [ ! -e "$PREV" ] || note "refused run created $PREV_NAME"
+finish "upgrade refused: plist LB_STRATEGY is not session-pace"
+
+setup_upgrade upgrade-plist-mscr
+$PB -c "Delete :EnvironmentVariables:MODEL_SCOPED_CAPACITY_ROUTING" "$RP" >/dev/null 2>&1; snapshot
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_upgrade_refused "MODEL_SCOPED_CAPACITY_ROUTING=__absent__"; [ ! -e "$PREV" ] || note "refused run created $PREV_NAME"
+finish "upgrade refused: plist lacks MODEL_SCOPED_CAPACITY_ROUTING"
+
+setup_upgrade upgrade-config
+set_config_lb "$BCF_CONFIG" session-affinity || die "config lb_strategy"; snapshot
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_upgrade_refused "config lb_strategy is session-affinity"; [ ! -e "$PREV" ] || note "refused run created $PREV_NAME"
+finish "upgrade refused: config lb_strategy is not session-pace"
+
+setup_upgrade upgrade-without-option
+run "$DEPLOY" "$P/new2"
+expect_upgrade_refused "is neither the release nor the new binary"; [ ! -e "$PREV" ] || note "refused run created $PREV_NAME"
+finish "without --upgrade-from the session-pace state is refused as before"
+
+setup_upgrade upgrade-same-binary
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new"
+expect_upgrade_refused "nothing to upgrade"
+finish "upgrade refused: the new binary is the installed one"
+
+setup_upgrade upgrade-from-release
+run "$DEPLOY" --upgrade-from "$RELEASE_SHA" "$P/new2"
+expect_upgrade_refused "names the release binary"
+finish "upgrade refused: --upgrade-from names the release binary"
+
+setup_upgrade upgrade-bad-option
+run "$DEPLOY" --upgrade-from 1234 "$P/new2"
+expect_rc 64; expect_out "usage: deploy.sh"
+[ ! -s "$EX_CTL/calls.log" ] || note "stub calls on a usage error"
+expect_aux_untouched
+finish "malformed --upgrade-from: usage error, nothing run"
+
+setup_upgrade upgrade-prev-differs
+printf 'not the previous build' >"$PREV"; H_PREV=$(sha "$PREV")
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_upgrade_refused "exists but is not an executable copy of the installed binary"
+[ "$(sha "$PREV")" = "$H_PREV" ] || note "existing $PREV_NAME was overwritten"
+finish "upgrade refused: an existing $PREV_NAME with other content is left as it is"
+
+setup_upgrade upgrade-prev-same
+/bin/cp -p "$BCF_BIN" "$PREV"; I_PREV=$(inode "$PREV")
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_rc 0; expect_last "^DEPLOYED$"; expect_out "previous build: keeping existing $PREV"; expect_upgraded_files
+[ "$(inode "$PREV")" = "$I_PREV" ] || note "existing $PREV_NAME was replaced"
+finish "upgrade with an existing identical $PREV_NAME: kept, upgrade succeeds"
+
+setup_upgrade upgrade-prev-not-executable
+/bin/cp -p "$BCF_BIN" "$PREV" && /bin/chmod 600 "$PREV"; H_PREV=$(sha "$PREV")
+run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+expect_upgrade_refused "exists but is not an executable copy of the installed binary"
+[ "$(sha "$PREV")" = "$H_PREV" ] && [ "$(fmode "$PREV")" = 600 ] || note "existing $PREV_NAME was changed"
+finish "upgrade refused: an existing $PREV_NAME with the right bytes but not executable is left as it is"
+
+for name in keep-absent plist-backup-not-release; do
+  setup_upgrade "upgrade-fail-$name"
+  case $name in
+    keep-absent) /bin/rm -f "$KEEP" ;;
+    *) $PB -c "Set :EnvironmentVariables:LB_STRATEGY session-pace" "$PBAK" >/dev/null 2>&1 ;;
+  esac
+  snapshot
+  inject claude_fail pace
+  run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+  expect_rc 2; expect_last "^NOT HEALTHY (failed check: claude)$"
+  expect_out "backups are missing or not the release; a failed check will print only"; expect_out "no release restore commands"
+  expect_out "restore: /bin/cp -p '$PREV' '$BCF_BIN.restore-tmp'"
+  if printf '%s\n' "$OUT" | /usr/bin/grep -q '^deploy: release-restore: '; then note "release restore commands printed"; fi
+  [ "$(sha "$BCF_BIN")" = "$NEW2_SHA" ] && [ "$(sha "$PREV")" = "$FROM_SHA" ] || note "binary or previous build wrong"
+  expect_aux_untouched
+  if [ "$name" = keep-absent ] && [ -e "$KEEP" ]; then note "absent release keep file was created"; fi
+  finish "failing claude on an upgrade with first-deploy backups $name: only the previous-build restore commands are printed, backups left as they were"
+done
+
+for spec in claude_fail:claude bootstrap_fail:reload; do
+  inj_name=${spec%%:*}; check=${spec#*:}
+  setup_upgrade "upgrade-fail-$check"
+  inject "$inj_name" pace
+  run "$DEPLOY" --upgrade-from "$FROM_SHA" "$P/new2"
+  expect_rc 2; expect_last "^NOT HEALTHY (failed check: $check)$"; expect_upgraded_files
+  expect_out "restore: /bin/cp -p '$PREV' '$BCF_BIN.restore-tmp' && /bin/mv -f '$BCF_BIN.restore-tmp' '$BCF_BIN'"
+  expect_out "release-restore: /bin/cp -p '$KEEP' '$BCF_BIN.restore-tmp' && /bin/mv -f '$BCF_BIN.restore-tmp' '$BCF_BIN'"
+  expect_out "release-restore: /bin/cp -p '$PBAK' '$RP'"; expect_out "release-restore: /bin/cp -p '$CBAK' '$BCF_CONFIG'"
+  printf '%s\n' "$OUT" | /usr/bin/sed -n 's/^deploy: restore: //p' >"$S/restore.sh"
+  printf '%s\n' "$OUT" | /usr/bin/sed -n 's/^deploy: release-restore: //p' >"$S/release-restore.sh"
+  [ "$(/usr/bin/wc -l <"$S/restore.sh" | /usr/bin/tr -d ' ')" = 3 ] || note "expected 3 previous-build restore commands"
+  [ "$(/usr/bin/wc -l <"$S/release-restore.sh" | /usr/bin/tr -d ' ')" = 5 ] || note "expected 5 release restore commands"
+  if [ "$check" = reload ]; then want_bs=$TRIES; else want_bs=1; fi
+  [ "$(calls 'launchctl bootout')" = 1 ] && [ "$(calls 'launchctl bootstrap')" = "$want_bs" ] || note "unexpected launchctl calls after the failure"
+  finish "failing $check on an upgrade: exit 2, previous-build and release restore commands printed, nothing reverted"
+  if [ "$check" = claude ]; then
+    : >"$EX_CTL/inject"; : >"$EX_CTL/calls.log"
+    run /bin/bash "$S/restore.sh"
+    expect_rc 0
+    [ "$(sha "$BCF_BIN")" = "$FROM_SHA" ] || note "binary is not the previous build after the restore commands"
+    [ "$(fmode "$BCF_BIN")" = "$(fmode "$P/bin")" ] || note "binary mode differs"
+    [ ! -e "$BCF_BIN.restore-tmp" ] || note "restore left $BCF_BIN.restore-tmp"
+    [ -f "$EX_CTL/loaded" ] && [ "$(/bin/cat "$EX_CTL/env_lb")" = session-pace ] || note "job not reloaded as session-pace"
+    expect_aux_untouched
+    finish "the printed previous-build restore commands, run as printed, bring back the previous binary and reload"
+    run /bin/bash "$S/release-restore.sh"
+    expect_rc 0
+    [ "$(sha "$BCF_BIN")" = "$H_KEEP" ] || note "binary is not the release after the release restore commands"
+    [ "$(sha "$RP")" = "$H_PBAK" ] || note "plist is not the first-deploy backup"
+    [ "$(sha "$BCF_CONFIG")" = "$H_CBAK" ] || note "config is not the first-deploy backup"
+    [ "$(fmode "$BCF_CONFIG")" = "$(fmode "$P/config")" ] || note "config mode changed"
+    [ -L "$BCF_PLIST" ] || note "plist symlink replaced"
+    [ "$(/bin/cat "$EX_CTL/env_lb")" = session-affinity ] || note "job not reloaded as session-affinity"
+    [ "$(sha "$KEEP")" = "$H_KEEP" ] && [ "$(sha "$PBAK")" = "$H_PBAK" ] && [ "$(sha "$CBAK")" = "$H_CBAK" ] || note "a first-deploy backup changed"
+    finish "the printed release restore commands, run as printed after an upgrade, bring back the release byte for byte"
+  fi
+done
 
 # Secret leak check: no line of the config copy longer than 12 characters may appear in any
 # script output. grep -q prints nothing either way.
