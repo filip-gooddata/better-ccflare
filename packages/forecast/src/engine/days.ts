@@ -60,6 +60,8 @@ export function buildDayTable(input: ForecastInput): DayTable {
 	let unitsSoFar = 0;
 	let recent = 0;
 	let recentFable = 0;
+	// Bucket approximation of the trailing hour: buckets that start in [now − 1 h, now),
+	// the current partial bucket included, divided by the 12 buckets of an hour.
 	const recentFrom = now - RECENT_WINDOW_MS;
 	for (const b of input.history) {
 		if (b.start >= now || b.start < input.historyFrom) continue;

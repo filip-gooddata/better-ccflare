@@ -16,7 +16,7 @@ import type { EpochMs, ForecastInput } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, poolFor } from "./days";
 import type { DayTable, Horizon, RecordedDay, Scenarios } from "./model";
-import { createRng } from "./rng";
+import { createRng, type Rng } from "./rng";
 import { yieldToEventLoop } from "./yield";
 
 /** Normal-reference (Silverman's rule-of-thumb) bandwidth factor, Silverman 1986 eq. 3.31. */
@@ -46,6 +46,8 @@ export function scaleBandwidth(pool: RecordedDay[]): number {
 	const logs: number[] = [];
 	for (const d of pool) if (d.total > 0) logs.push(Math.log(d.total));
 	if (logs.length < 2) return 0;
+	// all equal: no spread (σ would only be rounding residue)
+	if (logs.every((x) => x === logs[0])) return 0;
 	const sigma = sampleStandardDeviation(logs);
 	const robust = interquartileRange(logs) / NORMAL_IQR_SD;
 	const spread = robust > 0 ? Math.min(sigma, robust) : sigma;
@@ -126,6 +128,8 @@ interface DatePlan {
 	cumulative: Float64Array;
 	bandwidth: number;
 	factor: number;
+	/** This date's own stream, so a longer or shorter horizon leaves the other dates' draws unchanged. */
+	rng: Rng;
 }
 
 /** Index of the pool day whose cumulative weight first exceeds x (weighted draw). */
@@ -147,11 +151,15 @@ function pick(cumulative: Float64Array, x: number): number {
  * scale it by exp(ε), ε ~ N(0, h²), h = scaleBandwidth(pool), and shift it by a
  * uniform whole number of buckets within ±timeShiftMin; scale today by the day
  * factor; then blend e^(−h/τ)·r + (1 − e^(−h/τ))·value with h the minutes from
- * now to the bucket start (0 for the bucket holding now). The generator is seeded
- * with today's local day key and draws the same numbers in the same order with
- * noise on or off, so noise off is plain resampling of the same drawn days. A
- * date whose pool is empty draws from all recorded days. A shift past either end
- * of the recorded day reads 0.
+ * now to the bucket start (0 for the bucket holding now). Each date has its own
+ * generator, seeded with today's local day key and the date's key, and draws the
+ * same numbers in the same order with noise on or off, so noise off is plain
+ * resampling of the same drawn days. A recorded day is laid onto the date by
+ * wall-clock 5-minute slot, and the shift moves along that clock: on DST days a
+ * repeated hour is read from its first pass and a skipped slot, or a shift past
+ * either end of the day, reads 0, so totals are kept only on regular days. A
+ * date whose pool is empty (say no recorded weekends yet) draws from all recorded
+ * days: planning errs towards more demand, not less.
  */
 export async function buildScenarios(
 	input: ForecastInput,
@@ -220,6 +228,7 @@ export async function buildScenarios(
 			cumulative,
 			bandwidth,
 			factor: dayStart === table.today.start ? factorToday : 1,
+			rng: createRng(`${table.today.key}/${key}`),
 		});
 	}
 
@@ -232,16 +241,15 @@ export async function buildScenarios(
 	const r = table.today.recentRate;
 	const rFable = table.today.recentFableRate;
 
-	const rng = createRng(table.today.key);
 	const units: Float32Array[] = [];
 	const fable: Float32Array[] = [];
 	for (let s = 0; s < simulated; s++) {
 		const u = new Float32Array(bucketCount);
 		const f = new Float32Array(bucketCount);
 		for (const date of dates) {
-			const x = rng.uniform();
-			const eps = rng.normal();
-			const shiftDraw = rng.int(2 * shiftMax + 1);
+			const x = date.rng.uniform();
+			const eps = date.rng.normal();
+			const shiftDraw = date.rng.int(2 * shiftMax + 1);
 			const totalWeight = date.cumulative[date.cumulative.length - 1] ?? 0;
 			const i =
 				date.pool.length > 0 ? pick(date.cumulative, x * totalWeight) : -1;
@@ -255,9 +263,15 @@ export async function buildScenarios(
 				let vf = 0;
 				if (day) {
 					const slot = date.slots[j - date.from] as number;
-					const at = map ? (map[slot] as number) : slot;
-					const src = at - shift;
-					if (at >= 0 && src >= 0 && src < day.units.length) {
+					// shift on the wall clock, then find that slot in the recorded day
+					const from = slot - shift;
+					const src =
+						from < 0 || from >= SLOTS_PER_DAY
+							? -1
+							: map
+								? (map[from] as number)
+								: from;
+					if (src >= 0) {
 						v = (day.units[src] as number) * scale;
 						vf = (day.fable[src] as number) * scale;
 					}

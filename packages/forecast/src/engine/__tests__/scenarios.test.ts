@@ -433,6 +433,115 @@ describe("buildScenarios", () => {
 		}
 	});
 
+	test("a longer horizon leaves the draws of the shared dates unchanged", async () => {
+		const input = makeInput(NOW, { simulatedDays: 30, recentTauMin: 0.001 });
+		const table = buildDayTable(input);
+		const short = computeHorizon(NOW, [account(NOW + 2 * DAY)], TZ);
+		const long = computeHorizon(NOW, [account(NOW + 7 * DAY)], TZ);
+		expect(long.simEnd).toBeGreaterThan(short.simEnd);
+		const a = await buildScenarios(input, table, short, { noise: true });
+		const b = await buildScenarios(input, table, long, { noise: true });
+		for (let s = 0; s < 30; s++)
+			expect(
+				Array.from((b.units[s] as Float32Array).subarray(0, a.bucketCount)),
+			).toEqual(Array.from(a.units[s] as Float32Array));
+	});
+
+	test("a date whose pool is empty draws from all recorded days", async () => {
+		const { input, table, horizon } = setup(NOW, {
+			simulatedDays: 20,
+			recentTauMin: 0.001,
+		});
+		const noWeekends: DayTable = {
+			...table,
+			days: table.days.filter((d) => d.type !== "weekend"),
+		};
+		expect(poolFor(noWeekends, "weekend")).toEqual([]);
+		const sc = await buildScenarios(input, noWeekends, horizon, {
+			noise: false,
+		});
+		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
+		const [b0] = dateRange(sc.start, "2026-11-14", sat);
+		for (const u of sc.units) {
+			const match = noWeekends.days.find((d) =>
+				d.units.every((v, i) => u[b0 + i] === Math.fround(v)),
+			);
+			expect(match).toBeDefined();
+		}
+	});
+
+	test("time noise shifts the recorded day by whole buckets within ±timeShiftMin", async () => {
+		const { input, table, horizon } = setup(NOW, {
+			simulatedDays: 60,
+			recentTauMin: 0.001,
+			timeShiftMin: 30,
+		});
+		// equal totals: zero scale bandwidth, so only the time shift acts
+		const todayStart = localDayStart(NOW, TZ);
+		const days: RecordedDay[] = [1, 2, 3, 4, 5, 6, 7].map((back) => {
+			const start = addLocalDays(todayStart, -back, TZ);
+			const units = new Float64Array(288);
+			for (let i = 0; i < 12; i++) units[100 + back * 10 + i] = 1 + i / 100;
+			return {
+				key: localDayKey(start, TZ),
+				start,
+				type: "workday",
+				weight: 1,
+				units,
+				fable: new Float64Array(288),
+				total: 12.66,
+				fableTotal: 0,
+			};
+		});
+		const handmade: DayTable = { days, today: table.today };
+		const sc = await buildScenarios(input, handmade, horizon, { noise: true });
+		expect(sc.diagnostics.bandwidths["2026-11-13"]).toBe(0);
+		const fri = addLocalDays(todayStart, 1, TZ);
+		const [b0] = dateRange(sc.start, "2026-11-13", fri);
+		const shifts = new Set<number>();
+		for (const u of sc.units) {
+			let found: number | null = null;
+			for (const d of days)
+				for (let k = -6; k <= 6 && found === null; k++) {
+					let ok = true;
+					for (let i = 0; i < 288 && ok; i++) {
+						const src = i - k;
+						const v = src >= 0 && src < 288 ? (d.units[src] as number) : 0;
+						if (u[b0 + i] !== Math.fround(v)) ok = false;
+					}
+					if (ok) found = k;
+				}
+			expect(found).not.toBeNull();
+			shifts.add(found as number);
+		}
+		expect(shifts.size).toBeGreaterThan(5);
+	});
+
+	test("DST: a 23-hour target date (2026-03-29, Europe/Prague) reads the recorded day by wall clock", async () => {
+		const now = Date.UTC(2026, 2, 27, 9, 0);
+		const { input, table, horizon } = setup(now, {
+			simulatedDays: 20,
+			recentTauMin: 0.001,
+		});
+		const sc = await buildScenarios(input, table, horizon, { noise: false });
+		const sun = addLocalDays(localDayStart(now, TZ), 2, TZ);
+		const [b0, b1] = dateRange(sc.start, "2026-03-29", sun);
+		expect(b1 - b0).toBe(276);
+		const pool = poolFor(table, "weekend");
+		for (const u of sc.units) {
+			const match = pool.find((d) => {
+				for (let j = b0; j < b1; j++) {
+					const slot = Math.floor(
+						localParts(sc.start + j * BUCKET_MS, TZ).minuteOfDay / 5,
+					);
+					if (u[j] !== Math.fround(d.units[slot] as number)) return false;
+				}
+				return true;
+			});
+			expect(match).toBeDefined();
+		}
+	});
+
 	test("defaults (400 days, a week horizon): wall time and longest slice between yields", async () => {
 		const { input, table, horizon } = setup(NOW);
 		let last = performance.now();
