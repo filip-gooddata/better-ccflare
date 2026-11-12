@@ -19,6 +19,10 @@ import type {
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import {
+	markAllLimitedSelection,
+	selectAllLimitedTarget,
+} from "./limit-blocked";
+import {
 	type FamilyExhaustionOrigin,
 	getFamilyExhaustionOrigin,
 	getFamilyExhaustionUntil,
@@ -361,7 +365,7 @@ function applyXaiCacheAffinity(
  * ProxyContext without a `config` mock don't throw — capacity routing then
  * simply behaves as "off", matching the feature's default.
  */
-function isCapacityRoutingEnabled(ctx: ProxyContext): boolean {
+export function isCapacityRoutingEnabled(ctx: ProxyContext): boolean {
 	return ctx.config?.getModelScopedCapacityRouting?.() === "exhausted";
 }
 
@@ -407,7 +411,7 @@ export function isForceAccountModelEnabled(ctx: ProxyContext): boolean {
  * but the failure is then an explicit upstream error, never a silent
  * substitution, which is the promise this setting actually makes.
  */
-function accountServesModel(account: Account, model: string): boolean {
+export function accountServesModel(account: Account, model: string): boolean {
 	const known =
 		account.provider === "codex" ? getKnownCodexModels(account.id) : null;
 	if (known) {
@@ -503,6 +507,35 @@ export function resolveEffectiveModel(
 	requestModel: string | null | undefined,
 ): string | null {
 	return appliedModel ?? requestModel ?? null;
+}
+
+/** Providers this request excludes via `x-better-ccflare-exclude-providers`. */
+export function requestExcludedProviders(meta: RequestMeta): string[] {
+	return (
+		meta.headers
+			?.get("x-better-ccflare-exclude-providers")
+			?.split(",")
+			.map((p) => p.trim())
+			.filter(Boolean) ?? []
+	);
+}
+
+/** Whether `account`'s provider is one of `excludeProviders`. */
+export function isProviderExcludedBy(
+	account: Account,
+	excludeProviders: string[],
+): boolean {
+	for (const ex of excludeProviders) {
+		// "anthropic-oauth" targets only Anthropic OAuth accounts (refresh_token present),
+		// leaving Anthropic API key accounts (console mode) eligible.
+		if (ex === "anthropic-oauth") {
+			if (account.provider === "anthropic" && account.refresh_token != null)
+				return true;
+		} else if (account.provider === ex) {
+			return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -790,12 +823,7 @@ export async function selectAccountsForRequest(
 	}
 
 	// Filter out excluded providers (e.g. claude-oauth excluded by the responses adapter)
-	const excludeProviders =
-		meta.headers
-			?.get("x-better-ccflare-exclude-providers")
-			?.split(",")
-			.map((p) => p.trim())
-			.filter(Boolean) ?? [];
+	const excludeProviders = requestExcludedProviders(meta);
 
 	/**
 	 * Whether `account`'s provider is excluded for this request. Split out of
@@ -804,18 +832,8 @@ export async function selectAccountsForRequest(
 	 * combo path hands it the whole fleet while caring only about the slots it
 	 * actually skips.
 	 */
-	const isProviderExcluded = (a: Account): boolean => {
-		for (const ex of excludeProviders) {
-			// "anthropic-oauth" targets only Anthropic OAuth accounts (refresh_token present),
-			// leaving Anthropic API key accounts (console mode) eligible.
-			if (ex === "anthropic-oauth") {
-				if (a.provider === "anthropic" && a.refresh_token != null) return true;
-			} else if (a.provider === ex) {
-				return true;
-			}
-		}
-		return false;
-	};
+	const isProviderExcluded = (a: Account): boolean =>
+		isProviderExcludedBy(a, excludeProviders);
 
 	const applyExclusions = (accounts: Account[]): Account[] => {
 		if (excludeProviders.length === 0) return accounts;
@@ -1139,6 +1157,32 @@ export async function selectAccountsForRequest(
 		await getOrderedAccounts(meta, ctx);
 	let orderedAccounts = applyExclusions(rawOrderedAccounts);
 
+	/**
+	 * When this selection would end empty and the strategy implements
+	 * `selectWhenAllLimited`, the one account to forward to anyway (marked on
+	 * the request), or null to keep today's empty result. Never for a request
+	 * naming an account or an auto-refresh probe: both own their routing.
+	 */
+	const allLimitedSelection = async (): Promise<Account[] | null> => {
+		if (
+			!ctx.strategy.selectWhenAllLimited ||
+			meta.headers?.get("x-better-ccflare-account-id") ||
+			meta.headers?.get("x-better-ccflare-bypass-session") === "true"
+		) {
+			return null;
+		}
+		const target = await selectAllLimitedTarget(
+			ctx,
+			meta,
+			model,
+			Date.now(),
+			allAccounts,
+		);
+		if (!target) return null;
+		markAllLimitedSelection(meta, target.id);
+		return [target];
+	};
+
 	// "Force account model": keep only accounts that can serve the requested
 	// model as written. Nothing downstream will rename it, so an account that
 	// would need a translation is not a candidate — and if that empties the
@@ -1301,6 +1345,9 @@ export async function selectAccountsForRequest(
 					}
 				}
 
+				const allLimited = await allLimitedSelection();
+				if (allLimited) return allLimited;
+
 				if (earliestCooldownResetAt != null) {
 					log.warn(
 						`Model family "${family}" not actually capacity-exhausted — an account with free capacity is only sidelined by a rate-limit cooldown until ${new Date(earliestCooldownResetAt).toISOString()}`,
@@ -1328,6 +1375,11 @@ export async function selectAccountsForRequest(
 			notePoolDeferrals(available);
 			return applyXaiCacheAffinity(available, meta);
 		}
+	}
+
+	if (orderedAccounts.length === 0) {
+		const allLimited = await allLimitedSelection();
+		if (allLimited) return allLimited;
 	}
 
 	notePoolDeferrals(orderedAccounts);
