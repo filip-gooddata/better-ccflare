@@ -1,0 +1,15 @@
+{
+	"name": "@better-ccflare/forecast",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "./src/index.ts",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"typecheck": "bunx tsc --noEmit"
+	},
+	"dependencies": {
+		"simple-statistics": "8.0.0"
+	}
+}
