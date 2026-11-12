@@ -3,12 +3,24 @@
 # Run it from a terminal, not from a model session whose tool timeout could kill it mid-run: the
 # proxy is down during the reload.
 #
-# Usage: deploy.sh [--dry-run] [--sha256 HEX] NEW_BINARY
+# Usage: deploy.sh [--dry-run] [--sha256 HEX] [--upgrade-from HEX] NEW_BINARY
 # Exit: 0 DEPLOYED, 1 NOT DEPLOYED (preflight refused, nothing changed),
 #       2 NOT HEALTHY (a step or check failed after the first change; nothing is reverted), 64 usage.
 #
+# Two starting states are accepted. Without --upgrade-from: the release (or a half-done or finished
+# first deploy of the same NEW_BINARY, with all three first-deploy backups present). With
+# --upgrade-from HEX, an upgrade of one session-pace build to another: the installed binary hashes to
+# HEX, the plist already has LB_STRATEGY=session-pace and MODEL_SCOPED_CAPACITY_ROUTING=exhausted, and
+# the config lb_strategy is session-pace; anything else is refused. HEX is the operator's own
+# `shasum -a 256` of the installed binary; the script knows no session-pace hash. An upgrade leaves
+# the three first-deploy backups, the plist and the config alone (byte for byte), keeps a copy of the
+# installed binary as <bin>.pre-upgrade-<first 12 hex of HEX> (an existing file of that name is kept
+# only when it is the same binary, else the run is refused), then installs, reloads and checks as a
+# first deploy does.
+#
 # There is no automatic rollback. To go back to the release, run these by hand (a failed run prints
-# them too, with its actual paths). The binary is replaced by rename rather than overwritten in
+# them too, with its actual paths; a failed upgrade prints the commands that return to the previous
+# build first, then these). The binary is replaced by rename rather than overwritten in
 # place, because macOS can kill a signed executable whose file was rewritten in place. If bootstrap
 # reports error 5, the old job is still unloading: wait a few seconds and run bootstrap again.
 #   /bin/cp -p /Users/filip/.local/bin/better-ccflare.v3.6.7-release /Users/filip/.local/bin/better-ccflare.restore-tmp && /bin/mv -f /Users/filip/.local/bin/better-ccflare.restore-tmp /Users/filip/.local/bin/better-ccflare
@@ -77,12 +89,15 @@ ABSENT=__absent__
 DRY_RUN=0
 CHANGED=0
 PLIST_REAL=""
+UPGRADE_FROM=""
+PREV_KEEP=""
+RELEASE_RESTORE=0
 WORK=""
 TMP_FILES=""
 CHECK_FAILED=""
 
 usage() {
-  echo "usage: deploy.sh [--dry-run] [--sha256 HEX] NEW_BINARY" >&2
+  echo "usage: deploy.sh [--dry-run] [--sha256 HEX] [--upgrade-from HEX] NEW_BINARY" >&2
   exit 64
 }
 
@@ -133,6 +148,19 @@ atomic_copy() {
     /usr/sbin/chown "$owner" "$tmp" 2>/dev/null || { /bin/rm -f "$tmp"; return 1; }
   fi
   /bin/mv -f "$tmp" "$target" 2>/dev/null || { /bin/rm -f "$tmp"; return 1; }
+}
+
+# keep_copy SRC TARGET: copy SRC beside TARGET, then hard-link the copy to TARGET. ln fails when
+# TARGET exists, so an existing file is never overwritten.
+keep_copy() {
+  local tmp="$2.pace-tmp.$$" rc
+  TMP_FILES="$TMP_FILES $tmp"
+  /bin/rm -f "$tmp"
+  /bin/cp -p "$1" "$tmp" 2>/dev/null || { /bin/rm -f "$tmp"; return 1; }
+  /bin/ln "$tmp" "$2" 2>/dev/null
+  rc=$?
+  /bin/rm -f "$tmp"
+  return "$rc"
 }
 
 # plist_env FILE NAME: prints the value of EnvironmentVariables:NAME, or __absent__.
@@ -383,13 +411,31 @@ run_checks() {
   check_claude || return 1
 }
 
+# print_release_restore PREFIX: the commands that return binary, plist and config to the release.
+print_release_restore() {
+  say "$1: /bin/cp -p '$RELEASE_KEEP' '$BIN.restore-tmp' && /bin/mv -f '$BIN.restore-tmp' '$BIN'"
+  say "$1: /bin/cp -p '$PLIST_BACKUP' '$PLIST_REAL'"
+  say "$1: /bin/cp -p '$CONFIG_BACKUP' '$CONFIG'"
+  say "$1: $LAUNCHCTL bootout $DOMAIN/$LABEL"
+  say "$1: $LAUNCHCTL bootstrap $DOMAIN '$PLIST'"
+}
+
 print_restore() {
-  say "restore by hand, in this order (nothing was reverted):"
-  say "restore: /bin/cp -p '$RELEASE_KEEP' '$BIN.restore-tmp' && /bin/mv -f '$BIN.restore-tmp' '$BIN'"
-  say "restore: /bin/cp -p '$PLIST_BACKUP' '$PLIST_REAL'"
-  say "restore: /bin/cp -p '$CONFIG_BACKUP' '$CONFIG'"
-  say "restore: $LAUNCHCTL bootout $DOMAIN/$LABEL"
-  say "restore: $LAUNCHCTL bootstrap $DOMAIN '$PLIST'"
+  if [ -n "$UPGRADE_FROM" ]; then
+    say "restore the previous build by hand, in this order (nothing was reverted; plist and config were not changed):"
+    say "restore: /bin/cp -p '$PREV_KEEP' '$BIN.restore-tmp' && /bin/mv -f '$BIN.restore-tmp' '$BIN'"
+    say "restore: $LAUNCHCTL bootout $DOMAIN/$LABEL"
+    say "restore: $LAUNCHCTL bootstrap $DOMAIN '$PLIST'"
+    if [ "$RELEASE_RESTORE" = 1 ]; then
+      say "to go back to the release instead, run these by hand, in this order:"
+      print_release_restore release-restore
+    else
+      say "the first-deploy backups ($RELEASE_KEEP, $PLIST_BACKUP, $CONFIG_BACKUP) are missing or not the release; no release restore commands"
+    fi
+  else
+    say "restore by hand, in this order (nothing was reverted):"
+    print_release_restore restore
+  fi
   say "if bootstrap reports error 5, wait a few seconds and run it again; logs are in $HOME/Library/Logs/better-ccflare"
 }
 
@@ -435,6 +481,12 @@ while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) DRY_RUN=1; shift ;;
     --sha256) [ $# -ge 2 ] || usage; EXPECT_SHA=$(lower "$2"); shift 2 ;;
+    --upgrade-from)
+      [ $# -ge 2 ] || usage
+      UPGRADE_FROM=$(lower "$2")
+      case $UPGRADE_FROM in *[!0-9a-f]*) usage ;; esac
+      [ ${#UPGRADE_FROM} -eq 64 ] || usage
+      shift 2 ;;
     -*) usage ;;
     *) [ -z "$NEW" ] || usage; NEW=$1; shift ;;
   esac
@@ -484,7 +536,33 @@ if config_is "$CONFIG" "$OLD_STRATEGY"; then CONFIG_LB=$OLD_STRATEGY
 elif config_is "$CONFIG" "$NEW_STRATEGY"; then CONFIG_LB=$NEW_STRATEGY
 else CONFIG_LB=other; fi
 
-if [ "$CUR_SHA" = "$RELEASE_SHA" ] && [ "$PLIST_LB" = "$OLD_STRATEGY" ] && [ "$CONFIG_LB" = "$OLD_STRATEGY" ]; then
+if [ -n "$UPGRADE_FROM" ]; then
+  # Upgrade of a session-pace deploy: exactly the state named on the command line, nothing else.
+  [ "$UPGRADE_FROM" != "$RELEASE_SHA" ] || refuse "--upgrade-from names the release binary; deploy over the release without --upgrade-from"
+  [ "$NEW_SHA" != "$UPGRADE_FROM" ] || refuse "the new binary is the one --upgrade-from names; nothing to upgrade"
+  [ "$CUR_SHA" = "$UPGRADE_FROM" ] || refuse "installed binary sha256 ${CUR_SHA:-unreadable} is not the --upgrade-from $UPGRADE_FROM"
+  [ "$PLIST_LB" = "$NEW_STRATEGY" ] && [ "$PLIST_MSCR" = "$MSCR_VALUE" ] ||
+    refuse "plist has LB_STRATEGY=$PLIST_LB $MSCR_NAME=$PLIST_MSCR, but an upgrade starts from $NEW_STRATEGY / $MSCR_VALUE"
+  [ "$CONFIG_LB" = "$NEW_STRATEGY" ] || refuse "config lb_strategy is $CONFIG_LB, but an upgrade starts from $NEW_STRATEGY"
+  PREV_KEEP=$BIN.pre-upgrade-$(printf '%s' "$CUR_SHA" | /usr/bin/cut -c1-12)
+  if [ -e "$PREV_KEEP" ] || [ -L "$PREV_KEEP" ]; then
+    [ -f "$PREV_KEEP" ] && [ ! -L "$PREV_KEEP" ] && [ -x "$PREV_KEEP" ] && [ "$(sha256 "$PREV_KEEP")" = "$CUR_SHA" ] ||
+      refuse "$PREV_KEEP exists but is not an executable copy of the installed binary; move it aside"
+  fi
+  # The first-deploy backups are not required for an upgrade; release restore commands are only
+  # printed when they are still the release (same checks as a re-run of the first deploy).
+  if [ -f "$RELEASE_KEEP" ] && [ "$(sha256 "$RELEASE_KEEP")" = "$RELEASE_SHA" ] &&
+    [ -f "$PLIST_BACKUP" ] && [ ! -L "$PLIST_BACKUP" ] && "$PLUTIL" -lint -s "$PLIST_BACKUP" >/dev/null 2>&1 &&
+    [ "$(plist_key "$PLIST_BACKUP" Label)" = "$LABEL" ] && [ "$(plist_key "$PLIST_BACKUP" ProgramArguments:0)" = "$BIN" ] &&
+    [ "$(plist_env "$PLIST_BACKUP" LB_STRATEGY)" = "$OLD_STRATEGY" ] &&
+    [ -f "$CONFIG_BACKUP" ] && mode_private "$CONFIG_BACKUP" && config_is "$CONFIG_BACKUP" "$OLD_STRATEGY"; then
+    RELEASE_RESTORE=1
+    say "preflight: first-deploy backups are the release; a failed check will also print the release restore commands"
+  else
+    say "preflight: first-deploy backups are missing or not the release; a failed check will print only the previous-build restore commands"
+  fi
+  say "preflight: current state is a $NEW_STRATEGY deploy to upgrade (binary sha256 $CUR_SHA matches --upgrade-from, plist LB_STRATEGY=$PLIST_LB $MSCR_NAME=$PLIST_MSCR, config $CONFIG_LB)"
+elif [ "$CUR_SHA" = "$RELEASE_SHA" ] && [ "$PLIST_LB" = "$OLD_STRATEGY" ] && [ "$CONFIG_LB" = "$OLD_STRATEGY" ]; then
   # Release state. A backup left from an earlier run is kept, so it must still be the current file.
   if [ -e "$RELEASE_KEEP" ] && [ "$(sha256 "$RELEASE_KEEP")" != "$RELEASE_SHA" ]; then refuse "$RELEASE_KEEP exists but is not the release binary"; fi
   if [ -e "$PLIST_BACKUP" ] || [ -L "$PLIST_BACKUP" ]; then
@@ -518,17 +596,32 @@ else
 fi
 
 # ---- backups ----
-if [ -e "$RELEASE_KEEP" ]; then
-  say "backup binary: keeping existing $RELEASE_KEEP"
-elif [ "$DRY_RUN" = 1 ]; then
-  say "would back up binary: copy $BIN to $RELEASE_KEEP (cp -p, via rename)"
+if [ -n "$UPGRADE_FROM" ]; then
+  for f in "$RELEASE_KEEP" "$PLIST_BACKUP" "$CONFIG_BACKUP"; do
+    if [ -e "$f" ]; then say "first-deploy backup left untouched: $f"; else say "first-deploy backup not present (left so): $f"; fi
+  done
+  if [ -e "$PREV_KEEP" ]; then
+    say "previous build: keeping existing $PREV_KEEP (same sha256 as the installed binary)"
+  elif [ "$DRY_RUN" = 1 ]; then
+    say "would keep the previous build: copy $BIN to $PREV_KEEP (cp -p, then a hard link that never replaces an existing file)"
+  else
+    keep_copy "$BIN" "$PREV_KEEP" || refuse "cannot write $PREV_KEEP"
+    [ "$(sha256 "$PREV_KEEP")" = "$CUR_SHA" ] || refuse "$PREV_KEEP does not hash to the installed binary sha256"
+    say "previous build: $BIN -> $PREV_KEEP"
+  fi
 else
-  atomic_copy "$BIN" "$RELEASE_KEEP" || refuse "cannot write $RELEASE_KEEP"
-  [ "$(sha256 "$RELEASE_KEEP")" = "$RELEASE_SHA" ] || refuse "$RELEASE_KEEP does not hash to the release sha256"
-  say "backup binary: $BIN -> $RELEASE_KEEP"
+  if [ -e "$RELEASE_KEEP" ]; then
+    say "backup binary: keeping existing $RELEASE_KEEP"
+  elif [ "$DRY_RUN" = 1 ]; then
+    say "would back up binary: copy $BIN to $RELEASE_KEEP (cp -p, via rename)"
+  else
+    atomic_copy "$BIN" "$RELEASE_KEEP" || refuse "cannot write $RELEASE_KEEP"
+    [ "$(sha256 "$RELEASE_KEEP")" = "$RELEASE_SHA" ] || refuse "$RELEASE_KEEP does not hash to the release sha256"
+    say "backup binary: $BIN -> $RELEASE_KEEP"
+  fi
+  backup "$PLIST_REAL" "$PLIST_BACKUP" plist
+  backup "$CONFIG" "$CONFIG_BACKUP" config
 fi
-backup "$PLIST_REAL" "$PLIST_BACKUP" plist
-backup "$CONFIG" "$CONFIG_BACKUP" config
 
 if [ "$DRY_RUN" = 1 ]; then
   if [ "$CUR_SHA" = "$NEW_SHA" ]; then
@@ -536,9 +629,17 @@ if [ "$DRY_RUN" = 1 ]; then
   else
     say "would install $NEW as $BIN: copy beside it with mode $(fmode "$BIN") owner $(fowner "$BIN"), then rename"
   fi
-  if [ "$PLIST_MSCR" = "$ABSENT" ]; then mscr_op=add; else mscr_op="set (now $PLIST_MSCR)"; fi
-  say "would edit a copy of $PLIST_REAL: set LB_STRATEGY=$NEW_STRATEGY, $mscr_op $MSCR_NAME=$MSCR_VALUE, then rename"
-  say "would edit a copy of $CONFIG: set lb_strategy to $NEW_STRATEGY in place (nothing printed), then rename"
+  if [ "$PLIST_LB" = "$NEW_STRATEGY" ] && [ "$PLIST_MSCR" = "$MSCR_VALUE" ]; then
+    say "would leave $PLIST_REAL alone (already LB_STRATEGY=$NEW_STRATEGY $MSCR_NAME=$MSCR_VALUE)"
+  else
+    if [ "$PLIST_MSCR" = "$ABSENT" ]; then mscr_op=add; else mscr_op="set (now $PLIST_MSCR)"; fi
+    say "would edit a copy of $PLIST_REAL: set LB_STRATEGY=$NEW_STRATEGY, $mscr_op $MSCR_NAME=$MSCR_VALUE, then rename"
+  fi
+  if [ "$CONFIG_LB" = "$NEW_STRATEGY" ]; then
+    say "would leave $CONFIG alone (lb_strategy already $NEW_STRATEGY)"
+  else
+    say "would edit a copy of $CONFIG: set lb_strategy to $NEW_STRATEGY in place (nothing printed), then rename"
+  fi
   say "would validate binary sha256, plist lint and values, and config lb_strategy before the reload"
   reload_job
   run_checks
@@ -598,6 +699,10 @@ say "validate: binary sha256, plist (lint, LB_STRATEGY, $MSCR_NAME) and config l
 reload_job || failed reload
 run_checks || failed "$CHECK_FAILED"
 
-say "session-pace running from $BIN (sha256 $NEW_SHA), $MSCR_NAME=$MSCR_VALUE; backups: $RELEASE_KEEP, $PLIST_BACKUP, $CONFIG_BACKUP"
+if [ -n "$UPGRADE_FROM" ]; then
+  say "session-pace running from $BIN (sha256 $NEW_SHA), $MSCR_NAME=$MSCR_VALUE; previous build kept as $PREV_KEEP; first-deploy backups untouched"
+else
+  say "session-pace running from $BIN (sha256 $NEW_SHA), $MSCR_NAME=$MSCR_VALUE; backups: $RELEASE_KEEP, $PLIST_BACKUP, $CONFIG_BACKUP"
+fi
 echo "DEPLOYED"
 exit 0
