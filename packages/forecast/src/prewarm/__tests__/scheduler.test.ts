@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { PrewarmRecord } from "../../types";
 import {
 	createPrewarmScheduler,
+	PREWARM_HISTORY_KEY,
 	PREWARM_MAX_TIMER_MS,
 	PREWARM_RECORDS_KEY,
 	PREWARM_TESTS_KEY,
@@ -500,6 +501,116 @@ describe("timer and sleep", () => {
 		expect(w.timer.pending).toEqual([]);
 		await s.tick(T0 + 2 * H);
 		expect(w.runner.calls).toEqual([]);
+	});
+});
+
+describe("durable guards and markers", () => {
+	test("the 5-hour and daily guards survive eviction from the last-20 records", async () => {
+		const { w, s } = onWorld({
+			settings: settings({ prewarm: true, prewarmMaxPerDay: 1 }),
+		});
+		const others = Array.from({ length: 20 }, (_, i) =>
+			rec({
+				accountId: "b",
+				firedAt: T0 - i * MIN,
+				windowOpened: false,
+				resetsAt: null,
+			}),
+		);
+		w.store.meta.set(PREWARM_RECORDS_KEY, JSON.stringify(others));
+		w.store.meta.set(PREWARM_HISTORY_KEY, JSON.stringify({ a: [T0 - H] }));
+		await s.tick(T0);
+		expect(w.runner.calls).toEqual([]);
+		expect(w.lines).toEqual([
+			"forecast prewarm skip account=name-a reason=recent",
+		]);
+
+		// Later the same day: the 5 hours have passed, the daily cap still holds.
+		const { w: w2, s: s2 } = onWorld({
+			settings: settings({ prewarm: true, prewarmMaxPerDay: 1 }),
+			forecast: { available: true, plan: plan({ a: T0 + 6 * H }) },
+			limits: [limits("a", T0 + 6 * H)],
+		});
+		w2.store.meta = w.store.meta;
+		await s2.tick(T0 + 6 * H);
+		expect(w2.runner.calls).toEqual([]);
+		expect(w2.lines).toEqual([
+			"forecast prewarm skip account=name-a reason=daily_cap",
+		]);
+	});
+
+	test("firing writes the account history and prunes it after 48 hours", async () => {
+		const { w, s } = onWorld();
+		w.store.meta.set(
+			PREWARM_HISTORY_KEY,
+			JSON.stringify({ a: [T0 - 49 * H, T0 - 30 * H] }),
+		);
+		await s.tick(T0);
+		await s.idle();
+		expect(JSON.parse(w.store.meta.get(PREWARM_HISTORY_KEY) ?? "{}")).toEqual({
+			a: [T0 - 30 * H, T0],
+		});
+	});
+
+	test("a used test pair is never fired again, however many pairs came after it", async () => {
+		const { w, s } = onWorld({
+			settings: settings({ prewarmTest: { account: "a", at: T0 + 6 * H } }),
+			forecast: null,
+			limits: [limits("a", T0 + 6 * H)],
+		});
+		const used = [`a|${T0}`, ...Array.from({ length: 25 }, (_, i) => `b|${i}`)];
+		w.store.meta.set(PREWARM_TESTS_KEY, JSON.stringify(used));
+		await s.tick(T0 + 6 * H);
+		await s.idle();
+		expect(JSON.parse(w.store.meta.get(PREWARM_TESTS_KEY) ?? "[]")).toEqual([
+			...used,
+			`a|${T0 + 6 * H}`,
+		]);
+
+		w.state.settings = settings({ prewarmTest: { account: "a", at: T0 } });
+		const restarted = createPrewarmScheduler(w.deps);
+		await restarted.tick(T0 + 12 * H);
+		await restarted.idle();
+		expect(w.runner.calls).toEqual(["a"]);
+	});
+
+	test("after a restart mid-run, a reading inside the longest run decides nothing", async () => {
+		const { w, s } = onWorld({ forecast: { available: true, plan: plan({}) } });
+		w.state.settings = settings({ prewarmTest: { account: "a", at: T0 } });
+		w.runner.hold = true;
+		await s.tick(T0);
+		s.stop();
+
+		const restarted = createPrewarmScheduler(w.deps);
+		w.state.limits = [limits("a", T0 + 30_000)];
+		await restarted.tick(T0 + 30_000);
+		expect(restarted.status().last[0]?.windowOpened).toBeNull();
+
+		w.state.limits = [
+			limits("a", T0 + 90_000, {
+				fiveHour: { usedPct: 1, resetsAt: T0 + 5 * H },
+			}),
+		];
+		await restarted.tick(T0 + 90_000);
+		expect(restarted.status().last[0]).toMatchObject({
+			windowOpened: true,
+			resetsAt: T0 + 5 * H,
+		});
+	});
+
+	test("alternating skip reasons for one opening are each logged once", async () => {
+		const { w, s } = onWorld({ limits: [limits("a", T0, { counted: false })] });
+		await s.tick(T0);
+		w.state.limits = [limits("a", T0 - H, { counted: false })];
+		await s.tick(T0 + MIN);
+		w.state.limits = [limits("a", T0 + 2 * MIN, { counted: false })];
+		await s.tick(T0 + 2 * MIN);
+		w.state.limits = [limits("a", T0 - H, { counted: false })];
+		await s.tick(T0 + 3 * MIN);
+		expect(w.lines).toEqual([
+			"forecast prewarm skip account=name-a reason=not_counted",
+			"forecast prewarm skip account=name-a reason=stale_reading",
+		]);
 	});
 });
 

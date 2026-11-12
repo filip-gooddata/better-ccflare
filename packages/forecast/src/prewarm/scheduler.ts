@@ -13,6 +13,12 @@ import type {
 
 export const PREWARM_RECORDS_KEY = "prewarm.records";
 export const PREWARM_TESTS_KEY = "prewarm.tests";
+/** Firing times per account for the 5-hour and daily guards, kept apart from the display records. */
+export const PREWARM_HISTORY_KEY = "prewarm.history";
+/** Firing times older than this are dropped from the guard history; covers any local day. */
+export const PREWARM_HISTORY_KEEP_MS = 48 * 60 * 60_000;
+/** Longest a run can last (runner timeout plus kill grace); bounds a run interrupted by a restart. */
+export const PREWARM_MAX_RUN_MS = 65_000;
 export const PREWARM_KEEP_RECORDS = 20;
 export const PREWARM_MAX_READING_AGE_MS = 10 * 60_000;
 export const PREWARM_MIN_GAP_MS = 5 * 60 * 60_000;
@@ -53,6 +59,8 @@ export interface PrewarmSchedulerDeps {
 	/** The latest limit reading per account. */
 	limits(): AccountLimits[];
 	timeZone(): string;
+	/** Longest a run can last; default PREWARM_MAX_RUN_MS. */
+	maxRunMs?: number;
 	clock: { now(): EpochMs };
 	timer: PrewarmTimer;
 	logger: PrewarmLogger;
@@ -95,19 +103,42 @@ function parseArray<T>(raw: string | null, logger: PrewarmLogger, key: string) {
 	return [] as T[];
 }
 
+function parseHistory(
+	raw: string | null,
+	logger: PrewarmLogger,
+): Record<AccountId, EpochMs[]> {
+	if (raw === null) return {};
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			const out: Record<AccountId, EpochMs[]> = {};
+			for (const [id, times] of Object.entries(parsed))
+				if (Array.isArray(times))
+					out[id] = times.filter((t): t is number => typeof t === "number");
+			return out;
+		}
+	} catch {
+		// fall through
+	}
+	logger.warn(`forecast prewarm meta unreadable key=${PREWARM_HISTORY_KEY}`);
+	return {};
+}
+
 export function createPrewarmScheduler(
 	deps: PrewarmSchedulerDeps,
 ): PrewarmScheduler {
 	const { runner, store, clock, timer, logger } = deps;
 	let records: PrewarmRecord[] = [];
 	let testsDone: string[] = [];
+	let history: Record<AccountId, EpochMs[]> = {};
 	let loaded = false;
+	const maxRunMs = deps.maxRunMs ?? PREWARM_MAX_RUN_MS;
 	let chain: Promise<void> = Promise.resolve();
 	let timerHandle: unknown = null;
 	let stopped = false;
 	const running = new Map<AccountId, Promise<void>>();
 	const doneAt = new Map<PrewarmRecord, EpochMs>();
-	const lastSkip = new Map<AccountId, string>();
+	const skipsLogged = new Set<string>();
 
 	const serialize = (work: () => Promise<void>) => {
 		const next = chain.then(work).catch((error: unknown) => {
@@ -134,6 +165,12 @@ export function createPrewarmScheduler(
 			logger,
 			PREWARM_TESTS_KEY,
 		);
+		history = parseHistory(await store.getMeta(PREWARM_HISTORY_KEY), logger);
+		for (const r of records) {
+			const times = history[r.accountId] ?? [];
+			if (!times.includes(r.firedAt))
+				history[r.accountId] = [...times, r.firedAt];
+		}
 		loaded = true;
 	};
 
@@ -145,9 +182,10 @@ export function createPrewarmScheduler(
 		key: string,
 		reason: PrewarmSkipReason,
 	) => {
-		const token = `${key}|${reason}`;
-		if (lastSkip.get(accountId) === token) return;
-		lastSkip.set(accountId, token);
+		const token = `${accountId}|${key}|${reason}`;
+		if (skipsLogged.has(token)) return;
+		if (skipsLogged.size >= 500) skipsLogged.clear();
+		skipsLogged.add(token);
 		logger.info(
 			`forecast prewarm skip account=${nameOf(accountId)} reason=${reason}`,
 		);
@@ -169,6 +207,11 @@ export function createPrewarmScheduler(
 			resetsAt: null,
 		};
 		records = [record, ...records].slice(0, PREWARM_KEEP_RECORDS);
+		history[record.accountId] = [
+			...(history[record.accountId] ?? []),
+			now,
+		].filter((at) => at > now - PREWARM_HISTORY_KEEP_MS);
+		await store.setMeta(PREWARM_HISTORY_KEY, JSON.stringify(history));
 		await persistRecords();
 		const late = Math.max(0, Math.round((now - scheduledAt) / 1000));
 		logger.info(
@@ -206,7 +249,9 @@ export function createPrewarmScheduler(
 			if (running.has(record.accountId)) continue;
 			const limits = byId.get(record.accountId);
 			if (!limits) continue;
-			if (limits.readAt <= (doneAt.get(record) ?? record.firedAt)) continue;
+			// After a restart the finish time is unknown: wait out the longest possible run.
+			const finished = doneAt.get(record) ?? record.firedAt + maxRunMs;
+			if (limits.readAt <= finished) continue;
 			const resetsAt = limits.fiveHour.resetsAt;
 			record.windowOpened = resetsAt !== null && resetsAt > record.firedAt;
 			record.resetsAt = record.windowOpened ? resetsAt : null;
@@ -235,7 +280,7 @@ export function createPrewarmScheduler(
 			return;
 		}
 		if (running.has(limits.accountId)) return;
-		testsDone = [...testsDone, marker].slice(-PREWARM_KEEP_RECORDS);
+		testsDone = [...testsDone, marker];
 		await store.setMeta(PREWARM_TESTS_KEY, JSON.stringify(testsDone));
 		if (windowOpen(limits, now)) {
 			skip(limits.accountId, `test|${marker}`, "window_open");
@@ -256,12 +301,12 @@ export function createPrewarmScheduler(
 		if (!limits.counted) return "not_counted";
 		if (isOut(limits, now)) return "out";
 		if (windowOpen(limits, now)) return "window_open";
-		const mine = records.filter((r) => r.accountId === accountId);
-		if (mine.some((r) => r.firedAt > now - PREWARM_MIN_GAP_MS)) return "recent";
+		const mine = history[accountId] ?? [];
+		if (mine.some((at) => at > now - PREWARM_MIN_GAP_MS)) return "recent";
 		const zone = deps.timeZone();
 		const today = localDayKey(now, zone);
 		if (
-			mine.filter((r) => localDayKey(r.firedAt, zone) === today).length >=
+			mine.filter((at) => localDayKey(at, zone) === today).length >=
 			settings.prewarmMaxPerDay
 		)
 			return "daily_cap";

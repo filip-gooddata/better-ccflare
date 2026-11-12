@@ -8,7 +8,9 @@ WIRING constructs it.
   and duration. `nodeClaudeCliIo()` supplies the real process, file system and clock.
 - `scheduler.ts`: `createPrewarmScheduler(deps)` fires on `tick(now)` (every usage poll) and on its
   own timer, under the guards of design.md section 7. It keeps records in `forecast_meta`
-  (`prewarm.records`, last 20; `prewarm.tests`, one-shot markers).
+  (`prewarm.records`, last 20, for display; `prewarm.history`, firing times per account for the
+  5-hour and daily guards, 48 h; `prewarm.tests`, every used one-shot pair). After a restart a run
+  that was in flight is judged only from a reading taken after its longest possible run (65 s).
 
 ## The command
 
