@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sandbox exercise for deploy.sh. Builds a mode-700 mktemp sandbox holding copies of the real
-# release binary, LaunchAgent plist and app config JSON, points deploy.sh at the copies through
-# BCF_* overrides, and replaces launchctl, curl (the HTTP endpoints), lsof, netstat and claude with
+# release binary and LaunchAgent plist plus a synthetic app config JSON written here (the real
+# config is never read), points deploy.sh at them through BCF_* overrides, and replaces launchctl, curl (the HTTP endpoints), lsof, netstat and claude with
 # stubs. Nothing here touches the real installation, calls launchctl, runs the real claude or sends
 # a network request. The sandbox is deleted on exit.
 #
@@ -24,7 +24,6 @@ LABEL=net.kalny.better-ccflare
 REAL_BIN=$HOME/.local/bin/better-ccflare
 REAL_KEEP=$REAL_BIN.v3.6.7-release
 REAL_PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
-REAL_CONFIG=$HOME/.config/better-ccflare/better-ccflare.json
 PB=/usr/libexec/PlistBuddy
 
 [ $# -eq 1 ] || { echo "usage: exercise.sh NEW_BINARY" >&2; exit 64; }
@@ -50,21 +49,27 @@ if [ -f "$REAL_KEEP" ]; then src_bin=$REAL_KEEP; else src_bin=$REAL_BIN; fi
 /bin/cp -p "$src_bin" "$P/bin" || die "copy binary"
 real_plist_file=$(/usr/bin/perl -MCwd=abs_path -e 'my $p = abs_path(shift); defined $p or exit 1; print $p' "$REAL_PLIST") || die "resolve plist"
 /bin/cp -p "$real_plist_file" "$P/plist" || die "copy plist"
-/bin/cp -p "$REAL_CONFIG" "$P/config" || die "copy config"
 /bin/cp "$NEW_SRC" "$P/new" && /bin/chmod 755 "$P/new" || die "copy new binary"
 RELEASE_SHA=$(sha "$P/bin")
 NEW_SHA=$(sha "$P/new")
 [ "$RELEASE_SHA" != "$NEW_SHA" ] || die "the stand-in new binary must differ from the release binary"
 $PB -c "Set :EnvironmentVariables:LB_STRATEGY session-affinity" "$P/plist" >/dev/null 2>&1 || die "plist LB_STRATEGY"
 $PB -c "Delete :EnvironmentVariables:MODEL_SCOPED_CAPACITY_ROUTING" "$P/plist" >/dev/null 2>&1
-# Synthetic secret planted in the config copy, which is also set to the release lb_strategy; the
-# leak checks at the end assert the secret never leaves the config files. Written via a mode-600
-# temp file; nothing is printed.
+# Synthetic app config, mode 600, at the release lb_strategy. Besides lb_strategy (the only key
+# deploy.sh reads or edits) it holds other keys around it, so the in-place edit has neighbours to
+# leave alone, and fake OAuth tokens plus a random sentinel for the leak checks at the end, which
+# assert none of it leaves the config files. Nothing is printed.
 SENTINEL=$(/usr/bin/od -An -N16 -tx1 /dev/urandom | /usr/bin/tr -d ' \n')
 [ ${#SENTINEL} = 32 ] || die "sentinel"
-(umask 077; /usr/bin/jq --arg s "exercise-sentinel-$SENTINEL" '. + {exercise_sentinel_token: $s} | .lb_strategy = "session-affinity"' "$P/config" >"$P/config.tmp" 2>/dev/null) || die "plant sentinel"
-/bin/chmod "$(fmode "$P/config")" "$P/config.tmp" && /bin/mv -f "$P/config.tmp" "$P/config" || die "plant sentinel"
-/usr/bin/jq -e '.lb_strategy == "session-affinity" and (.exercise_sentinel_token | type) == "string"' "$P/config" >/dev/null 2>&1 || die "sentinel config shape"
+(umask 077; /usr/bin/jq -n --arg s "exercise-sentinel-$SENTINEL" '{
+  port: 8791,
+  lb_strategy: "session-affinity",
+  default_agent_model: "exercise-model-name",
+  exercise_fake_oauth: {access_token: ("exercise-fake-access-" + $s), refresh_token: ("exercise-fake-refresh-" + $s), expires_at: 1767225600000},
+  exercise_sentinel_token: $s
+}' >"$P/config" 2>/dev/null) || die "write synthetic config"
+/bin/chmod 600 "$P/config" || die "synthetic config mode"
+/usr/bin/jq -e '.lb_strategy == "session-affinity" and (.exercise_sentinel_token | type) == "string"' "$P/config" >/dev/null 2>&1 || die "synthetic config shape"
 
 # ---- stubs ----
 ST=$SBX/stubs
