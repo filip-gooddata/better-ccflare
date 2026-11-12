@@ -827,6 +827,44 @@ describe("SessionPaceStrategy", () => {
 			}
 		});
 
+		it("starts a day at its first instant when a DST change skips local midnight", () => {
+			// Santiago skips Sun 2026-09-06 00:00 -04 straight to 01:00 -03,
+			// so Saturday is 24 h and Sunday 23 h.
+			const fmt = new Intl.DateTimeFormat("en-GB", {
+				timeZone: "America/Santiago",
+				dateStyle: "full",
+				timeStyle: "long",
+			});
+			expect(fmt.format(Date.parse("2026-09-06T03:59:59Z"))).toBe(
+				"Saturday, 5 September 2026 at 23:59:59 GMT-4",
+			);
+			expect(fmt.format(Date.parse("2026-09-06T04:00:00Z"))).toBe(
+				"Sunday, 6 September 2026 at 01:00:00 GMT-3",
+			);
+			const monToSat = { workDays: 6, timeZone: "America/Santiago" };
+			// Window from Thu 2026-09-03 12:00 -04 to Thu 2026-09-10 13:00 -03:
+			// Thu 12 + Fri 24 + Sat 24 + Mon 24 + Tue 24 + Wed 24 + Thu 13 = 145 h.
+			const w = {
+				utilization: 0,
+				resetsAt: Date.parse("2026-09-10T16:00:00Z"),
+			};
+			// Sunday noon: Thu 12 + Fri 24 + Sat 24 = 60 h.
+			expect(
+				weeklyPaceDeficit(w, Date.parse("2026-09-06T16:00:00Z"), monToSat),
+			).toBeCloseTo((60 / 145) * 100, 9);
+			// Sat 23:30 -04: 59.5 h.
+			expect(
+				weeklyPaceDeficit(w, Date.parse("2026-09-06T03:30:00Z"), monToSat),
+			).toBeCloseTo((59.5 / 145) * 100, 9);
+		});
+
+		it("counts milliseconds at the window edges", () => {
+			expect(
+				weeklyPaceDeficit(gdWindow, NOW + 123, PRAGUE_WORKDAYS) -
+					weeklyPaceDeficit(gdWindow, NOW, PRAGUE_WORKDAYS),
+			).toBeCloseTo((0.123 / (120 * 3600)) * 100, 12);
+		});
+
 		it("falls back to the calendar pace when the window holds no work time", () => {
 			expect(
 				weeklyPaceDeficit(gdWindow, NOW, { workDays: 0, timeZone: PRAGUE }),

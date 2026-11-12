@@ -103,6 +103,10 @@ describe("session-pace settings", () => {
 				expect(config.getSessionPaceWorkDays()).toBe(7);
 				process.env.SESSION_PACE_WORK_DAYS = "6";
 				expect(config.getSessionPaceWorkDays()).toBe(6);
+				process.env.SESSION_PACE_WORK_DAYS = "1";
+				expect(config.getSessionPaceWorkDays()).toBe(1);
+				process.env.SESSION_PACE_WORK_DAYS = "";
+				expect(config.getSessionPaceWorkDays()).toBe(7);
 			} finally {
 				cleanup();
 			}

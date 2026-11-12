@@ -102,23 +102,50 @@ function zoneOffsetMs(timeZone: string, t: number): number {
 	return wallAsUtc - Math.floor(t / 1000) * 1000;
 }
 
-/** The instant of local midnight starting the calendar day dayUtc (a UTC midnight naming that date). */
-function localMidnight(timeZone: string, dayUtc: number): number {
-	const first = dayUtc - zoneOffsetMs(timeZone, dayUtc);
-	const offset = zoneOffsetMs(timeZone, first);
-	return dayUtc - offset;
+/** The local calendar day containing t, named by its UTC midnight. */
+function localDay(timeZone: string, t: number): number {
+	const w = wallClock(timeZone, t);
+	return Date.UTC(w.year, w.month - 1, w.day);
+}
+
+/**
+ * The first instant of the local calendar day dayUtc (a UTC midnight naming
+ * that date): its local midnight, or, where a DST change skips midnight, the
+ * first instant whose local date is that day.
+ */
+function localDayStart(timeZone: string, dayUtc: number): number {
+	const a = dayUtc - zoneOffsetMs(timeZone, dayUtc - DAY_MS);
+	const b = dayUtc - zoneOffsetMs(timeZone, dayUtc + DAY_MS);
+	const lo = Math.min(a, b);
+	const hi = Math.max(a, b);
+	for (const c of [lo, hi]) {
+		const w = wallClock(timeZone, c);
+		if (
+			Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) ===
+			dayUtc
+		)
+			return c;
+	}
+	// Midnight skipped: binary-search the second the local date turns over.
+	let before = lo;
+	let after = hi;
+	while (after - before > 1000) {
+		const mid = before + Math.floor((after - before) / 2000) * 1000;
+		if (localDay(timeZone, mid) >= dayUtc) after = mid;
+		else before = mid;
+	}
+	return after;
 }
 
 /** Milliseconds of [from, to) that fall on local work days. */
 function workMs(from: number, to: number, basis: PaceBasis): number {
 	if (to <= from) return 0;
-	const start = wallClock(basis.timeZone, from);
-	let day = Date.UTC(start.year, start.month - 1, start.day);
-	let dayStart = localMidnight(basis.timeZone, day);
+	let day = localDay(basis.timeZone, from);
+	let dayStart = localDayStart(basis.timeZone, day);
 	let total = 0;
 	for (let i = 0; i < 400; i++) {
 		const nextDay = day + DAY_MS;
-		const dayEnd = localMidnight(basis.timeZone, nextDay);
+		const dayEnd = localDayStart(basis.timeZone, nextDay);
 		const isoWeekday = new Date(day).getUTCDay() || 7;
 		if (isoWeekday <= basis.workDays) {
 			total += Math.max(0, Math.min(to, dayEnd) - Math.max(from, dayStart));
@@ -135,8 +162,8 @@ function workMs(from: number, to: number, basis: PaceBasis): number {
  * spend of its all-models weekly window: the share of the window's work time
  * that has elapsed minus the share that has been used. The window starts
  * `resetsAt` minus 7 days; work time is the part of it on local days whose
- * ISO weekday is at most `basis.workDays`. A window with no work time falls
- * back to the calendar share.
+ * ISO weekday is at most `basis.workDays`. Seven work days, or a window
+ * with no work time, use the calendar share.
  */
 export function weeklyPaceDeficit(
 	window: StrategyUsageWindow | null,
@@ -148,7 +175,8 @@ export function weeklyPaceDeficit(
 ): number {
 	if (!window || window.resetsAt === null) return 0;
 	const windowStart = window.resetsAt - WEEK_MS;
-	const total = workMs(windowStart, window.resetsAt, basis);
+	const total =
+		basis.workDays >= 7 ? 0 : workMs(windowStart, window.resetsAt, basis);
 	const share =
 		total > 0
 			? (workMs(windowStart, now, basis) * 100) / total
