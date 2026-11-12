@@ -105,6 +105,13 @@ describe("planner moves", () => {
 		expect(move.reason).toBe("low-point+9.1");
 	});
 
+	test("no move to an account that cannot take work now", async () => {
+		const ctx = moveCase(50_000);
+		ctx.accounts[1].blockedUntil = ctx.now + 2 * HOUR;
+		const { plan } = await planForecast(ctx);
+		expect(plan.moves).toEqual([]);
+	});
+
 	test("a cold session is never in moves", async () => {
 		const now = prague(12, 9);
 		const { plan } = await planForecast(moveCase(50_000, now));

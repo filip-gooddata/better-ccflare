@@ -89,7 +89,9 @@ function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
 
 /**
  * Shared axis: now; every 5 minutes on the clock to fineEnd; every full hour to simEnd (both ends
- * included); every deterministic jump twice (value before, value after).
+ * included); every deterministic jump twice (value before, value after). A reset of a window the
+ * simulation itself opened is not on the axis; inside the 5-minute part (the 5-hour score window) a
+ * dip it hides lasts less than one step.
  */
 export function buildSampleAxis(ctx: EngineContext, plan: SimPlan): SampleAxis {
 	const { now } = ctx;
@@ -333,6 +335,9 @@ class DayRun {
 			if (this.openPending[j] && this.openAt[j] <= t && this.usable(j, t))
 				if (best < 0 || this.openAt[j] < this.openAt[best]) best = j;
 		if (best >= 0) return best;
+		// Last resort: closed accounts with no planned opening first, so a scheduled opening keeps its time.
+		for (let j = 0; j < this.n; j++)
+			if (!this.openPending[j] && this.usable(j, t)) return j;
 		for (let j = 0; j < this.n; j++) if (this.usable(j, t)) return j;
 		return -1;
 	}
@@ -502,6 +507,9 @@ class DayRun {
 			}
 			t = end;
 		}
+		// Each phase but the last fills an account, so the guard is never reached; if it were, the
+		// rest of the demand counts as unserved rather than vanishing.
+		if (t < b) this.unserved += rate * (b - t);
 	}
 
 	day(): number {
@@ -560,7 +568,9 @@ function runDay(
 	run.reset();
 	const now = times[0];
 	run.applyDue(now);
-	if (p.moveSession >= 0) {
+	// A move to an account that cannot take work now is not made. A move cost above the target's
+	// quota left fills it (it is out at once), as the re-read would.
+	if (p.moveSession >= 0 && run.usable(p.moveTo, now)) {
 		run.sessionAt[p.moveSession] = p.moveTo;
 		run.charge(p.moveTo, p.sessionCost[p.moveSession], now);
 	}

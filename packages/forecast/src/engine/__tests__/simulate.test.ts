@@ -232,6 +232,27 @@ describe("simulate", () => {
 		});
 	});
 
+	test("last resort: a closed account with no planned opening goes before one planned for later", async () => {
+		const now = prague(12, 6);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [account({ id: "acct-a" }), account({ id: "acct-b" })],
+			k5: { "acct-a": 10, "acct-b": 10 },
+			rate: (_m, _w, at) => (at < now + 2 * HOUR ? 0.1 : 0),
+		});
+		const { traces } = await simulate(ctx, {
+			openAt: [now + 3 * HOUR, null],
+			preferred: null,
+			move: null,
+		});
+		expect(traces[0].outs[0]).toEqual({
+			account: 1,
+			at: now + 100 * MIN,
+			limit: "five_hour",
+		});
+	});
+
 	test("Fable out time is recorded per account", async () => {
 		const now = prague(12, 8);
 		const ctx = makeCtx({

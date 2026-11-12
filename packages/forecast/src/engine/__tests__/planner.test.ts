@@ -82,7 +82,8 @@ describe("planForecast: 2026-11-12 shape", () => {
 		expect(score.stopMinutes).toBe(0);
 		expect(plan.placement).toEqual({
 			tiers: [["acct-a"], ["acct-b"]],
-			rule: "forecast-open",
+			// New sessions now (07:30) go to acct-a, whose window the plan opens at 08:30, not now.
+			rule: "forecast-lookahead",
 			reason: "open-ahead+85.5",
 		});
 		expect(plan.computedAt).toBe(ctx.now);

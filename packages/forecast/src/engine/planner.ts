@@ -31,6 +31,10 @@ const SCORE_EPS = 1e-9;
 const OPEN_AHEAD_MIN = [0, 30, 60, 120, 180, 240] as const;
 /** With pre-warm on, openings also tried this many minutes before the learned work start: reaches across the night. */
 const OPEN_BEFORE_WORK_START_MIN = [300, 240, 180, 120, 60] as const;
+/** Best single openings per closed account carried into the combination search. */
+const OPENING_BEAM = 3;
+/** Most opening combinations simulated: (beam + 1)^closed accounts stays within it for up to 3 accounts. */
+const MAX_OPENING_COMBOS = 64;
 /** Most live sessions tried as move candidates (largest recent use first): keeps the search bounded. */
 const MAX_MOVE_SESSIONS = 3;
 /** Placement tiers: accounts whose best plans differ by at most this many points on items 1, 2 and 4 share a tier. */
@@ -81,18 +85,27 @@ function lowestUntil(
 	return Number.isFinite(low) ? low : 0;
 }
 
-/** Heavy unserved demand per sample: the 90th percentile of unserved units over the simulated days. */
-function heavyUnserved(result: SimulationResult, length: number): Float64Array {
-	const out = new Float64Array(length);
-	const column = new Float64Array(result.traces.length);
-	if (column.length === 0) return out;
-	for (let i = 0; i < length; i++) {
-		for (let s = 0; s < column.length; s++)
-			column[s] = result.traces[s].unserved[i];
-		column.sort();
-		out[i] = quantileSorted(column as unknown as number[], HEAVY_LEVEL / 100);
+/**
+ * Heavy unserved demand of a run of samples [from, to): each simulated day's unserved units summed
+ * over the run, then the 90th percentile over the days (a pointwise percentile summed over the run
+ * would add losses of different days).
+ */
+function heavyRunUnserved(
+	result: SimulationResult,
+	from: number,
+	to: number,
+): number {
+	const days = result.traces.length;
+	if (days === 0) return 0;
+	const sums = new Float64Array(days);
+	for (let s = 0; s < days; s++) {
+		const unserved = result.traces[s].unserved;
+		let sum = 0;
+		for (let i = from; i < to; i++) sum += unserved[i];
+		sums[s] = sum;
 	}
-	return out;
+	sums.sort();
+	return quantileSorted(sums as unknown as number[], HEAVY_LEVEL / 100);
 }
 
 /** Leximin items 1 to 4 of design 4.7 for one simulated plan. */
@@ -126,7 +139,6 @@ export function scorePlan(
 
 	// Heavy stops: maximal runs where the heavy 5-hour line is zero, counted only when the heavy
 	// unserved demand inside them reaches minStopPoints.
-	const unserved = heavyUnserved(result, length);
 	const minStop = ctx.input.settings.minStopPoints;
 	let stopMinutes = 0;
 	let i = 1;
@@ -136,16 +148,15 @@ export function scorePlan(
 			continue;
 		}
 		const runStart = times[i - 1];
-		let runUnserved = 0;
+		const first = i;
 		while (
 			i < length &&
 			heavyDay[i - 1] <= ZERO_LINE_POINTS &&
 			heavyDay[i] <= ZERO_LINE_POINTS
 		) {
-			runUnserved += unserved[i];
 			i++;
 		}
-		if (unservedPoints(ctx, runUnserved) >= minStop)
+		if (unservedPoints(ctx, heavyRunUnserved(result, first, i)) >= minStop)
 			stopMinutes += (times[i - 1] - runStart) / MINUTE_MS;
 	}
 	return {
@@ -250,27 +261,40 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	const openMin = ctx.input.settings.openMinGainPoints;
 	const moveMin = ctx.input.settings.moveMinGainPoints;
 
-	// 1. Openings, one closed account at a time (coordinate search).
+	// 1. Openings: each closed account's grid alone, then every combination of each account's best
+	// few openings (two openings may gain only together).
 	const grid = openingGrid(ctx);
+	const beams: (EpochMs | null)[][] = [];
 	for (const j of closed) {
-		let bestOpening: Evaluated | null = null;
-		for (const at of grid) {
-			const candidate = await evaluate(withOpening(best.plan, j, at));
-			if (
-				item1GainPoints(candidate.score, best.score) >= openMin &&
-				better(candidate, bestOpening)
-			)
-				bestOpening = candidate;
-		}
-		if (bestOpening) best = bestOpening;
+		const singles: { at: EpochMs; evaluated: Evaluated }[] = [];
+		for (const at of grid)
+			singles.push({
+				at,
+				evaluated: await evaluate(withOpening(baseline.plan, j, at)),
+			});
+		singles.sort((x, y) => compareScores(x.evaluated.score, y.evaluated.score));
+		beams.push([null, ...singles.slice(0, OPENING_BEAM).map((x) => x.at)]);
 	}
+	let bestOpening: Evaluated | null = null;
+	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
+		const openAt = [...baseline.plan.openAt];
+		closed.forEach((j, x) => {
+			openAt[j] = combo[x];
+		});
+		const candidate = await evaluate({ ...baseline.plan, openAt });
+		if (
+			item1GainPoints(candidate.score, baseline.score) >= openMin &&
+			better(candidate, bestOpening)
+		)
+			bestOpening = candidate;
+	}
+	if (bestOpening) best = bestOpening;
 
 	// 2. Order for unattached demand now: each account preferred in turn.
-	const preferred: Evaluated[] = [];
-	for (let j = 0; j < n; j++)
-		preferred.push(await evaluate({ ...best.plan, preferred: j }));
-	for (const candidate of preferred)
+	for (let j = 0; j < n; j++) {
+		const candidate = await evaluate({ ...best.plan, preferred: j });
 		if (better(candidate, best)) best = candidate;
+	}
 
 	// An opening stays only while it still earns openMinGainPoints in the final combination.
 	for (const j of closed) {
@@ -291,7 +315,8 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	const noMove = best;
 	for (const session of movable) {
 		for (let to = 0; to < n; to++) {
-			if (to === indexOf.get(session.accountId)) continue;
+			if (to === indexOf.get(session.accountId) || !canTakeWorkNow(ctx, to))
+				continue;
 			const candidate = await evaluate({
 				...noMove.plan,
 				move: { sessionId: session.sessionId, to },
@@ -324,6 +349,11 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		};
 	}
 
+	// Placement tiers are scored against the final plan (openings and move included).
+	const finalPreferred: Evaluated[] = [];
+	for (let j = 0; j < n; j++)
+		finalPreferred.push(await evaluate({ ...best.plan, preferred: j }));
+
 	const openAt: Record<string, EpochMs | null> = {};
 	for (const j of closed)
 		openAt[ctx.accounts[j].accountId] = best.plan.openAt[j] ?? null;
@@ -332,7 +362,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		plan: {
 			computedAt: ctx.now,
 			openAt,
-			placement: placementOf(ctx, preferred, baseline, best.plan),
+			placement: placementOf(ctx, finalPreferred, baseline, best.plan),
 			moves: move ? [move] : [],
 			workStartMinute: ctx.workStartMinute,
 		},
@@ -375,9 +405,13 @@ function placementOf(
 	const first = tiers[0][0];
 	const top = preferred[first].score;
 	const gain = item1GainPoints(top, baseline.score);
-	const opens = !isOpenNow(ctx, first);
+	// forecast-open: new sessions go to a closed window that the plan opens now.
+	const plannedAt = plan.openAt[first];
+	const opens =
+		!isOpenNow(ctx, first) &&
+		(plan.preferred === first || (plannedAt != null && plannedAt <= ctx.now));
 	let reason: string;
-	if (opens && plan.openAt[first] != null && gain >= REASON_MIN_GAIN_POINTS)
+	if (plannedAt != null && gain >= REASON_MIN_GAIN_POINTS)
 		reason = `open-ahead+${gain.toFixed(1)}`;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
 		reason = `low-point+${gain.toFixed(1)}`;
@@ -388,6 +422,35 @@ function placementOf(
 		rule: opens ? "forecast-open" : "forecast-lookahead",
 		reason,
 	};
+}
+
+/** Cartesian product of the choices, or only the one-change-at-a-time rows when it exceeds `limit`. */
+function combinations<T>(choices: T[][], limit: number): T[][] {
+	const size = choices.reduce((product, c) => product * c.length, 1);
+	if (size > limit) {
+		const rows: T[][] = [choices.map((c) => c[0])];
+		choices.forEach((c, x) => {
+			for (const value of c.slice(1))
+				rows.push(choices.map((d, y) => (y === x ? value : d[0])));
+		});
+		return rows;
+	}
+	let rows: T[][] = [[]];
+	for (const c of choices)
+		rows = rows.flatMap((row) => c.map((value) => [...row, value]));
+	return rows;
+}
+
+/** Not paused by a cooldown, weekly not used up, and no full 5-hour window. */
+function canTakeWorkNow(ctx: EngineContext, index: number): boolean {
+	const a = ctx.accounts[index];
+	if (a.blockedUntil !== null && a.blockedUntil > ctx.now) return false;
+	if (
+		a.weekly.usedPct >= 100 &&
+		(a.weekly.resetsAt === null || a.weekly.resetsAt > ctx.now)
+	)
+		return false;
+	return !(isOpenNow(ctx, index) && a.fiveHour.usedPct >= 100);
 }
 
 /** The account's open window resets before every other open window. */
