@@ -72,6 +72,7 @@ import {
 import {
 	getUsageCollector,
 	initUsageCollector,
+	type ServedUsageSink,
 	tryGetUsageCollector,
 	type UsageCollectorHealth,
 } from "./usage-collector";
@@ -134,16 +135,25 @@ function createForceAccountModelResponse(model: string): Response {
 
 // ===== USAGE COLLECTOR MANAGEMENT =====
 
+export interface InitProxyOptions {
+	/** Receives each served request that has a client session id and usage. */
+	servedUsageSink?: ServedUsageSink;
+}
+
 export async function initProxy(
 	getStorePayloads: () => boolean,
+	options: InitProxyOptions = {},
 ): Promise<void> {
-	await initUsageCollector(
+	const collector = await initUsageCollector(
 		getStorePayloads,
 		(summary) => {
 			requestEvents.emit("event", { type: "summary", payload: summary });
 		},
 		DatabaseFactory.getInstance(),
 	);
+	if (options.servedUsageSink) {
+		collector.setServedUsageSink(options.servedUsageSink);
+	}
 }
 
 export async function drainUsageCollector(): Promise<void> {

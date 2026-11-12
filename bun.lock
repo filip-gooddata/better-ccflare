@@ -194,6 +194,7 @@
       "dependencies": {
         "@better-ccflare/core": "workspace:*",
         "@better-ccflare/database": "workspace:*",
+        "@better-ccflare/forecast": "workspace:*",
         "@better-ccflare/logger": "workspace:*",
       },
     },
