@@ -344,6 +344,8 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 	private routed = new WeakMap<RequestMeta, RoutedRequest>();
 	private advisor: ForecastAdvisor | null = null;
 	private advisorErrorLoggedAt = Number.NEGATIVE_INFINITY;
+	/** Set by ask() when an advisor call threw during the current plan. */
+	private advisorFailed = false;
 
 	/** `internal.timeZone` replaces the process's local zone (tests). */
 	constructor(
@@ -509,6 +511,22 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		meta: RequestMeta | null,
 		now: number,
 	): Plan {
+		if (this.advisor === null)
+			return this.planWith(available, meta, now, false);
+		this.advisorFailed = false;
+		const advised = this.planWith(available, meta, now, true);
+		// Any advisor failure while planning: today's rules for the whole request.
+		return this.advisorFailed
+			? this.planWith(available, meta, now, false)
+			: advised;
+	}
+
+	private planWith(
+		available: Account[],
+		meta: RequestMeta | null,
+		now: number,
+		useAdvisor: boolean,
+	): Plan {
 		const model = meta?.routingModel ?? null;
 		const family = model ? getModelFamily(model) : null;
 		const candidates = available.map((a) =>
@@ -519,24 +537,28 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 		const clientId = meta?.clientSessionId || null;
 		const mapping = clientId !== null ? this.sessions.get(clientId) : undefined;
-		const liveMapping =
-			mapping && !this.isExpired(mapping, now) ? mapping : undefined;
-		const mapped = liveMapping ? byId.get(liveMapping.accountId) : undefined;
 
-		// Forecast routing applies to client sessions only: a new session, or
-		// a mapped one whose cache has gone cold, is placed by the advice.
-		const advising = this.advisor !== null && clientId !== null;
+		// Forecast routing applies to client sessions only. Under advice the
+		// session's cache lifetime (unknown: idleMs), not idleMs, tells a live
+		// session from a cold one; a new or cold session is placed by the advice.
+		const advising = useAdvisor && this.advisor !== null && clientId !== null;
 		const cold =
 			advising &&
 			clientId !== null &&
-			liveMapping !== undefined &&
-			this.isCold(clientId, liveMapping, now);
-		if (advising && (!liveMapping || cold)) {
+			mapping !== undefined &&
+			this.isCold(clientId, mapping, now);
+		const liveMapping =
+			mapping && (advising && !cold ? true : !this.isExpired(mapping, now))
+				? mapping
+				: undefined;
+		const mapped = liveMapping ? byId.get(liveMapping.accountId) : undefined;
+
+		if (advising && (!mapping || cold)) {
 			const advised = this.forecastPlacement(sorted, candidates, now);
 			if (advised) {
 				const landsElsewhere =
-					liveMapping !== undefined &&
-					advised.order[0].account.id !== liveMapping.accountId;
+					mapping !== undefined &&
+					advised.order[0].account.id !== mapping.accountId;
 				return {
 					ordered: advised.order.map((c) => c.account),
 					placement: {
@@ -625,10 +647,11 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 	/** Advisor call that never throws: a failure counts as no advice. */
 	private ask<T>(call: (advisor: ForecastAdvisor) => T): T | null {
 		const advisor = this.advisor;
-		if (advisor === null) return null;
+		if (advisor === null || this.advisorFailed) return null;
 		try {
 			return call(advisor) ?? null;
 		} catch (error) {
+			this.advisorFailed = true;
 			const now = Date.now();
 			if (now - this.advisorErrorLoggedAt >= ADVISOR_ERROR_LOG_INTERVAL_MS) {
 				this.advisorErrorLoggedAt = now;
@@ -640,7 +663,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		}
 	}
 
-	/** Mapped and live by idleMs, but its cache lifetime (unknown: idleMs) has passed. */
+	/** Mapped, and its cache lifetime (unknown: idleMs) has passed since its last request. */
 	private isCold(clientId: string, mapping: Mapping, now: number): boolean {
 		const ttl = this.ask((a) => a.cacheTtlMs(clientId));
 		const lifetime =
@@ -702,6 +725,7 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		accountId: string,
 		now: number,
 	): void {
+		this.advisorFailed = false;
 		this.ask((a) => a.applied(kind, clientId, accountId, now));
 	}
 

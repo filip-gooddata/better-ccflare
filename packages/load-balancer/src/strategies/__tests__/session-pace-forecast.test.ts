@@ -508,6 +508,33 @@ describe("SessionPaceStrategy with a forecast advisor", () => {
 			expect(short.select([a, b, c], meta(S1))[0].id).toBe("b");
 		});
 
+		it("a known 1-hour cache keeps the session live past a shorter idle setting", () => {
+			const short = new SessionPaceStrategy({ idleMs: 10 * MIN }, PRAGUE);
+			short.initialize(store);
+			short.setForecastAdvisor(advisor);
+			advisor.placement = lookahead([["a"]]);
+			const m = meta(S1);
+			short.select([a, b, c], m);
+			short.onRequestServed(m, a, 200);
+			advisor.ttl.set(S1, HOUR);
+			advisor.placement = lookahead([["b"]]);
+			setSystemTime(new Date(NOW + 30 * MIN));
+			expect(short.select([a, b, c], meta(S1))[0].id).toBe("a");
+			expect(advisor.moveCalls).toBe(1);
+		});
+
+		it("a cold session past the idle setting still carries the cold: prefix", () => {
+			mapTo(S1, a);
+			advisor.ttl.set(S1, 5 * MIN);
+			advisor.placement = lookahead([["b"]], "rebalance");
+			const lines = captureLines(strategy);
+			setSystemTime(new Date(NOW + 2 * HOUR));
+			expect(strategy.select([a, b, c], meta(S1))[0].id).toBe("b");
+			expect(lines[0]).toContain(
+				"account=b-name rule=forecast-lookahead reason=cold:rebalance ",
+			);
+		});
+
 		it("a cold session landing on its own account logs the plain reason", () => {
 			mapTo(S1, a);
 			advisor.ttl.set(S1, 5 * MIN);
@@ -618,6 +645,27 @@ describe("SessionPaceStrategy with a forecast advisor", () => {
 			expect(throwing.filter((l) => !warnings.includes(l as string))).toEqual(
 				plain,
 			);
+		});
+
+		it("an advisor whose lifetime call alone throws gives today's rules for the whole request", () => {
+			advisor.placement = lookahead([["a"]]);
+			const m = meta(S1);
+			strategy.select([a, b, c], m);
+			strategy.onRequestServed(m, a, 200);
+			advisor.cacheTtlMs = () => {
+				throw new Error("ttl boom");
+			};
+			advisor.placement = lookahead([["c"]]);
+			advisor.moves.set(S1, move(S1, "a", "c"));
+			const lines = captureLines(strategy);
+			setSystemTime(new Date(NOW + 2 * MIN));
+			expect(ids(strategy.select([a, b, c], meta(S1)))).toEqual([
+				"a",
+				"b",
+				"c",
+			]);
+			expect(lines.filter((l) => !l.startsWith("WARN "))).toEqual([]);
+			expect(advisor.moveCalls).toBe(0);
 		});
 
 		it("removing the advisor restores today's rules", () => {

@@ -91,6 +91,13 @@ describe("createSessionTracker", () => {
 		expect(tracker.get("s1")?.coldAt).toBe(T0 + 3 * MIN + CACHE_TTL_1H_MS);
 	});
 
+	it("only cache writes with a known split count toward the lifetime", () => {
+		const tracker = createSessionTracker({ now: () => T0 + 2 * MIN });
+		tracker.observe(event("s1", T0, { cacheWriteTokens: 50_000 }));
+		tracker.observe(event("s1", T0 + MIN, write(0, 1)));
+		expect(tracker.get("s1")?.cacheTtlMs).toBe(CACHE_TTL_1H_MS);
+	});
+
 	it("keeps account, family and context of the last request", () => {
 		const tracker = createSessionTracker({ now: () => T0 + MIN });
 		tracker.observe(event("s1", T0, { model: "claude-opus-5-5" }, "acct-a"));
