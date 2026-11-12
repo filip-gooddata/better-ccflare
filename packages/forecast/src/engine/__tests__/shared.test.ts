@@ -36,10 +36,19 @@ describe("computeHorizon", () => {
 			now + 7 * 86_400_000,
 		);
 	});
-	test("on a Saturday the week ends no earlier than today", () => {
+	test("on a Saturday the week ends at a weekly reset later that day", () => {
+		// Saturday 2026-11-14 10:00 CET, reset at 12:00 CET
+		const sat = Date.UTC(2026, 10, 14, 9, 0);
+		const reset = Date.UTC(2026, 10, 14, 11, 0);
+		const h = computeHorizon(sat, [account(reset)], TZ);
+		expect(h.weekEnd).toBe(reset);
+		expect(h.weekEnd).toBeLessThan(h.dayEnd);
+		expect(h.simEnd).toBe(sat + 86_400_000);
+	});
+	test("on a Saturday with no reset ahead the week ends next Friday 24:00", () => {
 		const sat = Date.UTC(2026, 10, 14, 9, 0);
 		const h = computeHorizon(sat, [account(null)], TZ);
-		expect(h.weekEnd).toBe(h.dayEnd);
+		expect(h.weekEnd).toBe(Date.UTC(2026, 10, 20, 23, 0));
 	});
 });
 
@@ -61,5 +70,16 @@ describe("levelLines", () => {
 			);
 		}
 		expect(lines[0][0]).toBeGreaterThan(lines[4][0]);
+	});
+	test("pNN of demand is the (100 - NN)th percentile of quota left", () => {
+		// 10 simulated days with quota left 0..90; simple-statistics interpolates linearly at (n - 1)·p
+		// (type 7): p 0.9 -> 81, p 0.5 -> 45, p 0.1 -> 9.
+		const series = Array.from({ length: 10 }, (_, s) =>
+			Float32Array.from([s * 10]),
+		);
+		const [light, typical, heavy] = levelLines(series, 1, [10, 50, 90]);
+		expect(light[0]).toBeCloseTo(81, 9);
+		expect(typical[0]).toBeCloseTo(45, 9);
+		expect(heavy[0]).toBeCloseTo(9, 9);
 	});
 });
