@@ -57,11 +57,17 @@ export type {
 	MarkAccountRateLimitedOptions,
 	MarkAccountRateLimitedResult,
 } from "./repositories/account.repository";
+// Re-export repository classes
+export type {
+	ClaudeOAuthRequestUsage,
+	ForecastDemandRow,
+	ForecastDemandTotal,
+} from "./repositories/forecast-demand.repository";
+export { ForecastDemandRepository } from "./repositories/forecast-demand.repository";
 export type {
 	ModelTranslation,
 	SimilarModel,
 } from "./repositories/model-translation.repository";
-// Re-export repository classes
 export { ModelTranslationRepository } from "./repositories/model-translation.repository";
 // RequestRepository owns the payload storage codec. Exported so callers that
 // need to read `request_payloads` go through a decoder that reverses

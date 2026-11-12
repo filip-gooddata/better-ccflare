@@ -11,5 +11,8 @@
 	},
 	"dependencies": {
 		"simple-statistics": "8.0.0"
+	},
+	"devDependencies": {
+		"@better-ccflare/database": "workspace:*"
 	}
 }
