@@ -6,6 +6,7 @@ This document explains how better-ccflare picks an account for each proxied requ
 
 1. [Overview: Three Orthogonal Axes](#overview-three-orthogonal-axes)
 2. [Master Pipeline](#master-pipeline)
+   - [Unserved /api paths](#unserved-api-paths)
 3. [The Load-Balancing Strategies](#the-load-balancing-strategies)
    - [session](#session-sessionstrategy)
    - [session-drain-soonest](#session-drain-soonest-sessiondrainsoonestrategy)
@@ -100,6 +101,12 @@ mapped model has 429ed the request ends at `all_models_exhausted_429`, which
 window.
 
 *Source: `packages/proxy/src/proxy.ts` (`handleProxy`, `applyUsageThrottling`), `packages/proxy/src/handlers/account-selector.ts` (`selectAccountsForRequest`), `packages/proxy/src/handlers/proxy-operations.ts` + `packages/proxy/src/handlers/retryable-429.ts` (the three no-bench 429 classes and the transient-5xx retry/bench path).*
+
+### Unserved /api paths
+
+A path the API router does not serve normally falls through to the proxy and goes upstream with an account's token. For `/api` and `/api/...` (prefix matched case-insensitively) the server stops that: an unserved path gets a local JSON `404` (`not_found_error`), with no account selection and no upstream request. Three exact paths that the Claude CLI sends still pass through to the proxy as before: `/api/hello` (the CLI's connectivity check, forwarded upstream) and `/api/event_logging/batch` and `/api/system/package-manager` (answered locally by the proxy's stub). Each refusal is logged at WARN as `Refused unserved API path: <METHOD> <path>`, at most once per method and path per minute, with a `suppressedSinceLastLog` count. If a CLI feature stops working and that line names a path the CLI needs, add the path to `PROXY_PASSTHROUGH_API_PATHS`.
+
+*Source: `apps/server/src/api-guard.ts`, called in `apps/server/src/server.ts` right after `apiRouter.handleRequest`.*
 
 ## The Load-Balancing Strategies
 
