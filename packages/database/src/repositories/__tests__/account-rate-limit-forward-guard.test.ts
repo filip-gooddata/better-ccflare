@@ -492,3 +492,75 @@ describe("AccountRepository.markAccountRateLimited — authoritative replace mod
 		expect(row("acc-1").rate_limited_until).toBe(until);
 	});
 });
+
+describe("AccountRepository.markAccountRateLimited — authoritative reset ordering", () => {
+	let db: Database;
+	let repo: AccountRepository;
+
+	beforeEach(() => {
+		({ db, repo } = makeDb());
+	});
+
+	afterEach(() => {
+		db.close();
+	});
+
+	it("lets the newer observation win when both writes run after both observations", async () => {
+		insertAccount(db, "acc-1");
+		const longReset = Date.now() + 60 * 60 * 1000;
+		const shortReset = Date.now() + 5 * 60 * 1000;
+
+		// Response A (long reset) is observed, then response B (shorter reset).
+		const observedA = Date.now();
+		await Bun.sleep(2);
+		const observedB = Date.now();
+		// Both cooldown writes were queued and only execute now.
+		await Bun.sleep(2);
+
+		await repo.markAccountRateLimited(
+			"acc-1",
+			longReset,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: observedA },
+		);
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			shortReset,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: observedB },
+		);
+
+		expect(result.applied).toBe(true);
+		expect(getAudit(db, "acc-1").rate_limited_until).toBe(shortReset);
+	});
+
+	it("still refuses to shorten a cooldown observed after this response", async () => {
+		insertAccount(db, "acc-1");
+		const longReset = Date.now() + 60 * 60 * 1000;
+		const shortReset = Date.now() + 5 * 60 * 1000;
+
+		const observedB = Date.now();
+		await Bun.sleep(2);
+		const observedA = Date.now();
+
+		await repo.markAccountRateLimited(
+			"acc-1",
+			longReset,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: observedA },
+		);
+		const result = await repo.markAccountRateLimited(
+			"acc-1",
+			shortReset,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: observedB },
+		);
+
+		expect(result.applied).toBe(false);
+		expect(getAudit(db, "acc-1").rate_limited_until).toBe(longReset);
+	});
+});

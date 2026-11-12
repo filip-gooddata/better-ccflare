@@ -343,7 +343,9 @@ export class AccountRepository extends BaseRepository<Account> {
 			// An upstream-reported reset replaces the stored deadline even when
 			// it is earlier, leaving the streak untouched. A cooldown stamped
 			// after this response was observed came from a newer concurrent
-			// write and may only be extended, never shortened.
+			// write and may only be extended, never shortened. The stamp is the
+			// observation time, not this write's execution time: queued writes
+			// may run out of order, and the newer observation must still win.
 			const changes = await this.runWithChanges(
 				`UPDATE accounts
            SET rate_limited_until      = ?,
@@ -360,7 +362,7 @@ export class AccountRepository extends BaseRepository<Account> {
 				[
 					until,
 					reason,
-					Date.now(),
+					options.authoritativeObservedAt,
 					accountId,
 					until,
 					options.authoritativeObservedAt,
