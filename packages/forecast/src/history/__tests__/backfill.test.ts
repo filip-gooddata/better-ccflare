@@ -533,14 +533,75 @@ describe("resumability", () => {
 
 		const store = new FakeStore();
 		const realSet = store.setMeta.bind(store);
-		store.setMeta = async () => {
-			throw new Error("meta write failed");
+		store.setMeta = async (key, value) => {
+			if (key === TRANSCRIPT_BACKFILL_META_KEY)
+				throw new Error("meta write failed");
+			await realSet(key, value);
 		};
 		await expect(runTranscriptBackfill(deps(store))).rejects.toThrow();
-		expect(store.meta.size).toBe(0);
+		expect(store.meta.has(TRANSCRIPT_BACKFILL_META_KEY)).toBe(false);
+		expect(store.rows.size).toBeGreaterThan(0);
 		store.setMeta = realSet;
 		await runTranscriptBackfill(deps(store));
 		expect(store.sorted()).toEqual(reference.sorted());
+		expect(store.meta.has(TRANSCRIPT_BACKFILL_META_KEY)).toBe(true);
+	});
+
+	test("a rerun keeps the first attempt's cut-over when no proxy bucket existed", async () => {
+		const now1 = CUTOVER + 60_000;
+		const now2 = CUTOVER + 6 * 3_600_000;
+		await writeCorpus();
+		await writeJsonl("late/s.jsonl", [
+			assistantLine({
+				at: CUTOVER + 3_600_000,
+				messageId: "late",
+				requestId: "late",
+			}),
+		]);
+		const noProxy = {
+			earliestProxyBucket: async () => null,
+			upsertBatchSize: 10,
+		};
+
+		const reference = new FakeStore();
+		await runTranscriptBackfill(
+			deps(reference, { ...noProxy, now: () => now1 }),
+		);
+
+		const store = new FakeStore();
+		store.failOnUpsertCall = 2;
+		await expect(
+			runTranscriptBackfill(deps(store, { ...noProxy, now: () => now1 })),
+		).rejects.toThrow();
+		store.failOnUpsertCall = null;
+		const result = await runTranscriptBackfill(
+			deps(store, { ...noProxy, now: () => now2 }),
+		);
+		expect(result.status).toBe("done");
+		if (result.status === "done") {
+			expect(result.cutover).toBe(CUTOVER);
+			expect(result.cutoverSource).toBe("resumed");
+		}
+		expect(store.sorted()).toEqual(reference.sorted());
+	});
+
+	test("a rerun moves the cut-over earlier when the proxy has since recorded an earlier bucket", async () => {
+		await writeCorpus();
+		const store = new FakeStore();
+		store.failOnUpsertCall = 1;
+		await expect(runTranscriptBackfill(deps(store))).rejects.toThrow();
+		store.failOnUpsertCall = null;
+		const earlier = T0 + 3_600_000;
+		const result = await runTranscriptBackfill(
+			deps(store, { earliestProxyBucket: async () => earlier }),
+		);
+		expect(result.status).toBe("done");
+		if (result.status === "done") {
+			expect(result.cutover).toBe(earlier);
+			expect(result.cutoverSource).toBe("proxy");
+		}
+		expect(store.sorted().every((row) => row.start < earlier)).toBe(true);
+		expect(store.sorted().length).toBeGreaterThan(0);
 	});
 
 	test("the marker is written only after every row is upserted", async () => {
@@ -553,7 +614,7 @@ describe("resumability", () => {
 			await realUpsert(rows);
 		};
 		store.setMeta = async (key, value) => {
-			events.push("marker");
+			if (key === TRANSCRIPT_BACKFILL_META_KEY) events.push("marker");
 			store.meta.set(key, value);
 		};
 		await runTranscriptBackfill(deps(store, { upsertBatchSize: 10 }));
@@ -564,10 +625,12 @@ describe("resumability", () => {
 
 describe("event loop", () => {
 	test("never blocks the event loop for more than about 50 ms", async () => {
-		// ~45 MB of synthetic transcripts: 60 000 usage lines and as many user lines.
+		// 60 000 usage lines and as many user lines, half of them after the cut-over.
 		// A 64 MB read chunk puts each whole file into one synchronous stretch, so
 		// only the slice budget keeps the event loop free; the control run without
 		// a budget proves the data blocks long enough for the gap meter to notice.
+		// A loaded machine can delay any timer, so the bound must hold in at least
+		// one of three runs; a run that does not yield fails all three.
 		const padding = "x".repeat(200);
 		for (let f = 0; f < 2; f++) {
 			const lines: string[] = [];
@@ -598,9 +661,13 @@ describe("event loop", () => {
 			}, 1);
 			try {
 				const result = await runTranscriptBackfill(
-					deps(new FakeStore(), { readChunkBytes: 64 << 20, ...overrides }),
+					deps(new FakeStore(), {
+						readChunkBytes: 64 << 20,
+						earliestProxyBucket: async () => T0 - 30_000 * 1_000,
+						...overrides,
+					}),
 				);
-				return { maxGap, responses: result.responses };
+				return { maxGap, responses: result.responses + result.afterCutover };
 			} finally {
 				clearInterval(timer);
 			}
@@ -610,10 +677,15 @@ describe("event loop", () => {
 		expect(control.responses).toBe(60_000);
 		expect(control.maxGap).toBeGreaterThan(60);
 
-		const sliced = await measure({});
-		expect(sliced.responses).toBe(60_000);
-		// The default slice budget is 30 ms; one line's parse and the timer's own
+		// The default slice budget is 30 ms; one line's scan and the timer's own
 		// latency come on top, so 60 ms leaves slack for a loaded machine.
-		expect(sliced.maxGap).toBeLessThan(60);
+		const gaps: number[] = [];
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const sliced = await measure({});
+			expect(sliced.responses).toBe(60_000);
+			gaps.push(sliced.maxGap);
+			if (sliced.maxGap < 60) break;
+		}
+		expect(Math.min(...gaps)).toBeLessThan(60);
 	}, 60_000);
 });

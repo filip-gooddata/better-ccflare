@@ -16,8 +16,13 @@ import type {
 	TokenUsage,
 } from "../types";
 import { bucketStart, demandUnits, isFableUsage } from "../units";
+import { type ScannedLine, scanUsageLine } from "./backfill-scan";
 
+/** Completion marker in forecast_meta; set only after every row is stored. */
 export const TRANSCRIPT_BACKFILL_META_KEY = "transcript_backfill_done";
+/** Cut-over chosen by the first attempt, reused by reruns after an interruption. */
+export const TRANSCRIPT_BACKFILL_CUTOVER_META_KEY =
+	"transcript_backfill_cutover";
 
 const DEFAULT_SLICE_BUDGET_MS = 30;
 const DEFAULT_UPSERT_BATCH_SIZE = 500;
@@ -53,7 +58,7 @@ export interface BackfillCounts {
 	unreadable: number;
 	/** Lines read. */
 	lines: number;
-	/** Lines that mention usage but are not valid JSON. */
+	/** Lines that mention usage but are not one JSON object. */
 	malformed: number;
 	/** Lines without usable usage metadata (no usage, synthetic, bad timestamp). */
 	skipped: number;
@@ -69,14 +74,19 @@ export interface BackfillCounts {
 	rows: number;
 }
 
+/**
+ * "proxy": the earliest proxy bucket. "now": the proxy had recorded nothing,
+ * so the current bucket. "resumed": kept from an earlier interrupted attempt.
+ */
+export type CutoverSource = "proxy" | "now" | "resumed";
+
 export type BackfillResult =
 	| ({ status: "already_done" | "no_dir" } & BackfillCounts)
 	| ({
 			status: "done";
 			/** Only buckets strictly before this bucket start were stored. */
 			cutover: EpochMs;
-			/** "proxy": earliest proxy bucket; "now": the proxy had recorded nothing yet. */
-			cutoverSource: "proxy" | "now";
+			cutoverSource: CutoverSource;
 	  } & BackfillCounts);
 
 interface Response {
@@ -103,22 +113,12 @@ function countsRecord(counts: BackfillCounts): Record<string, number> {
 	return { ...counts };
 }
 
-function tokens(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) && value > 0
-		? value
-		: 0;
+function tokens(value: number | null): number {
+	return value !== null && value > 0 ? value : 0;
 }
 
-function splitTokens(value: unknown): number | null {
-	return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function str(value: unknown): string | null {
-	return typeof value === "string" && value.length > 0 ? value : null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
+function nonEmpty(value: string | null): string | null {
+	return value !== null && value.length > 0 ? value : null;
 }
 
 interface ParsedLine {
@@ -127,24 +127,17 @@ interface ParsedLine {
 	usage: TokenUsage;
 }
 
-/** Reads only usage metadata; returns null for lines that carry none. */
-function usageMetadata(entry: unknown): ParsedLine | null {
-	if (!isRecord(entry)) return null;
-	const message = entry.message;
-	if (!isRecord(message)) return null;
-	const usage = message.usage;
-	if (!isRecord(usage)) return null;
-	const model = str(message.model);
+/** Usage metadata of one scanned line; null for lines that carry none. */
+function usageMetadata(line: ScannedLine): ParsedLine | null {
+	const usage = line.usage;
+	if (usage === null) return null;
+	const model = nonEmpty(line.model);
 	if (model === "<synthetic>") return null;
-	const timestamp = str(entry.timestamp);
-	const at = timestamp === null ? Number.NaN : Date.parse(timestamp);
+	const at = line.timestamp === null ? Number.NaN : Date.parse(line.timestamp);
 	if (!Number.isFinite(at)) return null;
 
-	const split = isRecord(usage.cache_creation) ? usage.cache_creation : null;
-	const write5m = split ? splitTokens(split.ephemeral_5m_input_tokens) : null;
-	const write1h = split ? splitTokens(split.ephemeral_1h_input_tokens) : null;
-	const messageId = str(message.id);
-	const requestId = str(entry.requestId);
+	const messageId = nonEmpty(line.messageId);
+	const requestId = nonEmpty(line.requestId);
 	return {
 		at,
 		key:
@@ -153,14 +146,36 @@ function usageMetadata(entry: unknown): ParsedLine | null {
 				: `${messageId ?? ""}\u0000${requestId ?? ""}`,
 		usage: {
 			model,
-			inputTokens: tokens(usage.input_tokens),
-			outputTokens: tokens(usage.output_tokens),
-			cacheReadTokens: tokens(usage.cache_read_input_tokens),
-			cacheWriteTokens: tokens(usage.cache_creation_input_tokens),
-			cacheWrite5mTokens: write5m,
-			cacheWrite1hTokens: write1h,
+			inputTokens: tokens(usage.inputTokens),
+			outputTokens: tokens(usage.outputTokens),
+			cacheReadTokens: tokens(usage.cacheReadTokens),
+			cacheWriteTokens: tokens(usage.cacheWriteTokens),
+			cacheWrite5mTokens: usage.hasSplit ? usage.cacheWrite5mTokens : null,
+			cacheWrite1hTokens: usage.hasSplit ? usage.cacheWrite1hTokens : null,
 		},
 	};
+}
+
+/**
+ * The cut-over is fixed by the first attempt and kept in forecast_meta, so a
+ * rerun after an interruption stores exactly the buckets the first attempt
+ * would have. It only ever moves earlier: if the proxy has meanwhile recorded
+ * an earlier bucket, transcript rows stop before that one.
+ */
+async function resolveCutover(
+	deps: TranscriptBackfillDeps,
+): Promise<{ cutover: EpochMs; source: CutoverSource }> {
+	const earliest = await deps.earliestProxyBucket();
+	const fresh = bucketStart(earliest ?? deps.now());
+	const storedText = await deps.store.getMeta(
+		TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+	);
+	const stored = storedText === null ? Number.NaN : Number(storedText);
+	if (Number.isFinite(stored) && stored <= fresh) {
+		return { cutover: stored, source: "resumed" };
+	}
+	await deps.store.setMeta(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY, String(fresh));
+	return { cutover: fresh, source: earliest === null ? "now" : "proxy" };
 }
 
 class Slicer {
@@ -261,9 +276,7 @@ export async function runTranscriptBackfill(
 		return { status: "no_dir", ...counts };
 	}
 
-	const earliest = await deps.earliestProxyBucket();
-	const cutover = bucketStart(earliest ?? deps.now());
-	const cutoverSource = earliest === null ? "now" : "proxy";
+	const { cutover, source: cutoverSource } = await resolveCutover(deps);
 
 	const slicer = new Slicer(deps.sliceBudgetMs ?? DEFAULT_SLICE_BUDGET_MS);
 	const chunkBytes = Math.max(
@@ -279,17 +292,16 @@ export async function runTranscriptBackfill(
 			for await (const raw of fileLines(file, chunkBytes)) {
 				counts.lines++;
 				if (raw.indexOf(USAGE_NEEDLE) !== -1) {
-					let entry: unknown;
-					let parsed = true;
+					let scanned: ScannedLine | null = null;
 					try {
-						entry = JSON.parse(raw.toString("utf8"));
+						scanned = scanUsageLine(raw);
 					} catch {
-						parsed = false;
+						// MalformedLineError only; its message holds no line content.
 					}
-					if (!parsed) {
+					if (scanned === null) {
 						counts.malformed++;
 					} else {
-						const line = usageMetadata(entry);
+						const line = usageMetadata(scanned);
 						if (line === null) counts.skipped++;
 						else if (line.key === null) {
 							counts.unkeyed++;
@@ -322,30 +334,32 @@ export async function runTranscriptBackfill(
 	}
 
 	const buckets = new Map<EpochMs, StoredDemandRow>();
-	for (const response of [...responses.values(), ...unkeyed]) {
-		const start = bucketStart(response.at);
-		if (start >= cutover) {
-			counts.afterCutover++;
-			continue;
+	for (const group of [responses.values(), unkeyed.values()]) {
+		for (const response of group) {
+			await slicer.maybeYield();
+			const start = bucketStart(response.at);
+			if (start >= cutover) {
+				counts.afterCutover++;
+				continue;
+			}
+			counts.responses++;
+			let row = buckets.get(start);
+			if (row === undefined) {
+				row = {
+					start,
+					accountId: "",
+					source: "transcript",
+					units: 0,
+					fableUnits: 0,
+					requests: 0,
+				};
+				buckets.set(start, row);
+			}
+			const units = demandUnits(response.usage);
+			row.units += units;
+			if (isFableUsage(response.usage)) row.fableUnits += units;
+			row.requests++;
 		}
-		counts.responses++;
-		let row = buckets.get(start);
-		if (row === undefined) {
-			row = {
-				start,
-				accountId: "",
-				source: "transcript",
-				units: 0,
-				fableUnits: 0,
-				requests: 0,
-			};
-			buckets.set(start, row);
-		}
-		const units = demandUnits(response.usage);
-		row.units += units;
-		if (isFableUsage(response.usage)) row.fableUnits += units;
-		row.requests++;
-		await slicer.maybeYield();
 	}
 
 	// Rows replace by (start, accountId, source) and each holds its bucket's
