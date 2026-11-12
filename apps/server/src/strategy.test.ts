@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { Config } from "@better-ccflare/config";
+import { Config, FORECAST_NUMBER_SETTINGS } from "@better-ccflare/config";
 import { createConfigHandlers } from "@better-ccflare/http-api";
 import {
 	LeastUsedStrategy,
@@ -19,14 +19,27 @@ import {
 	sessionPaceSettings,
 } from "./strategy";
 
+const FORECAST_ENV_KEYS = [
+	"FORECAST_ENABLED",
+	"FORECAST_ROUTING",
+	"FORECAST_PREWARM",
+	"FORECAST_PREWARM_TEST",
+	"FORECAST_CLAUDE_PATH",
+	"FORECAST_PREWARM_MODEL",
+	"FORECAST_TRANSCRIPTS_DIR",
+	"FORECAST_FAN_LEVELS",
+	...FORECAST_NUMBER_SETTINGS.map((spec) => spec.env),
+];
+
 const ENV_KEYS = [
+	...FORECAST_ENV_KEYS,
 	"LB_STRATEGY",
 	"SESSION_PACE_WORK_DAYS",
 	"SESSION_PACE_FAMILY_GUARD_PCT",
 	"SESSION_PACE_FIVE_HOUR_GUARD_PCT",
 	"SESSION_PACE_TIE_BAND_PCT",
 	"SESSION_PACE_IDLE_MS",
-] as const;
+];
 
 // Neither zone is UTC (the zone `bun test` runs in) nor the machine's
 // Europe/Prague, so a value that leaks from the process zone shows up.
@@ -57,6 +70,35 @@ function setPaceEnv(values: {
 	process.env.SESSION_PACE_FIVE_HOUR_GUARD_PCT = values.fiveHourGuardPct;
 	process.env.SESSION_PACE_TIE_BAND_PCT = values.tieBandPct;
 	process.env.SESSION_PACE_IDLE_MS = values.idleMs;
+}
+
+/** The fields the forecast adds to the strategy response with nothing configured. */
+function defaultForecastFields() {
+	return {
+		forecastSettings: {
+			enabled: true,
+			routing: true,
+			prewarm: false,
+			prewarmTest: null,
+			claudePath: null,
+			prewarmModel: "haiku",
+			prewarmMaxPerDay: 4,
+			simulatedDays: 400,
+			timeShiftMin: 30,
+			transcriptsDir: join(homedir(), ".claude", "projects"),
+			fanLevels: Array.from({ length: 39 }, (_, i) => 12 + 2 * i).filter(
+				(p) => p !== 50,
+			),
+			minStopPoints: 1,
+			moveMinGainPoints: 2,
+			openMinGainPoints: 1,
+			historyHalfLifeDays: 14,
+			historyLookbackDays: 56,
+			recentTauMin: 45,
+			sessionTurnoverMin: 60,
+		},
+		forecast: { path: "/api/forecast", contractVersion: 1 },
+	};
 }
 
 async function strategyBody(
@@ -115,6 +157,7 @@ describe("GET /api/config/strategy sessionPace", () => {
 				idleMs: 1800000,
 				timeZone: "Pacific/Auckland",
 			},
+			...defaultForecastFields(),
 		});
 	});
 
@@ -219,6 +262,7 @@ describe("GET /api/config/strategy sessionPace", () => {
 				idleMs: 7200000,
 				timeZone: INSTANCE_ZONE,
 			},
+			...defaultForecastFields(),
 		});
 	});
 
@@ -250,6 +294,7 @@ describe("GET /api/config/strategy sessionPace", () => {
 				idleMs: 1800000,
 				timeZone: "America/Denver",
 			},
+			...defaultForecastFields(),
 		});
 	});
 
@@ -266,6 +311,7 @@ describe("GET /api/config/strategy sessionPace", () => {
 				idleMs: 3600000,
 				timeZone: START_ZONE,
 			},
+			...defaultForecastFields(),
 		});
 	});
 
@@ -320,7 +366,7 @@ describe("GET /api/config/strategy sessionPace", () => {
 		);
 	});
 
-	it("adds no keys beyond strategy, strategySource and the six sessionPace fields", async () => {
+	it("adds no keys beyond strategy, strategySource, the six sessionPace fields and the forecast fields", async () => {
 		for (const strategy of ["session-pace", "session"]) {
 			process.env.LB_STRATEGY = strategy;
 			const config = makeConfig();
@@ -332,6 +378,8 @@ describe("GET /api/config/strategy sessionPace", () => {
 			const body = await strategyBody(config, running);
 
 			expect(Object.keys(body).sort()).toEqual([
+				"forecast",
+				"forecastSettings",
 				"sessionPace",
 				"strategy",
 				"strategySource",
@@ -355,6 +403,113 @@ describe("GET /api/config/strategy sessionPace", () => {
 				expect(typeof sessionPace[key]).toBe("number");
 			}
 			expect(typeof sessionPace.timeZone).toBe("string");
+		}
+	});
+});
+
+describe("GET /api/config/strategy forecast fields", () => {
+	const FORECAST_SETTINGS_KEYS = [
+		"claudePath",
+		"enabled",
+		"fanLevels",
+		"historyHalfLifeDays",
+		"historyLookbackDays",
+		"minStopPoints",
+		"moveMinGainPoints",
+		"openMinGainPoints",
+		"prewarm",
+		"prewarmMaxPerDay",
+		"prewarmModel",
+		"prewarmTest",
+		"recentTauMin",
+		"routing",
+		"sessionTurnoverMin",
+		"simulatedDays",
+		"timeShiftMin",
+		"transcriptsDir",
+	];
+
+	it("has exactly these keys with the forecast on, and every existing field unchanged", async () => {
+		process.env.LB_STRATEGY = "session-pace";
+		const config = makeConfig();
+		const body = await strategyBody(config, null);
+		expect(Object.keys(body)).toEqual([
+			"strategy",
+			"strategySource",
+			"sessionPace",
+			"forecastSettings",
+			"forecast",
+		]);
+		expect(body.strategy).toBe("session-pace");
+		expect(body.strategySource).toBe("env");
+		expect(body.forecast).toEqual({
+			path: "/api/forecast",
+			contractVersion: 1,
+		});
+		expect(
+			Object.keys(body.forecastSettings as Record<string, unknown>).sort(),
+		).toEqual(FORECAST_SETTINGS_KEYS);
+		expect(body.forecastSettings).toEqual(
+			defaultForecastFields().forecastSettings,
+		);
+	});
+
+	it("has forecastSettings but no discovery field with the forecast off (environment)", async () => {
+		process.env.FORECAST_ENABLED = "false";
+		const config = makeConfig();
+		const body = await strategyBody(config, null);
+		expect(Object.keys(body)).toEqual([
+			"strategy",
+			"strategySource",
+			"sessionPace",
+			"forecastSettings",
+		]);
+		expect((body.forecastSettings as Record<string, unknown>).enabled).toBe(
+			false,
+		);
+		expect(
+			Object.keys(body.forecastSettings as Record<string, unknown>).sort(),
+		).toEqual(FORECAST_SETTINGS_KEYS);
+	});
+
+	it("reports the forecast off from the config file, and the environment wins over it", async () => {
+		const config = makeConfig({
+			forecast_enabled: false,
+			forecast_simulated_days: 800,
+			forecast_fan_levels: [90, 20, 20, 50, 80],
+		});
+		const off = await strategyBody(config, null);
+		expect("forecast" in off).toBe(false);
+		const settings = off.forecastSettings as Record<string, unknown>;
+		expect(settings.simulatedDays).toBe(800);
+		expect(settings.fanLevels).toEqual([20, 80]);
+
+		process.env.FORECAST_ENABLED = "true";
+		process.env.FORECAST_SIMULATED_DAYS = "9";
+		const on = await strategyBody(config, null);
+		expect(on.forecast).toEqual({ path: "/api/forecast", contractVersion: 1 });
+		expect((on.forecastSettings as Record<string, unknown>).simulatedDays).toBe(
+			50,
+		);
+	});
+
+	it("warns once per distinct invalid forecast value however often the endpoint is polled", async () => {
+		const warn = spyOn(Logger.prototype, "warn");
+		try {
+			const config = makeConfig();
+			process.env.FORECAST_PREWARM = "sometimes";
+			for (let i = 0; i < 5; i++) {
+				const body = await strategyBody(config, null);
+				expect((body.forecastSettings as Record<string, unknown>).prewarm).toBe(
+					false,
+				);
+			}
+			const warnings = warn.mock.calls.filter(([message]) =>
+				String(message).includes("FORECAST_PREWARM"),
+			);
+			expect(warnings).toHaveLength(1);
+		} finally {
+			warn.mockRestore();
 		}
 	});
 });

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname } from "node:path";
 import {
 	DEFAULT_AGENT_MODEL,
@@ -15,8 +16,13 @@ import {
 	validateNumber,
 	validateString,
 } from "@better-ccflare/core";
+import type { ForecastSettings } from "@better-ccflare/forecast";
 import { Logger } from "@better-ccflare/logger";
 import { validatePathOrThrow } from "@better-ccflare/security";
+import {
+	type ForecastConfigData,
+	resolveForecastSettings,
+} from "./forecast-settings";
 import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
@@ -316,6 +322,7 @@ export class Config extends EventEmitter {
 	// Invalid work-days values already warned about, so a value polled again
 	// (or switched back to) is not logged twice.
 	private readonly workDaysWarnings = new Set<string>();
+	private readonly forecastWarnings = new Set<string>();
 
 	constructor(configPath?: string) {
 		super();
@@ -710,6 +717,26 @@ export class Config extends EventEmitter {
 			);
 		}
 		return 5;
+	}
+
+	/**
+	 * Forecast settings: environment variable over config file over default,
+	 * numbers clamped to their range, an invalid value replaced by the default
+	 * with one warning per distinct input. See docs/configuration.md.
+	 */
+	getForecastSettings(): ForecastSettings {
+		return resolveForecastSettings({
+			env: process.env,
+			// JSON from disk: the resolver checks every value it reads.
+			file: this.data as ForecastConfigData,
+			home: homedir(),
+			warn: (source, raw, expected, using) => {
+				const warning = `${source}=${JSON.stringify(raw)}`;
+				if (this.forecastWarnings.has(warning)) return;
+				this.forecastWarnings.add(warning);
+				log.warn(`Invalid ${warning}: expected ${expected}; using ${using}`);
+			},
+		});
 	}
 
 	setUsagePollIntervalMs(ms: number): void {
@@ -1711,5 +1738,12 @@ export class Config extends EventEmitter {
 
 // Re-export types
 export type { StrategyName } from "@better-ccflare/core";
+export {
+	DEFAULT_PREWARM_MODEL,
+	DEFAULT_TRANSCRIPTS_DIR,
+	FORECAST_NUMBER_SETTINGS,
+	type ForecastConfigData,
+	resolveForecastSettings,
+} from "./forecast-settings";
 export { resolveConfigPath } from "./paths";
 export { getLegacyConfigDir, getPlatformConfigDir } from "./paths-common";

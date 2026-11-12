@@ -1,0 +1,15 @@
+{
+	"contractVersion": 1,
+	"computedAt": 1794486000000,
+	"available": false,
+	"reason": "insufficient_history",
+	"accounts": [],
+	"levels": {
+		"light": 10,
+		"typical": 50,
+		"heavy": 90
+	},
+	"day": null,
+	"week": null,
+	"fable": {}
+}

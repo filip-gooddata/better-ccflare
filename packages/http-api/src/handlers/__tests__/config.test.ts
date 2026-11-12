@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { Config } from "@better-ccflare/config";
+import { Config, resolveForecastSettings } from "@better-ccflare/config";
 import { TIME_CONSTANTS } from "@better-ccflare/core";
 import type { APIContext, SessionPaceSettings } from "@better-ccflare/types";
 import { createConfigHandlers } from "../config";
@@ -30,8 +30,35 @@ function makeCatalog(
 	};
 }
 
+function defaultForecastSettings() {
+	return resolveForecastSettings({
+		env: {},
+		file: {},
+		home: "/home/tester",
+		warn: () => {},
+	});
+}
+
+/** The strategy response fields the forecast adds with nothing configured. */
+function defaultForecastFields() {
+	return {
+		forecastSettings: realDefaultForecastSettings(),
+		forecast: { path: "/api/forecast", contractVersion: 1 },
+	};
+}
+
+function realDefaultForecastSettings() {
+	return resolveForecastSettings({
+		env: process.env,
+		file: {},
+		home: homedir(),
+		warn: () => {},
+	});
+}
+
 function makeConfig() {
 	return {
+		getForecastSettings: () => defaultForecastSettings(),
 		getAllSettings: () => ({
 			lb_strategy: "session",
 			port: 8080,
@@ -421,6 +448,7 @@ describe("strategy source (real config)", () => {
 			strategy: "session",
 			strategySource: "file",
 			sessionPace: paceSettings(),
+			...defaultForecastFields(),
 		});
 	});
 
@@ -445,6 +473,7 @@ describe("strategy source (real config)", () => {
 			strategy: "session-drain-soonest",
 			strategySource: "file",
 			sessionPace: paceSettings(),
+			...defaultForecastFields(),
 		});
 	});
 
@@ -460,6 +489,7 @@ describe("strategy source (real config)", () => {
 			strategy: "least-used",
 			strategySource: "env",
 			sessionPace: paceSettings(),
+			...defaultForecastFields(),
 		});
 	});
 
@@ -484,6 +514,7 @@ describe("strategy source (real config)", () => {
 			strategy: "least-used",
 			strategySource: "env",
 			sessionPace: paceSettings(),
+			...defaultForecastFields(),
 		});
 	});
 });
