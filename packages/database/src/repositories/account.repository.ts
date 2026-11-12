@@ -346,11 +346,14 @@ export class AccountRepository extends BaseRepository<Account> {
 			// write and may only be extended, never shortened. The stamp is the
 			// observation time, not this write's execution time: queued writes
 			// may run out of order, and the newer observation must still win.
+			// An accepted extension keeps a newer stored stamp.
 			const changes = await this.runWithChanges(
 				`UPDATE accounts
            SET rate_limited_until      = ?,
                rate_limited_reason     = ?,
-               rate_limited_at         = ?,
+               rate_limited_at         = CASE
+                 WHEN rate_limited_at IS NOT NULL AND rate_limited_at > ?
+                 THEN rate_limited_at ELSE ? END,
                rate_limit_status       = NULL,
                rate_limit_reset        = NULL,
                rate_limit_reset_at     = NULL
@@ -362,6 +365,7 @@ export class AccountRepository extends BaseRepository<Account> {
 				[
 					until,
 					reason,
+					options.authoritativeObservedAt,
 					options.authoritativeObservedAt,
 					accountId,
 					until,

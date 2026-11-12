@@ -690,6 +690,9 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 		meta: RequestMeta,
 	): Account | null {
 		if (blocked.length === 0) return null;
+		// An earlier select() for this request may have recorded it; the rule
+		// must not let the served response rebind the session.
+		this.routed.delete(meta);
 		const ranked = blocked
 			.map((b) => ({ ...b, usableAt: usableAgainAt(b.limits) }))
 			.sort(

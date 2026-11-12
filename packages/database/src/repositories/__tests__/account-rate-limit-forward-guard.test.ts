@@ -491,6 +491,38 @@ describe("AccountRepository.markAccountRateLimited — authoritative replace mod
 		expect(result.applied).toBe(true);
 		expect(row("acc-1").rate_limited_until).toBe(until);
 	});
+
+	it("keeps the newest observation stamp when a stale write extends the cooldown", async () => {
+		const now = Date.now();
+		seed("acc-1", now + 9_000, now + 3_000, 2);
+
+		const extend = await repo.markAccountRateLimited(
+			"acc-1",
+			now + 10_000,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: now + 1_000 },
+		);
+		expect(extend.applied).toBe(true);
+		expect(row("acc-1").rate_limited_until).toBe(now + 10_000);
+		expect(
+			(
+				db
+					.query("SELECT rate_limited_at FROM accounts WHERE id = ?")
+					.get("acc-1") as { rate_limited_at: number }
+			).rate_limited_at,
+		).toBe(now + 3_000);
+
+		const shorten = await repo.markAccountRateLimited(
+			"acc-1",
+			now + 8_000,
+			"upstream_429_with_reset",
+			false,
+			{ authoritativeObservedAt: now + 2_000 },
+		);
+		expect(shorten.applied).toBe(false);
+		expect(row("acc-1").rate_limited_until).toBe(now + 10_000);
+	});
 });
 
 describe("AccountRepository.markAccountRateLimited — authoritative reset ordering", () => {

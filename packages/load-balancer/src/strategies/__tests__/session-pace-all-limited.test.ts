@@ -225,6 +225,22 @@ describe("SessionPaceStrategy.selectWhenAllLimited", () => {
 		expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
 	});
 
+	it("does not rebind the session when the rule-routed account serves the request", () => {
+		expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+		// The normal pass ran for this request (family filter emptied it later),
+		// then the rule sent it to b, which answered 200.
+		const m = meta("s1");
+		expect(strategy.select([a, b], m)[0].id).toBe("a");
+		expect(
+			strategy.selectWhenAllLimited(
+				[blocked(a, family(3)), blocked(b, family(1))],
+				m,
+			)?.id,
+		).toBe("b");
+		strategy.onRequestServed(m, b, 200);
+		expect(strategy.select([a, b], meta("s1"))[0].id).toBe("a");
+	});
+
 	it("logs one placement line naming the rule, reason and every candidate", () => {
 		const lines = captureLog(strategy);
 		strategy.selectWhenAllLimited(
