@@ -245,43 +245,28 @@ function unitsBetween(f: EngineFixture, from: EpochMs, to: EpochMs): number {
 // ── the 2026-11-12 shape (research 17) ──────────────────────────────────
 
 /**
- * Units per local hour of the 2026-11-12 day at K_FIVE_HOUR = 2: 60 points 08–11, 100 points
- * 11:00–13:17 (one window), 100 points 13:10–14:55 (the other), demand on through the stop,
- * 30 points 16:00–16:30, tailing off by 20:00.
+ * Units per local hour of the 2026-11-12 day at K_FIVE_HOUR = 2, from the trace only: 60 points
+ * 08–11 (acct-a's window that resets at 11:00), about 100 points 11:00–13:17 (acct-a full),
+ * about 100 points 13:10–14:55 (acct-b full), little demand while both are out (15 refused
+ * requests in the 15:00 hour), 30 points 16:00–16:30, tailing off in the evening.
  */
 export const DAY_2026_11_12 = [
-	0, 0, 0, 0, 0, 0, 0.5, 0.5, 10, 10, 10, 22, 22, 26, 30, 25, 30, 20, 20, 3, 0,
-	0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0.5, 0.5, 10, 10, 10, 22, 22, 26, 30, 4, 20, 8, 3, 1, 0, 0,
+	0, 0,
 ];
 
 /** Recorded days scale the 2026-11-12 shape by a fixed per-day factor (spread for the bandwidth). */
 const REPLAY_SCALES = [
-	0.8, 1.05, 0.9, 1.15, 1, 0.85, 1.2, 0.95, 1.1, 0.9, 1.05, 1,
+	0.92, 1.02, 0.96, 1.06, 1, 0.94, 1.08, 0.98, 1.04, 0.95, 1.03, 1,
 ];
 
-/**
- * Scaled shape: recorded days at this share of the 2026-11-12 shape, heavy days two accounts can still carry
- * when acct-b's window opens early, which on-demand opening cannot (the acceptance case).
- */
-export const REPLAY_DEMAND_SCALE = 0.6;
-/**
- * Stop-time analogue: at this share the on-demand heavy line stops 14:54 to 16:00 like the trace
- * (the accounts' opening and full times are not matched); heavy days then
- * exceed what both accounts serve in a day whatever the plan.
- */
-export const TRACE_DEMAND_SCALE = 0.8;
-
-export function replayHourly(demandScale: number): HourlyShape {
-	return (key, isoWeekday) => {
-		if (isoWeekday > 5)
-			return DAY_2026_11_12.map((u) => u * demandScale * 0.02);
-		const day = Number(key.slice(8, 10)) + 31 * Number(key.slice(5, 7));
-		const scale = REPLAY_SCALES[day % REPLAY_SCALES.length] ?? 1;
-		return DAY_2026_11_12.map(
-			(u) => u * demandScale * scale * (isoWeekday === 1 ? 0.7 : 1),
-		);
-	};
-}
+/** Work days like 2026-11-12 (Mondays at 0.7), weekends nearly idle. */
+export const replayHourly: HourlyShape = (key, isoWeekday) => {
+	if (isoWeekday > 5) return DAY_2026_11_12.map((u) => u * 0.02);
+	const day = Number(key.slice(8, 10)) + 31 * Number(key.slice(5, 7));
+	const scale = REPLAY_SCALES[day % REPLAY_SCALES.length] ?? 1;
+	return DAY_2026_11_12.map((u) => u * scale * (isoWeekday === 1 ? 0.7 : 1));
+};
 
 /**
  * Morning of 2026-11-12, 07:00: acct-a's window opened at about 06:07 and resets at 11:00
@@ -293,7 +278,7 @@ export function replayFixture(
 	return {
 		now: prague(12, 7),
 		historyDays: 28,
-		hourly: replayHourly(REPLAY_DEMAND_SCALE),
+		hourly: replayHourly,
 		weeklyReset: { a: prague(15, 15), b: prague(17, 3) },
 		fiveHour: {
 			a: { usedPct: 0, resetsAt: prague(12, 11) },
