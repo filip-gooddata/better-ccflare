@@ -4,10 +4,13 @@
  * clock, the timers, the demand store, the usage readings, the limits, the session tracker and the
  * pre-warm runner. No network and no `claude` CLI.
  *
- * At 07:00 the plan opens acct-b at 10:00 by routing; until then new sessions follow the base order.
- * The service computes again at 10:00 with acct-a's window at 47 % (the record has it at 0 % at
- * 06:12 and 60 % at 10:58; 47 % is the straight line between them at 10:00): new sessions then go
- * to acct-b with rule `forecast-open`, and the runner is never called.
+ * At 07:00 the plan holds acct-b closed until 08:00 (amendment 5, E3: S +59.9 against +13.8 when it
+ * opens at once); until then new sessions follow the base order. The record has acct-a's window at
+ * 0 % at 06:12 and 60 % at 10:58; the fixture puts it on the straight line between them. At 08:00
+ * (23 %) the planner, searching again from 08:00, holds acct-b once more, to 08:30 (S +77.7 against
+ * +60.1 opening at once; 08:30 was not on the 07:00 grid of 0, 30, 60, 120 … minutes ahead). At
+ * 08:30 (29 %) holding no longer gains the gate, so new sessions go to the idle acct-b with rule
+ * `forecast-open`. The runner is never called.
  */
 import { afterAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -33,7 +36,10 @@ import type {
 import { createForecastService, type ForecastService } from "../service";
 
 const POLL_MS = 90_000;
-const OPEN_AT = prague(12, 10);
+// amendment 5 (E1 to E3): the plan computed at 07:00 holds acct-b until 08:00 (10:00 before)
+const OPEN_AT = prague(12, 8);
+// the plan computed at 08:00 holds it until 08:30
+const REHOLD_AT = prague(12, 8, 30);
 
 const dirs: string[] = [];
 const dbs: DatabaseOperations[] = [];
@@ -153,18 +159,19 @@ function world() {
 }
 
 describe("forecast service with the real engine on the 2026-11-12 replay, pre-warm off", () => {
-	it("routes new sessions to acct-b from the planned opening at 10:00 and never pre-warms", async () => {
+	it("holds acct-b until 08:00, then until 08:30, then routes new sessions to it, and never pre-warms", async () => {
 		const w = world();
 		expect(w.current.input.settings.prewarm).toBe(false);
 		expect(w.current.input.settings.routing).toBe(true);
 
-		// 07:00, before the planned opening.
+		// 07:00, while the plan holds acct-b closed.
 		await w.computeAt(prague(12, 7));
 		const early = w.service.forecastView();
 		expect(early?.plan?.openAt).toEqual({ "acct-b": OPEN_AT });
 		const before = w.service.advisor.placeNewSession(w.clock.at);
 		expect(before?.rule).toBe("forecast-lookahead");
-		expect(before?.reason).toBe("reset-soon");
+		// "reset-soon" before amendment 5: the hold gains S 46.1 over opening acct-b at once
+		expect(before?.reason).toBe("low-point+46.1");
 		expect(before?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 		const morning = w.service.provider();
 		expect(morning.available).toBe(true);
@@ -175,12 +182,23 @@ describe("forecast service with the real engine on the 2026-11-12 replay, pre-wa
 		});
 		expect(validateForecastResponse(morning)).toEqual([]);
 
-		// 10:00, the planned opening time has come.
-		await w.computeAt(OPEN_AT, { usedPct: 47, resetsAt: prague(12, 11) });
+		// 08:00, the first hold ends; the plan computed now holds acct-b until 08:30.
+		await w.computeAt(OPEN_AT, { usedPct: 23, resetsAt: prague(12, 11) });
+		expect(w.service.forecastView()?.plan?.openAt).toEqual({
+			"acct-b": REHOLD_AT,
+		});
+		const held = w.service.advisor.placeNewSession(w.clock.at);
+		expect(held?.rule).toBe("forecast-lookahead");
+		expect(held?.reason).toBe("low-point+17.6");
+		expect(held?.tiers).toEqual([["acct-a"], ["acct-b"]]);
+
+		// 08:30, no hold gains the gate: the idle acct-b heads the tiers (amendment 5, E1).
+		await w.computeAt(REHOLD_AT, { usedPct: 29, resetsAt: prague(12, 11) });
+		expect(w.service.forecastView()?.plan?.openAt).toEqual({ "acct-b": null });
 		const due = w.service.advisor.placeNewSession(w.clock.at);
 		expect(due?.rule).toBe("forecast-open");
-		expect(due?.tiers[0]).toEqual(["acct-b"]);
-		expect(due?.reason).toMatch(/^\S+$/);
+		expect(due?.tiers).toEqual([["acct-b"], ["acct-a"]]);
+		expect(due?.reason).toBe("no-preference");
 		const later = w.service.provider();
 		expect(later.prewarm?.enabled).toBe(false);
 		expect(validateForecastResponse(later)).toEqual([]);

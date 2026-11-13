@@ -3,25 +3,20 @@
  * 0 % at 06:12 to 60 % at 10:58; its 11:00–16:00 window was full at 13:17:41; acct-b opened at
  * about 13:10 and was refused at 14:54:46; both out until 16:00. Morning state 07:00: acct-a's
  * window open (resets 11:00), acct-b closed. Recorded days are that day's shape within ±8 %
- * (fixtures-engine.ts). The heavy (p90) day is heavier than the recorded one, so the heavy 5-hour
- * low point is 0 under every plan (amendment 2, B5). The assertions state what the engine
- * achieves on this day, measured, not a wanted number.
+ * (fixtures-engine.ts).
+ *
+ * Amendment 5: the simulation sends new demand to the idle account first (E1), so on demand acct-b
+ * opens at 07:00; the planner scores the unfloored heavy low point S (E2) and may hold an idle
+ * account closed when S gains at least openMinGainPoints (E3). The assertions state what the engine
+ * achieves on this day, measured, not a wanted number. The sandbox prototype
+ * (line-options-2) gave the same values: S +13.8 on demand, +59.9 holding acct-b to 08:00, −3.3
+ * for the old 10:00 opening, reason low-point+46.1.
  */
 import { describe, expect, test } from "bun:test";
-import type {
-	EpochMs,
-	ForecastBlock,
-	ForecastInput,
-	Interval,
-} from "../../types";
+import type { EpochMs, ForecastBlock, ForecastInput } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { EngineContext, SimulationResult } from "../model";
-import {
-	compareScores,
-	openingEarns,
-	planForecast,
-	scorePlan,
-} from "../planner";
+import { planForecast } from "../planner";
 import { buildResponse } from "../response";
 import { onDemandPlan, simulate } from "../simulate";
 import {
@@ -32,17 +27,9 @@ import {
 } from "./fixtures-engine";
 
 const MIN = 60_000;
-// The median simulated day's first 5-hour fills must land within these of the recorded ones
-// (research 17): a simulated median, not a claim of exact replay. acct-a's median fill is 13:25.
-// The recorded day lies on the heavy side of its pool: the heavy line puts acct-b's stop at 14:53,
-// two minutes before the recorded 14:55 refusal (BASELINE_STOP), while the median day fills acct-b
-// at 15:18. Day factor (amendment 4): at 07:00 the pool's mean day has 3.0 of its 182 units behind
-// it (w = M ÷ c = 0.067), so today's factor is 0.9997 where the unweighted rule gave 0.9956; the
-// slightly heavier day moved the heavy stop from 14:55 to 14:53, the typical stop from 15:20 to
-// 15:16 and left two short heavy-line stops under the 10:00 opening (14:53–15:00, 18:10–18:20)
-// that the planner's score does not count (its stop minutes stay 0 against 60 on demand).
-const TRACE_TOLERANCE_A_MS = 15 * MIN;
-const TRACE_TOLERANCE_B_MS = 30 * MIN;
+const FIVE_HOURS = 5 * 60 * MIN;
+// Each test simulates 400 days, some several plans; the default 5 s is short under a loaded full suite.
+const REPLAY_TIMEOUT_MS = 60_000;
 
 async function contextOf(input: ForecastInput): Promise<EngineContext> {
 	const ctx = await prepareEngineContext(input, { noise: true });
@@ -51,174 +38,246 @@ async function contextOf(input: ForecastInput): Promise<EngineContext> {
 	return ctx;
 }
 
-/** Lowest point of the heavy line over the day block. */
-function heavyLow(block: ForecastBlock): number {
-	return Math.min(...block.heavy);
+/** acct-b's first opening on every simulated day. */
+function firstOpensOfB(sim: SimulationResult): EpochMs[] {
+	return sim.traces.map(
+		(t) => t.opens.find((o) => o.account === 1)?.at ?? Number.NaN,
+	);
 }
 
-function stops(block: ForecastBlock): Interval[] {
-	return block.stops.heavy;
+/**
+ * Reset instants shared by every simulated day: acct-a's morning reset at 11:00 and five hours after
+ * each opening.
+ */
+function commonResets(sim: SimulationResult): Set<EpochMs> {
+	const perDay = sim.traces.map(
+		(t) => new Set([prague(12, 11), ...t.opens.map((o) => o.at + FIVE_HOURS)]),
+	);
+	return new Set([...perDay[0]].filter((at) => perDay.every((s) => s.has(at))));
 }
 
-/** Median over the simulated days of the account's first 5-hour fill. */
-function medianFirstFull(sim: SimulationResult, account: number): EpochMs {
-	const at = sim.traces
-		.map(
-			(t) =>
-				t.outs.find((o) => o.account === account && o.limit === "five_hour")
-					?.at,
-		)
-		.filter((x): x is EpochMs => x !== undefined)
-		.sort((a, b) => a - b);
-	expect(at).toHaveLength(sim.traces.length);
-	return at[Math.floor(at.length / 2)] ?? Number.NaN;
+/** Samples where the typical 5-hour line rises, each with the interval it rises over. */
+function typicalRises(block: ForecastBlock): { from: EpochMs; to: EpochMs }[] {
+	const rises: { from: EpochMs; to: EpochMs }[] = [];
+	for (let i = 1; i < block.typical.length; i++)
+		if (block.typical[i] > block.typical[i - 1] + 1e-9)
+			rises.push({ from: block.times[i - 1], to: block.times[i] });
+	return rises;
 }
 
-// on demand: the recorded stop (refused 14:54:46, reset 16:00) on the heavy line (14:55 before amendment 4)
-const BASELINE_STOP = { start: prague(12, 14, 53), end: prague(12, 16) };
-// routing every new session to acct-b from 07:00 (no planned opening): one shorter, later stop (16:14 before)
-const ROUTED_STOP = { start: prague(12, 16, 13), end: prague(12, 17) };
-// the typical (p50) line: the recorded day itself had a stop (15:20 before)
-const TYPICAL_BASELINE_STOP = {
-	start: prague(12, 15, 16),
-	end: prague(12, 16),
-};
-// the heavy line under the 10:00 opening (none before amendment 4); the planner's score counts 0 minutes
-const PLANNED_HEAVY_STOPS = [
-	{ start: prague(12, 14, 53), end: prague(12, 15) },
-	{ start: prague(12, 18, 10), end: prague(12, 18, 20) },
-];
+const openAtOf = (at: EpochMs | null) => [null, at];
 
 describe("2026-11-12 replay through compute()", () => {
-	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:53–16:00, typical stop 15:16–16:00", async () => {
-		const ctx = await contextOf(buildInput(replayFixture()));
-		const { baseline } = await planForecast(ctx);
-		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
+	test(
+		"on demand the idle acct-b opens at 07:00 on every simulated day (amendment 5, E1); S +13.8, no stop",
+		async () => {
+			const ctx = await contextOf(buildInput(replayFixture()));
+			const { baseline } = await planForecast(ctx);
+			const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
 
-		const fullA = medianFirstFull(baseline.result, 0);
-		const fullB = medianFirstFull(baseline.result, 1);
-		expect(Math.abs(fullA - prague(12, 13, 17))).toBeLessThanOrEqual(
-			TRACE_TOLERANCE_A_MS,
-		);
-		expect(Math.abs(fullB - prague(12, 14, 55))).toBeLessThanOrEqual(
-			TRACE_TOLERANCE_B_MS,
-		);
-		expect(heavyLow(base)).toBe(0);
-		expect(stops(base)).toEqual([BASELINE_STOP]);
-		expect(baseline.score.stopMinutes).toBe(60);
-		expect(baseline.score.weekLowPoints).toBeCloseTo(84.31, 1);
-		expect(Math.min(...base.typical)).toBe(0);
-		expect(base.stops.typical).toEqual([TYPICAL_BASELINE_STOP]);
-	});
+			const opens = firstOpensOfB(baseline.result);
+			expect(opens).toHaveLength(400);
+			for (const at of opens) expect(at).toBe(prague(12, 7));
+			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
+			expect(baseline.score.dayLowPoints).toBeCloseTo(13.77, 1);
+			expect(baseline.score.weekLowPoints).toBeCloseTo(80.6, 1);
+			expect(base.stops.heavy).toEqual([]);
+			expect(base.stops.typical).toEqual([]);
+			expect(Math.min(...base.heavy)).toBeCloseTo(13.8, 1);
+			expect(Math.min(...base.typical)).toBeCloseTo(27.7, 1);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 
-	test("pre-warm off: the plan routes new sessions to acct-b from 10:00 (design 4.5); its window opens through the first demand at 10:00; no typical stop and no scored heavy stop is left, as with pre-warm", async () => {
-		const input = buildInput(replayFixture());
-		const result = await createForecastEngine().compute(input);
-		if (!result.available) throw new Error(result.reason);
-		const day = result.response.day as ForecastBlock;
+	test(
+		"pre-warm off: the plan holds acct-b closed until 08:00 (E3), S +59.9 against +13.8 on demand; no stop is left",
+		async () => {
+			const input = buildInput(replayFixture());
+			const result = await createForecastEngine().compute(input);
+			if (!result.available) throw new Error(result.reason);
+			const day = result.response.day as ForecastBlock;
 
-		const ctx = await contextOf(input);
-		const { baseline, score, plan, result: sim } = await planForecast(ctx);
-		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
+			const ctx = await contextOf(input);
+			const {
+				baseline,
+				score,
+				plan,
+				result: sim,
+				scored,
+			} = await planForecast(ctx);
 
-		expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 10) });
-		// Before 10:00 new sessions follow the base order (acct-a resets first); from 10:00 the next
-		// computation advises forecast-open for acct-b until its window is open.
-		expect(result.plan.placement?.rule).toBe("forecast-lookahead");
-		expect(result.plan.placement?.reason).toBe("reset-soon");
-		expect(result.plan.placement?.tiers).toEqual([["acct-a"], ["acct-b"]]);
-		expect(plan.placement).toEqual(result.plan.placement);
-		// every simulated day opens acct-b at 10:00 through demand, once
-		for (const trace of sim.traces)
-			expect(trace.opens.filter((o) => o.account === 1)[0]?.at).toBe(
-				prague(12, 10),
+			expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 8) });
+			expect(plan.openAt).toEqual(result.plan.openAt);
+			// acct-a first (it resets first); acct-b is held behind it until 08:00
+			expect(result.plan.placement).toEqual({
+				tiers: [["acct-a"], ["acct-b"]],
+				rule: "forecast-lookahead",
+				reason: "low-point+46.1",
+			});
+			expect(plan.placement).toEqual(result.plan.placement);
+			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8));
+			expect(score.lowPoint).toBeCloseTo(59.88, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
+			expect(score.lowPoint - baseline.score.lowPoint).toBeCloseTo(46.1, 1);
+			expect(day.stops.heavy).toEqual([]);
+			expect(day.stops.typical).toEqual([]);
+			expect(Math.min(...day.typical)).toBeCloseTo(72.9, 1);
+
+			// Every opening time searched, the baseline first. Opening at 07:00 is on demand itself; the
+			// old 10:00 opening now scores −3.3 (its heavy stops count below zero).
+			expect(scored[0].plan).toEqual(onDemandPlan(ctx));
+			const sOf = (at: EpochMs) =>
+				scored.find(
+					(s) =>
+						s.plan.preferred === null &&
+						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
+				)?.score.lowPoint;
+			expect(sOf(prague(12, 7))).toBeCloseTo(13.77, 1);
+			expect(sOf(prague(12, 7, 30))).toBeCloseTo(37.29, 1);
+			expect(sOf(prague(12, 8))).toBeCloseTo(59.88, 1);
+			expect(sOf(prague(12, 9))).toBeCloseTo(52.69, 1);
+			expect(sOf(prague(12, 10))).toBeCloseTo(-3.27, 1);
+			expect(sOf(prague(12, 11))).toBeCloseTo(-24.99, 1);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
+
+	test(
+		"the gate: with openMinGainPoints above the 46.1 gain the hold is not taken; at 46 it is",
+		async () => {
+			const above = await createForecastEngine().compute(
+				buildInput(
+					replayFixture({
+						settings: defaultSettings({ openMinGainPoints: 47 }),
+					}),
+				),
 			);
-		expect(heavyLow(day)).toBe(0);
-		expect(heavyLow(base)).toBe(0);
-		expect(stops(day)).toEqual(PLANNED_HEAVY_STOPS);
-		expect(stops(base)).toEqual([BASELINE_STOP]);
-		expect(score.stopMinutes).toBe(0);
-		expect(baseline.score.stopMinutes).toBe(60);
-		expect(score.weekLowPoints).toBeCloseTo(82.15, 1);
-		expect(day.stops.typical).toEqual([]);
-		// 9.0 before amendment 4
-		expect(Math.min(...day.typical)).toBeCloseTo(8.3, 1);
-	});
+			if (!above.available) throw new Error(above.reason);
+			expect(above.plan.openAt).toEqual({ "acct-b": null });
+			const ctx = await contextOf(
+				buildInput(
+					replayFixture({
+						settings: defaultSettings({ openMinGainPoints: 47 }),
+					}),
+				),
+			);
+			const { score, baseline } = await planForecast(ctx);
+			expect(score.lowPoint).toBe(baseline.score.lowPoint);
 
-	test("pre-warm off, why 10:00 and not all new sessions to acct-b from 07:00: that preference leaves a 40-minute heavy stop (16:13–17:00), the 10:00 routing-opening none", async () => {
-		const ctx = await contextOf(buildInput(replayFixture()));
-		const base = onDemandPlan(ctx);
-		const preferSim = await simulate(ctx, { ...base, preferred: 1 });
-		const preferB = scorePlan(ctx, preferSim);
-		const open10 = scorePlan(
-			ctx,
-			await simulate(ctx, { ...base, openAt: [null, prague(12, 10)] }),
-		);
-		expect(stops(buildResponse(ctx, preferSim).day as ForecastBlock)).toEqual([
-			ROUTED_STOP,
-		]);
-		expect(preferB.stopMinutes).toBe(40);
-		expect(open10.stopMinutes).toBe(0);
-		expect(compareScores(open10, preferB)).toBeLessThan(0);
-	});
+			const at46 = await createForecastEngine().compute(
+				buildInput(
+					replayFixture({
+						settings: defaultSettings({ openMinGainPoints: 46 }),
+					}),
+				),
+			);
+			if (!at46.available) throw new Error(at46.reason);
+			expect(at46.plan.openAt).toEqual({ "acct-b": prague(12, 8) });
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 
-	test("pre-warm on: the planner opens acct-b at 10:00 ahead of demand; no typical stop and no scored heavy stop is left and the heavy low point is not lower than on demand", async () => {
-		const input = buildInput(
-			replayFixture({ settings: defaultSettings({ prewarm: true }) }),
-		);
-		const result = await createForecastEngine().compute(input);
-		if (!result.available) throw new Error(result.reason);
-		const day = result.response.day as ForecastBlock;
+	test(
+		"the typical line rises only at reset instants shared by every simulated day, on demand and under the plan",
+		async () => {
+			const ctx = await contextOf(buildInput(replayFixture()));
+			const { baseline, result } = await planForecast(ctx);
+			for (const sim of [baseline.result, result]) {
+				const block = buildResponse(ctx, sim).day as ForecastBlock;
+				const resets = [...commonResets(sim)];
+				const rises = typicalRises(block);
+				expect(rises.length).toBeGreaterThan(0);
+				for (const { from, to } of rises)
+					expect(
+						resets.some(
+							(r) => (r > from && r <= to) || (from === to && r === to),
+						),
+					).toBe(true);
+			}
+			// under the plan: acct-a at 11:00, 16:00, 21:00; acct-b at 13:00, 18:00, 23:00
+			const planResets = commonResets(result);
+			for (const [h, m] of [
+				[11, 0],
+				[13, 0],
+				[16, 0],
+				[18, 0],
+				[21, 0],
+				[23, 0],
+			])
+				expect(planResets.has(prague(12, h, m))).toBe(true);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 
-		const ctx = await contextOf(input);
-		const { baseline, score } = await planForecast(ctx);
-		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
+	test(
+		"determinism: the same input gives the same result twice",
+		async () => {
+			const input = buildInput(replayFixture());
+			const a = await createForecastEngine().compute(input);
+			const b = await createForecastEngine().compute(input);
+			expect(JSON.stringify(b)).toBe(JSON.stringify(a));
+			const ctx = await contextOf(input);
+			const plan = onDemandPlan(ctx);
+			expect(await simulate(ctx, plan)).toEqual(await simulate(ctx, plan));
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 
-		expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 10) });
-		expect(result.plan.placement?.rule).toBe("forecast-lookahead");
-		expect(result.plan.placement?.reason).toBe("reset-soon");
-		expect(result.plan.placement?.tiers).toEqual([["acct-a"], ["acct-b"]]);
-		expect(stops(day)).toEqual(PLANNED_HEAVY_STOPS);
-		expect(score.stopMinutes).toBe(0);
-		expect(score.stopMinutes).toBeLessThan(baseline.score.stopMinutes);
-		expect(heavyLow(day)).toBeGreaterThanOrEqual(heavyLow(base));
-		expect(day.stops.typical).toEqual([]);
-		expect(Math.min(...day.typical)).toBeGreaterThan(0);
-	});
-
-	test("pre-warm on, why: the 10:00 opening earns by rule B3(b): item 1 ties at 0 and the heavy stop falls 60 → 0 minutes, although the heavy weekly low point falls 84.31 → 82.15", async () => {
-		const ctx = await contextOf(
-			buildInput(
+	test(
+		"pre-warm on: the same plan as pre-warm off (hold acct-b to 08:00, S +59.9); the extra pre-warm openings do not win",
+		async () => {
+			const input = buildInput(
 				replayFixture({ settings: defaultSettings({ prewarm: true }) }),
-			),
-		);
-		const base = onDemandPlan(ctx);
-		const baseScore = scorePlan(ctx, await simulate(ctx, base));
-		const open10 = scorePlan(
-			ctx,
-			await simulate(ctx, { ...base, openAt: [null, prague(12, 10)] }),
-		);
-		expect(baseScore.item1).toBe(0);
-		expect(open10.item1).toBe(0);
-		expect(baseScore.stopMinutes).toBe(60);
-		expect(open10.stopMinutes).toBe(0);
-		expect(baseScore.weekLowPoints).toBeCloseTo(84.31, 1);
-		expect(open10.weekLowPoints).toBeCloseTo(82.15, 1);
-		expect(
-			openingEarns(open10, baseScore, ctx.input.settings.openMinGainPoints),
-		).toBe(true);
-		// fewer stop minutes rank before the higher weekly low point (amendment 2, B2)
-		expect(compareScores(open10, baseScore)).toBeLessThan(0);
-	});
+			);
+			const result = await createForecastEngine().compute(input);
+			if (!result.available) throw new Error(result.reason);
+			expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 8) });
+			expect(result.plan.placement).toEqual({
+				tiers: [["acct-a"], ["acct-b"]],
+				rule: "forecast-lookahead",
+				reason: "low-point+46.1",
+			});
 
-	test("the response covers the morning state: acct-a's 11:00 reset is a jump, day ends at midnight", async () => {
-		const result = await createForecastEngine().compute(
-			buildInput(replayFixture()),
-		);
-		if (!result.available) throw new Error(result.reason);
-		const day = result.response.day as ForecastBlock;
-		expect(day.times[0]).toBe(prague(12, 7));
-		expect(day.times.at(-1)).toBe(prague(12, 7) + 17 * 60 * MIN);
-		expect(day.times.filter((t) => t === prague(12, 11))).toHaveLength(2);
-	});
+			const ctx = await contextOf(input);
+			const {
+				score,
+				baseline,
+				scored,
+				candidates,
+				result: sim,
+			} = await planForecast(ctx);
+			expect(score.lowPoint).toBeCloseTo(59.88, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
+			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8));
+			// pre-warm adds openings before work start: 07:15 today and 03:15 to 06:15 tomorrow
+			expect(candidates).toBe(14);
+			const sOf = (at: EpochMs) =>
+				scored.find(
+					(s) =>
+						s.plan.preferred === null &&
+						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
+				)?.score.lowPoint;
+			expect(sOf(prague(12, 7, 15))).toBeCloseTo(25.66, 1);
+			expect(sOf(prague(13, 3, 15))).toBeCloseTo(-22.26, 1);
+			const day = result.response.day as ForecastBlock;
+			expect(day.stops.heavy).toEqual([]);
+			expect(day.stops.typical).toEqual([]);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
+
+	test(
+		"the response covers the morning state: acct-a's 11:00 reset is a jump, day ends at midnight",
+		async () => {
+			const result = await createForecastEngine().compute(
+				buildInput(replayFixture()),
+			);
+			if (!result.available) throw new Error(result.reason);
+			const day = result.response.day as ForecastBlock;
+			expect(day.times[0]).toBe(prague(12, 7));
+			expect(day.times.at(-1)).toBe(prague(12, 7) + 17 * 60 * MIN);
+			expect(day.times.filter((t) => t === prague(12, 11))).toHaveLength(2);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 });
