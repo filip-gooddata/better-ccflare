@@ -73,11 +73,27 @@ export function classifyRefusalScope({
 	);
 
 	const claim = headers.get(REPRESENTATIVE_CLAIM_HEADER)?.trim().toLowerCase();
+	if (claim && ACCOUNT_CLAIMS.has(claim)) {
+		return { scope: "account", detail: `representative-claim=${claim}` };
+	}
+
+	// A live exhausted account window outranks a family claim: the claim names
+	// one binding limit, not that the account's other limits have room.
+	const accountRows = windows.filter(
+		(window) => !window.scoped && ACCOUNT_WINDOWS.has(window.window),
+	);
+	const exhaustedAccountRow = accountRows.find(
+		(window) => window.utilization >= 100 && window.resetAtMs > now,
+	);
+	if (exhaustedAccountRow) {
+		return {
+			scope: "account",
+			detail: `${describeWindow(exhaustedAccountRow)} exhausted`,
+		};
+	}
+
 	if (claim) {
-		if (ACCOUNT_CLAIMS.has(claim)) {
-			return { scope: "account", detail: `representative-claim=${claim}` };
-		}
-		if (claim.includes(family)) {
+		if (claim === `seven_day_${family}`) {
 			const futureResets = familyRows
 				.map((window) => window.resetAtMs)
 				.filter((resetAtMs) => resetAtMs > now);
@@ -106,20 +122,21 @@ export function classifyRefusalScope({
 		}
 	}
 
-	const accountRows = windows.filter(
-		(window) => !window.scoped && ACCOUNT_WINDOWS.has(window.window),
-	);
-	const exhaustedAccountRow = accountRows.find(
-		(window) => window.utilization >= 100 && window.resetAtMs > now,
-	);
-	if (exhaustedAccountRow) {
-		return {
-			scope: "account",
-			detail: `${describeWindow(exhaustedAccountRow)} exhausted`,
-		};
-	}
 	if (accountRows.length === 0) {
 		return { scope: "unclassified", detail: "no usage readings" };
+	}
+	// Usage alone may call a refusal family-scoped only when both account-wide
+	// windows were read: a missing weekly_all reading could be the binding one.
+	const missing = [...ACCOUNT_WINDOWS].filter(
+		(name) =>
+			!accountRows.some((window) => window.window === name) &&
+			!hasRoomWithoutReset(usageData, name),
+	);
+	if (missing.length > 0) {
+		return {
+			scope: "unclassified",
+			detail: `no usable ${missing.join(", ")} reading`,
+		};
 	}
 
 	const accountSummary = accountRows.map(describeWindow).join(", ");
@@ -155,6 +172,35 @@ export function classifyRefusalScope({
 
 function describeWindow(window: UsageWindowSnapshot): string {
 	return `${window.window} ${window.utilization}% resets ${new Date(window.resetAtMs).toISOString()}`;
+}
+
+const LIMIT_KIND_FOR_WINDOW: Record<string, string> = {
+	five_hour: "session",
+	seven_day: "weekly_all",
+};
+
+/**
+ * Whether the raw limits[] row behind an account window reads below 100 %
+ * with no reset. collectWindows drops such a row (a fresh window carries
+ * `resets_at: null`), yet its percent still shows room.
+ */
+function hasRoomWithoutReset(
+	usageData: AnyUsageData | null | undefined,
+	windowName: string,
+): boolean {
+	const limits = (usageData as { limits?: unknown[] } | null | undefined)
+		?.limits;
+	if (!Array.isArray(limits)) return false;
+	const kind = LIMIT_KIND_FOR_WINDOW[windowName];
+	return limits.some((entry) => {
+		const row = entry as { kind?: string; percent?: unknown } | null;
+		return (
+			row?.kind === kind &&
+			typeof row.percent === "number" &&
+			Number.isFinite(row.percent) &&
+			row.percent < 100
+		);
+	});
 }
 
 /**

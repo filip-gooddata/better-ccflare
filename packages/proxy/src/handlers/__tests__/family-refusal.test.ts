@@ -196,6 +196,78 @@ describe("classifyRefusalScope", () => {
 	});
 });
 
+describe("classifyRefusalScope — evidence guards", () => {
+	it("is account-wide for a family claim while the session is at 100 %", () => {
+		const result = classify({
+			headers: new Headers({
+				"anthropic-ratelimit-unified-representative-claim": "seven_day_fable",
+			}),
+			usageData: usage({ session: 100 }),
+		});
+		expect(result.scope).toBe("account");
+	});
+
+	it("ignores a composite claim that merely contains the family", () => {
+		const result = classify({
+			headers: new Headers({
+				"anthropic-ratelimit-unified-representative-claim":
+					"seven_day_fable_extra",
+			}),
+			usageData: usage({ fable: 97 }),
+		});
+		expect(result.scope).toBe("unclassified");
+	});
+
+	it("is unclassified when the weekly_all reading is missing", () => {
+		const data = {
+			limits: [
+				{ kind: "session", percent: 79, resets_at: FIVE_HOUR_RESET },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: FABLE_RESET,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+		const result = classify({ usageData: data });
+		expect(result.scope).toBe("unclassified");
+		expect(result.detail).toBe("no usable seven_day reading");
+	});
+
+	it("is unclassified when weekly_all has no percent", () => {
+		const data = {
+			limits: [
+				{ kind: "session", percent: 79, resets_at: FIVE_HOUR_RESET },
+				{ kind: "weekly_all", percent: null, resets_at: WEEKLY_RESET },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: FABLE_RESET,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+		expect(classify({ usageData: data }).scope).toBe("unclassified");
+	});
+
+	it("counts a fresh session window with no reset as room", () => {
+		const data = {
+			limits: [
+				{ kind: "session", percent: 0, resets_at: null },
+				{ kind: "weekly_all", percent: 89, resets_at: WEEKLY_RESET },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: FABLE_RESET,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+		expect(classify({ usageData: data }).scope).toBe("family");
+	});
+});
+
 describe("rateLimitHeaderSummary", () => {
 	it("lists only rate-limit headers, sorted by name", () => {
 		const headers = new Headers({

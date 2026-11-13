@@ -18,7 +18,7 @@ import type { HeldLimitRefusal, ProxyContext } from "../proxy-types";
 const HOUR = 3_600_000;
 const BODY_MARKER = "refusal-body-marker";
 
-function makeAccount(): Account {
+function makeAccount(overrides: Partial<Account> = {}): Account {
 	return {
 		id: "acc-gooddata",
 		name: "gooddata",
@@ -53,6 +53,7 @@ function makeAccount(): Account {
 		pause_reason: null,
 		refresh_token_issued_at: null,
 		consecutive_rate_limits: 0,
+		...overrides,
 	};
 }
 
@@ -319,6 +320,28 @@ describe("proxyWithAccount — family-scoped 429", () => {
 		]) {
 			expect(line).not.toContain(secret);
 		}
+	});
+
+	it("logs one upstream_429 line per 429 while cycling fallback models", async () => {
+		globalThis.fetch = mock(async () => refusal());
+		const ctx = makeContext();
+		const account = makeAccount({
+			model_mappings: JSON.stringify({
+				fable: ["claude-fable-5-2", "claude-opus-5-5"],
+			}),
+		});
+
+		try {
+			await run(ctx, account);
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			if (!msg.includes("UsageCollector not initialized")) throw e;
+		}
+
+		const models = lines()
+			.filter((l) => l.includes(" upstream_429 "))
+			.map((l) => /model=(\S+)/.exec(l)?.[1]);
+		expect(models).toEqual(["claude-fable-5-2", "claude-opus-5-5"]);
 	});
 
 	it("holds a family refusal for the all-limited replay without benching", async () => {

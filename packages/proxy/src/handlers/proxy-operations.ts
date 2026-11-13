@@ -3341,6 +3341,11 @@ export async function proxyWithAccount(
 						log,
 					);
 					zai1305AlreadyChecked = true;
+					if (rawResponse.status === 429 && isClaudeProvider) {
+						log.info(
+							`[ccflare] account=${account.name} upstream_429 model=${nextBareModel} headers=${rateLimitHeaderSummary(rawResponse.headers)}`,
+						);
+					}
 					if (!(await isModelUnavailableError(rawResponse.clone()))) {
 						break; // Success — stop cycling
 					}
