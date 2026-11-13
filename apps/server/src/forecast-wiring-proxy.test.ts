@@ -221,7 +221,10 @@ describe("forecast wiring through the real proxy", () => {
 		const response = await handleProxy(
 			new Request("http://127.0.0.1:8080/v1/messages", {
 				method: "POST",
-				headers: { "content-type": "application/json" },
+				headers: {
+					"content-type": "application/json",
+					"x-better-ccflare-account-id": ACCOUNT_ID,
+				},
 				body: JSON.stringify({
 					model: "claude-sonnet-4-5",
 					max_tokens: 16,
