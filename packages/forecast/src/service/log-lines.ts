@@ -153,7 +153,11 @@ function inputsKey(d: ForecastInputsDetail): string {
 	const a = Number.isFinite(d.dayFactor.a)
 		? String(Math.round(d.dayFactor.a * 10))
 		: "?";
-	const ks = d.limits.map(
+	const sorted = [...d.limits].sort(
+		(x, y) =>
+			x.accountId.localeCompare(y.accountId) || x.limit.localeCompare(y.limit),
+	);
+	const ks = sorted.map(
 		(l) =>
 			`${l.accountId}/${l.limit}=${l.k === null || !Number.isFinite(l.k) ? "none" : Math.round(l.k * 20)}`,
 	);

@@ -175,4 +175,18 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		log.record(available(withA(1.6, 2.05)), now);
 		expect(lines.length).toBe(3);
 	});
+
+	it("writes no new line when the same limits arrive in another order", () => {
+		const lines: string[] = [];
+		const log = createInputsLog((m) => lines.push(m));
+		const first = 1_000_000;
+		const d = detail();
+		log.record(available(d), first);
+		expect(lines.length).toBe(1);
+		const reordered = { ...d, limits: [...d.limits].reverse() };
+		log.record(available(reordered), first + MIN);
+		log.record(available(reordered), first + 10 * MIN);
+		log.record(available(reordered), first + 3 * INPUTS_MIN_SPACING_MS);
+		expect(lines.length).toBe(1);
+	});
 });
