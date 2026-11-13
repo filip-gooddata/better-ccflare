@@ -105,7 +105,11 @@ import type {
 import { serve } from "bun";
 import { createUnservedApiGuard } from "./api-guard";
 import { createCodexUsageRefresher } from "./codex-usage-refresher";
-import { createForecastWiring, type ForecastWiring } from "./forecast-wiring";
+import {
+	awaitForecastStop,
+	createForecastWiring,
+	type ForecastWiring,
+} from "./forecast-wiring";
 import {
 	buildStrategy,
 	sessionPaceOptionsFrom,
@@ -2644,6 +2648,14 @@ async function handleGracefulShutdown(signal: string) {
 			cacheKeepaliveScheduler.stop();
 			cacheKeepaliveScheduler = null;
 		}
+		// Stop the forecast with the other triggers so no pre-warm starts while
+		// requests drain. A run already in flight is awaited after the drain,
+		// but never past the drain deadline, so the watchdog margin stays
+		// reserved for the usage drain and the database close.
+		setUsageSnapshotListener(null);
+		const forecastStopping = forecastWiring?.stop() ?? Promise.resolve();
+		const forecastDeadline = Date.now() + drainMs;
+		forecastWiring = null;
 
 		// Stop memory monitoring
 		if (memoryMonitorInterval) {
@@ -2731,11 +2743,17 @@ async function handleGracefulShutdown(signal: string) {
 		}
 
 		usageCache.clear(); // Stop all usage polling
-		setUsageSnapshotListener(null);
-		if (forecastWiring) {
-			// Before the database closes: the cycle and pre-warm records write to it.
-			await forecastWiring.stop();
-			forecastWiring = null;
+		// Before the database closes: the cycle and pre-warm records write to it.
+		const forecastStopped = await awaitForecastStop(
+			forecastStopping,
+			forecastDeadline - Date.now(),
+			undefined,
+			(error) => console.error("Forecast stop failed:", error),
+		);
+		if (!forecastStopped) {
+			console.error(
+				"Forecast pre-warm still running at the drain deadline; closing without it",
+			);
 		}
 		await drainUsageCollector();
 		await shutdown();

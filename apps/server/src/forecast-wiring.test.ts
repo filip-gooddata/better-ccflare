@@ -53,6 +53,7 @@ import {
 } from "../../../packages/forecast/src/engine/__tests__/fixtures-engine";
 import { createUnservedApiGuard } from "./api-guard";
 import {
+	awaitForecastStop,
 	createForecastWiring,
 	type ForecastRunnerContext,
 	type ForecastWiring,
@@ -197,11 +198,14 @@ const flush = async () => {
 class FakeRunner {
 	calls: string[] = [];
 	contexts: ForecastRunnerContext[] = [];
+	/** While set, a run stays in flight until it resolves. */
+	gate: Promise<void> | null = null;
 	factory = (context: ForecastRunnerContext) => {
 		this.contexts.push(context);
 		return {
 			run: async (accountId: string): Promise<PrewarmRunResult> => {
 				this.calls.push(accountId);
+				if (this.gate) await this.gate;
 				return { exitCode: 0, durationMs: 5, error: null };
 			},
 		};
@@ -831,6 +835,47 @@ describe("pre-warm through the wiring", () => {
 		expect(h.runner.contexts).toHaveLength(1);
 		expect(h.runner.contexts[0].proxyPort).toBe(18080);
 		expect(h.runner.contexts[0].proxyApiKey()).toBeNull();
+	});
+
+	it("shutdown: no pre-warm starts after stop, and the wait for one in flight is bounded", async () => {
+		const { h } = await prewarmSetup({ prewarm: true });
+		let release!: () => void;
+		h.runner.gate = new Promise<void>((r) => {
+			release = r;
+		});
+		h.wiring.onUsageSnapshot("acct-a");
+		await h.time.advance(POLL);
+		expect(h.runner.calls).toEqual(["acct-a"]);
+
+		// Shutdown begins while the run is in flight; the drain budget runs out first.
+		const stopping = h.wiring.stop();
+		const bounded = awaitForecastStop(stopping, 15_000, h.time.timer);
+		await h.time.advance(15_000);
+		expect(await bounded).toBe(false);
+		expect(h.time.pending).toHaveLength(0);
+
+		// Stopped: later snapshots start no cycle and no second run.
+		h.wiring.onUsageSnapshot("acct-b");
+		await h.time.advance(10 * POLL);
+		expect(h.runner.calls).toEqual(["acct-a"]);
+
+		release();
+		expect(await awaitForecastStop(stopping, 1_000, h.time.timer)).toBeTrue();
+	});
+
+	it("shutdown: a failing stop is reported and counts as finished", async () => {
+		const time = new FakeTime(NOW);
+		const errors: unknown[] = [];
+		expect(
+			await awaitForecastStop(
+				Promise.reject(new Error("stop boom")),
+				1_000,
+				time.timer,
+				(e) => errors.push(e),
+			),
+		).toBeTrue();
+		expect(errors).toHaveLength(1);
+		expect(time.pending).toHaveLength(0);
 	});
 
 	it("prewarm off: across several polls the runner is never called", async () => {

@@ -188,6 +188,36 @@ export async function loadClaudeLimits(
 	});
 }
 
+/**
+ * Waits for a forecast stop until `budgetMs` passes; true when it finished.
+ * Shutdown uses it so a pre-warm run in flight (up to the runner's timeout)
+ * cannot hold the database open past the drain deadline. A stop that fails
+ * counts as finished: its error is logged, not thrown.
+ */
+export async function awaitForecastStop(
+	stopping: Promise<void>,
+	budgetMs: number,
+	timer: ForecastTimer = unrefTimer,
+	onError: (error: unknown) => void = () => {},
+): Promise<boolean> {
+	let handle: unknown = null;
+	const settled = stopping.then(
+		() => true,
+		(error: unknown) => {
+			onError(error);
+			return true;
+		},
+	);
+	const timedOut = new Promise<boolean>((resolve) => {
+		handle = timer.set(() => resolve(false), Math.max(0, budgetMs));
+	});
+	try {
+		return await Promise.race([settled, timedOut]);
+	} finally {
+		timer.clear(handle);
+	}
+}
+
 const DISABLED: ForecastWiring = {
 	service: null,
 	servedUsageSink: undefined,
@@ -268,8 +298,9 @@ export function createForecastWiring(
 		onUsageSnapshot() {
 			created.notifyUsagePoll();
 		},
-		// The service also waits for a pre-warm run in flight (bounded by the
-		// runner's timeout), so the database can close afterwards.
+		// Resolves once no cycle and no pre-warm run is in flight; a run can take
+		// up to the runner's timeout, so shutdown bounds the wait with
+		// awaitForecastStop.
 		stop: () => created.stop(),
 	};
 }
