@@ -17,6 +17,7 @@ This document explains how better-ccflare picks an account for each proxied requ
 4. [Usage Throttling](#usage-throttling)
 5. [Model-Capacity Routing](#model-capacity-routing)
 6. [Auto-Fallback](#auto-fallback)
+7. [Interruption Forecast](#interruption-forecast)
 
 ## Overview: Three Orthogonal Axes
 
@@ -300,3 +301,55 @@ flowchart TD
 ```
 
 *Source: `packages/load-balancer/src/strategies/peek-availability.ts` (`wouldAutoUnpause`, shared by `least-used` and `session-affinity`), `packages/load-balancer/src/strategies/index.ts` and `session-drain-soonest.ts` (`checkForAutoFallbackAccounts`, the forced-position variant).*
+
+## Interruption Forecast
+
+The interruption forecast projects how much pooled quota the Claude OAuth accounts have left over the rest of the day, plans when each account opens its 5-hour window and where sessions should sit so that the lowest point of that projection stays as far above zero as possible, and serves the projection at `GET /api/forecast` ([forecast-endpoint.md](./forecast-endpoint.md)). Routing under `session-pace` follows the plan; with no usable plan it behaves exactly as described in [session-pace](#session-pace-sessionpacestrategy).
+
+### When it is computed
+
+- After each successful usage poll (every `usage_poll_interval_ms`, default 90 s), a computation starts once the polls have settled for 5 s (`FORECAST_POLL_SETTLE_MS`), and never sooner than 30 s after the previous one started (`FORECAST_MIN_SPACING_MS`).
+- It runs off the request path, one at a time. Polls that arrive during a computation are coalesced into one follow-up run.
+- One run: record the proxy's own served requests as demand history (on the first successful run, when `transcriptsDir` is set, a one-time backfill from local Claude transcripts starts in the background; it reads usage metadata only and is never awaited); load the demand history for `historyLookbackDays`, the usage readings, each counted account's limits from the usage cache, and the live sessions; run the engine; keep the result; then tick the pre-warm scheduler.
+- A failed step is logged once per run and never reaches a request. The previous result is kept and ages.
+- `GET /api/forecast` only serves the kept result; it never computes.
+
+### Fresh and stale
+
+The kept result is **fresh** while it is available and no older than 3 poll intervals (`FORECAST_STALE_POLLS` × `usage_poll_interval_ms`, 4.5 minutes at the default). Past that, or before the first result, the endpoint answers the no-forecast shape with `reason: "error"` and routing gets no advice.
+
+### How routing uses it
+
+Only `session-pace` takes advice, and only when `routing` is on. Under another strategy the forecast is still computed and served for display. Advice is the first step of the plan, replanned on every run:
+
+- **New session**: the hard filters run first as before (availability, probe back-off, the model-family guard, never an account that is out). The plan gives look-ahead tiers; the first tier that holds a candidate wins, and inside it the usual session-pace ranking decides. Under advice the 5-hour 90 % guard is a tie-break inside the tier, not a filter. The placement is logged with the usual `session-pace place` line; its `rule` and `reason` come from the advice.
+- **Cold session**: a mapped session whose last request plus its cache lifetime has passed (1 hour when at least half of its cache writes were 1-hour writes, else 5 minutes; the idle setting while unknown) is placed like a new session. When it lands on another account the reason starts with `cold:`.
+- **Live session**: moved only when the plan says the lowest point ends higher after paying the cold-cache re-read on the other account (the gain threshold is `moveMinGainPoints`). The target must be among the candidates, not out, and pass the family guard; otherwise the session stays. Each move is applied once per plan and logged as
+  `session-pace move session=<tag> from=<name> to=<name> rule=forecast-move reason=<reason> gain=<points> cost=<points>`.
+- The model-family (Fable) guard stays hard. The all-limited rule is unchanged and decides as before when every account is out.
+
+**Fallback**: when `routing` is off, the forecast is disabled, the result is stale or missing, the engine failed, or the advisor fails, session-pace gets no advice and routes exactly as pace.3 did.
+
+### Pre-warm
+
+Pre-warm opens an account's 5-hour window at the time the plan chose, with one one-word request through the real `claude` CLI (print mode, `prewarmModel`, default Haiku) pinned to that account through the proxy. It is **off by default** (`prewarm: false`). With it on, the scheduler fires only when the forecast is fresh, the plan's opening time has come, the latest reading (at most 10 minutes old) shows no open 5-hour window, the account is counted and not out, it is below `prewarmMaxPerDay` for the day, no pre-warm ran for it in the last 5 hours, and none is running. Records of the last 20 pre-warms survive a restart.
+
+`prewarmTest` (`{ "account": <name or id>, "at": <time> }`) fires once at the first scheduler tick at or after `at`, whether or not `prewarm` is on and whether or not a forecast is available, and never twice for the same pair. Procedure: [packages/forecast/src/prewarm/README.md](../packages/forecast/src/prewarm/README.md#test-morning-run-by-the-supervisor-with-filip).
+
+Log lines (INFO):
+
+- `forecast prewarm fire account=<name> kind=<plan|test> scheduled=<iso> late=<seconds>`
+- `forecast prewarm done account=<name> exit=<code> ms=<n>`
+- `forecast prewarm result account=<name> windowOpened=<true|false> resetsAt=<iso|none>` (after the next readings)
+- `forecast prewarm skip account=<name> reason=<token>` (tokens include `window_open`, `daily_cap`, `not_counted`, `stale_reading`, `unknown_account`)
+
+`GET /api/forecast` reports the planned and recent pre-warms under `prewarm`.
+
+### Settings and restarts
+
+Settings, defaults and formats: [Forecast Settings](./configuration.md#forecast-settings). The config file is read at start, so every change applies after a restart. Two of them also decide what is built at start:
+
+- `enabled: false` at start: nothing is constructed (no session tracking, no computation, no scheduler, no timers) and the endpoint answers `reason: "disabled"`. Turning it back on needs a restart.
+- `routing: false` at start: session-pace is not given the advisor. A running proxy also checks it on every routing call.
+
+*Source: `packages/forecast/src/service/` (computation, freshness, advisor, endpoint provider), `packages/forecast/src/prewarm/` (scheduler and runner), `packages/load-balancer/src/strategies/session-pace.ts` (advice), `apps/server/src/forecast-wiring.ts` (construction).*

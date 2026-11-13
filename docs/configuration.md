@@ -142,7 +142,7 @@ How the values are read:
 - `prewarmTest`: in the environment JSON or `none`; in the config file a JSON object or `null`. `account` is an account name or id; `at` is epoch milliseconds or an ISO 8601 time with a zone (`Z` or `±hh:mm`).
 - Pre-warm is off by default (`prewarm` is `false`).
 
-The config file is read once, at start, so an edit to it applies after the next restart. `GET /api/config/strategy` reports the resolved values under `forecastSettings` (see [Get Current Strategy](#get-current-strategy)). The response format is specified in [forecast-endpoint.md](forecast-endpoint.md).
+The config file is read once, at start, so an edit to it applies after the next restart. `GET /api/config/strategy` reports the resolved values under `forecastSettings` (see [Get Current Strategy](#get-current-strategy)). The response format is specified in [forecast-endpoint.md](forecast-endpoint.md). When the forecast is computed, how session-pace uses it, the pre-warm guards and log lines, and which settings decide what is built at start: [Interruption Forecast](routing-architecture.md#interruption-forecast).
 
 ### Logging Configuration (Environment Only)
 
