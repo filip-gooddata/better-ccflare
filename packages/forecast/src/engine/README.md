@@ -55,14 +55,47 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    e^(−h/τ). The generator is seeded from the local day key.
 5. **Planner** (`planner.ts`, `simulate.ts`, `move-cost.ts`). This is a scenario-based receding-horizon
    search over openings, order and at most one move. Each candidate is a simulated depletion of every
-   account, with refill jumps at resets. Candidates get a lexicographic score on the heavy
-   (p90-of-demand) lines, in the order of design amendment 2 (B2): the smaller low-point share, then the
-   minutes of heavy stops (fewer is better), then the other low-point share, then the smaller share on
-   the typical lines (`compareScores`).
+   account, with refill jumps at resets. Candidates are compared by the score S and its tie-breaks
+   (design amendment 5, E2; see Score below).
    A planned opening (`openAt`) with pre-warm off is a routing-opening: from its time the first new
    (unattached) demand goes to that closed account and opens its window, then the base order applies
-   again (design 4.5). The placement advice follows it: before the time, the usual tiers; once the time
-   has come and the window is still closed, `forecast-open` with that account first.
+   again (design 4.5). An `openAt` later than on demand would open the account is a hold: until its
+   time the account counts as held and takes no new work (amendment 5, E3). The placement advice
+   carries the simulated order: a due routing-opening or the idle accounts the plan does not hold come
+   first with `forecast-open`; an account the plan holds goes behind every other.
+
+## Routing order in the simulation (`DayRun.pick`, amendment 5 E1)
+
+New (unattached) demand, and an attached session whose account is full (failover), go to the first of:
+
+1. a closed account whose planned opening time has come (routing-opening);
+2. an idle account: usable, window not open, not held. Among several, the larger weekly pace deficit
+   first (elapsed share of the weekly window's local work time minus weekly use, as the live router's
+   session-pace), then the lower account index;
+3. the plan's preferred account, when usable and not held;
+4. an open usable account, the earliest 5-hour reset first;
+5. last resort: any usable account, a held one included (it opens then).
+
+Account priority is not an engine input, so the live router's priority tie-break is not modelled
+(every account ties on it). Also not modelled: the live probe backoff, the router's 120-second hold,
+the Fable-family guard, cold-start rotation, and the live order among open accounts (the simulation
+always takes the earliest reset). A hold executed live can leak, because a request without a session
+key or stale advice places by the plain rules.
+
+## Score (amendment 5, E2)
+
+S is the lowest usage point of the heavy day with unserved demand counted below zero. For each limit
+(5-hour and weekly) and each simulated day, the day's own low is the minimum over the day of
+(line − k × cumulative unserved units), k the mean calibration of the counted accounts; unserved demand
+is lost and stays counted for the rest of the day. The limit's low is the 10th percentile of those
+per-day lows (`levelOf` at `HEAVY_LEVEL`), and S = min(5-hour low, weekly low), the limit closer to
+zero. Higher is better. Served lines, the response and its floor at 0 are unchanged; only the planner
+scores this way. Fable is not part of S.
+
+Order (`compareScores`): S higher by more than `TIER_TOLERANCE_POINTS`; else the other limit's low;
+else the typical day's unfloored low (min over both limits of the median per-day low); else fewer
+departures from on demand (`departuresOf`: openings, a preferred account, a move); else the exact
+values.
 6. **Response** (`response.ts`, `stops.ts`, `past.ts`). Pointwise percentile lines (`percentile.ts`),
    stops, `stopNow`, shortfall, Fable `outAt`, and the past series.
 
@@ -87,11 +120,10 @@ side.
 | `SIMULATED_DAYS_PER_YIELD` | 25 | `scenarios.ts` |
 | `FINE_STEP_MS`, `COARSE_STEP_MS`, `DAYS_PER_SLICE`, `FULL_POINTS` | 5 min, 1 h, 20, 100 − 1e-9 | `simulate.ts` |
 | `ONE_HOUR_LIFETIME_FROM_MS` | 30 min | `move-cost.ts` |
-| `HEAVY_LEVEL`, `TYPICAL_LEVEL`, `ZERO_LINE_POINTS`, `SCORE_EPS` | 90, 50, 0.05, 1e-9 | `planner.ts` |
+| `HEAVY_LEVEL`, `TYPICAL_LEVEL`, `SCORE_EPS` | 90, 50, 1e-9 | `planner.ts` |
 | `OPEN_AHEAD_MIN`, `OPEN_BEFORE_WORK_START_MIN` | 0–240 min ahead; 300–60 min before work start | `planner.ts` |
 | `OPENING_BEAM`, `MAX_OPENING_COMBOS`, `MAX_MOVE_SESSIONS` | 3, 64, 3 | `planner.ts` |
-| `TIER_TOLERANCE_POINTS`, `TIER_TOLERANCE_STOP_MIN`, `REASON_MIN_GAIN_POINTS` | 0.5, 5 min, 0.05 | `planner.ts` |
-| `OPEN_MIN_STOP_GAIN_MIN` | 5 min (one simulation step) | `planner.ts` |
+| `TIER_TOLERANCE_POINTS`, `REASON_MIN_GAIN_POINTS` | 0.5, 0.05 | `planner.ts` |
 | `ZERO_POINTS` | 0.05 | `stops.ts` |
 | `WEEK_PAST_SPACING_MS` | 30 min | `past.ts` |
 
@@ -99,16 +131,17 @@ The user-facing knobs (`simulatedDays`, `timeShiftMin`, `recentTauMin`, `session
 `openMinGainPoints`, `moveMinGainPoints`, `minStopPoints`, `fanLevels`, history half-life and lookback)
 are `ForecastSettings`, not constants.
 
-Opening ahead of need (`openingEarns`, amendment 2 B3): a window opens early when that raises score
-item 1 by `openMinGainPoints`, or when item 1 ties within `TIER_TOLERANCE_POINTS` and the heavy stop
-minutes fall by at least `OPEN_MIN_STOP_GAIN_MIN`; never for the other share or the typical share alone.
-The placement reason is then `open-ahead+<points>` or `open-ahead-stop-<minutes>min`.
+Openings and holds (`openingEarns`, amendment 5 E3): the candidates include earlier and later opening
+times than on demand (`OPEN_AHEAD_MIN` from now, and before the work start with pre-warm on); a plan
+that departs from on demand by an opening or a hold is chosen only when it raises S by at least
+`openMinGainPoints`, a move only by `moveMinGainPoints`. The other low, the typical low and departures
+never earn one. The engine adds the chosen plan's S and on demand's S to the `forecast inputs` log
+line (`lowPoint`, `lowPointOnDemand`); the HTTP response does not carry them.
 
-Placement reason (amendment 2 B4), one token: `open-ahead+<points>` or `open-ahead-stop-<minutes>min`
-for an opening ahead of need; else `low-point+<points>` for a gain of item 1 over the on-demand plan;
-else `reset-soon`; else the first score item on which the first tier beats the second, with its gain
-(`decidingReason`): `low-point+<points>`, `stop-shorter+<minutes>min`, `weekly-low+<points>` or
-`five-hour-low+<points>`, `typical-low+<points>`.
+Placement reason (amendment 2 B4), one token: `open-ahead+<points>` for an opening ahead of need; else
+`low-point+<points>` for a gain of S over the on-demand plan; else `reset-soon`; else the first score
+item on which the first tier beats the second, with its gain (`decidingReason`): `low-point+<points>`,
+`weekly-low+<points>` or `five-hour-low+<points>`, `typical-low+<points>`.
 
 Learned work start (`workStartMinute`, amendment A3): the median, over the last `WORK_START_RECENT_DAYS`
 work days with demand, of the local minute at which the day's cumulative demand first reaches
