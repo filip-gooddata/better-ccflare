@@ -3075,6 +3075,9 @@ export async function proxyWithAccount(
 		// model_mappings arrays and legacy model_fallbacks. We already tried index 0
 		// (the primary), so start at index 1.
 		let zai1305AlreadyChecked = false;
+		// Models the model-list loop below sent upstream, in order. Read by the
+		// exhausted-list 429 path to decide between a family block and a bench.
+		const attemptedModels: string[] = [];
 
 		// The request carried images and this model cannot read them. Classified
 		// separately from `isModelUnavailableError`: that predicate answers only
@@ -3201,6 +3204,7 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
+				attemptedModels.push(requestedModel);
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(
@@ -3302,6 +3306,7 @@ export async function proxyWithAccount(
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
 						: await forwardUpstream(retryTransformedRequest);
+					attemptedModels.push(nextBareModel);
 					if (retryTransformedBodyText === undefined) {
 						// Body unreadable — unreachable for a buffer-backed Request.
 						// Record the model and leave the replay on the previous request
@@ -3402,19 +3407,61 @@ export async function proxyWithAccount(
 							providerReset.resetTime,
 						);
 						const reason: RateLimitReason = "all_models_exhausted_429";
-						applyRateLimitCooldown(
-							account,
-							{
-								resetTime: cooldown.until,
-								resetIsInferred:
-									!isExplicitUpstreamCooldown(cooldown.source) ||
-									(cooldown.source === "provider" &&
-										providerReset.resetIsInferred),
-								reason,
-								preserveStreak: isAllLimitedSelection(requestMeta),
-							},
-							ctx,
-						);
+						const resetIsInferred =
+							!isExplicitUpstreamCooldown(cooldown.source) ||
+							(cooldown.source === "provider" && providerReset.resetIsInferred);
+						// Same family rule as the no-fallback path: when every model
+						// the list tried belongs to one family and the last refusal
+						// concerns that family's limit, block the family instead of
+						// benching the account. A list that spans families falls back
+						// to the account bench.
+						const lastAttemptedModel = attemptedModels.at(-1);
+						const refusal =
+							isClaudeProvider && lastAttemptedModel
+								? classifyRefusalScope({
+										headers: rawResponse.headers,
+										usageData: usageCache.get(account.id),
+										model: lastAttemptedModel,
+										now: Date.now(),
+										headerResetAt: resetIsInferred ? null : cooldown.until,
+									})
+								: null;
+						const spansFamilies =
+							refusal?.scope === "family" &&
+							!attemptedModels.every(
+								(model) => getModelFamily(model) === refusal.family,
+							);
+						if (refusal?.scope === "family" && !spansFamilies) {
+							const block = blockFamily(
+								account.id,
+								refusal.family,
+								refusal.until,
+								refusal.source,
+							);
+							log.warn(
+								`[ccflare] account=${account.name} family_block family=${refusal.family} until=${new Date(block?.until ?? refusal.until).toISOString()} source=${refusal.source} detail=${refusal.detail} (after model list ${attemptedModels.join(",")})`,
+							);
+						} else {
+							if (refusal?.scope === "unclassified" || spansFamilies) {
+								log.warn(
+									`[ccflare] account=${account.name} family_refusal_unclassified detail=${
+										spansFamilies
+											? `model list spans families (${attemptedModels.join(",")})`
+											: refusal?.detail
+									}`,
+								);
+							}
+							applyRateLimitCooldown(
+								account,
+								{
+									resetTime: cooldown.until,
+									resetIsInferred,
+									reason,
+									preserveStreak: isAllLimitedSelection(requestMeta),
+								},
+								ctx,
+							);
+						}
 						const responseTime = Date.now() - requestMeta.timestamp;
 						const modelRewrite = isModelRewrite(
 							requestMeta.originalModel,

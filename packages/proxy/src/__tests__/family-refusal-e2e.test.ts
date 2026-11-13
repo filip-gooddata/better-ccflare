@@ -494,6 +494,74 @@ describe("scenario 1: the measured incident replayed", () => {
 	});
 });
 
+describe("scenario 1b: a family 429 after the account's model list", () => {
+	it("blocks Fable without a bench when every model in the list is Fable", async () => {
+		usageCache.set(GD, usage(measuredGooddata()));
+		usageCache.set(AI, usage(measuredGooddataAi()));
+		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
+		const aiRefusal = refusal(AI, FIVE_HOUR_RESET_AI, "five_hour");
+		const calls = installUpstream(({ account, model }) => {
+			if (account === GD && model.startsWith("claude-fable"))
+				return toResponse(gdRefusal);
+			if (account === AI) return toResponse(aiRefusal);
+			return ok200(account, model);
+		});
+		const { ctx, row } = makeCtx(
+			[
+				makeAccount(GD, {
+					model_mappings: JSON.stringify({
+						fable: [FABLE, "claude-fable-5-2"],
+					}),
+				}),
+				makeAccount(AI, { rate_limited_until: FIVE_HOUR_RESET_AI }),
+			],
+			paceStrategy(),
+		);
+
+		const first = await send(ctx, makeRequest(FABLE));
+		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
+			FABLE,
+			"claude-fable-5-2",
+		]);
+		expect(row(GD).rate_limited_until).toBeNull();
+		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
+		expect(
+			logged(`account=${GD} family_block family=fable`).length,
+		).toBeGreaterThan(0);
+		await expectUpstreamRefusal(first, aiRefusal);
+
+		const opus = (await send(ctx, makeRequest(OPUS))) as Response;
+		expect(opus.status).toBe(200);
+		expect(calls.at(-1)).toEqual({ account: GD, model: OPUS });
+	});
+
+	it("still benches the account when the model list spans families", async () => {
+		usageCache.set(GD, usage(measuredGooddata()));
+		usageCache.set(AI, usage(measuredGooddataAi()));
+		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
+		installUpstream(({ account, model }) => {
+			if (account === GD) return toResponse(gdRefusal);
+			return ok200(account, model);
+		});
+		const { ctx, row } = makeCtx(
+			[
+				makeAccount(GD, {
+					model_mappings: JSON.stringify({ fable: [FABLE, OPUS] }),
+				}),
+				makeAccount(AI, { rate_limited_until: FIVE_HOUR_RESET_AI }),
+			],
+			paceStrategy(),
+		);
+
+		await send(ctx, makeRequest(FABLE));
+		expect(row(GD).rate_limited_until).not.toBeNull();
+		expect(getFamilyBlock(GD, "fable", Date.now())).toBeNull();
+		expect(
+			logged(`account=${GD} family_refusal_unclassified`).length,
+		).toBeGreaterThan(0);
+	});
+});
+
 describe("scenario 2: sticky sessions after a family 429", () => {
 	it("moves the Fable session to gooddata-ai and rebinds it; the Opus session stays on gooddata", async () => {
 		usageCache.set(GD, usage(measuredGooddata()));
