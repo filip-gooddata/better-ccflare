@@ -54,8 +54,9 @@ import { forwardToClient as defaultForwardToClient } from "../response-handler";
 import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
+import { classifyRefusalScope, rateLimitHeaderSummary } from "./family-refusal";
 import { isAllLimitedSelection } from "./limit-blocked";
-import { markFamilyExhausted } from "./model-capacity";
+import { blockFamily, markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
 	markModelCooling,
@@ -2382,6 +2383,11 @@ export async function proxyWithAccount(
 			rawResponse: Response,
 			requestedModel: string | null,
 		): Promise<UpstreamErrorClassification> => {
+			if (rawResponse.status === 429 && isClaudeProvider) {
+				log.info(
+					`[ccflare] account=${account.name} upstream_429 model=${requestedModel ?? "none"} headers=${rateLimitHeaderSummary(rawResponse.headers)}`,
+				);
+			}
 			// ── out_of_credits: model/beta-scoped depletion, NOT account-wide (issue #261) ──
 			// Anthropic returns 429 + `overage-disabled-reason: out_of_credits` with no reset
 			// header. This is scoped to a specific model/beta (e.g. context-1m), not the
@@ -2687,19 +2693,51 @@ export async function proxyWithAccount(
 					return null;
 				}
 
-				log.warn(
-					`Account ${account.name} rate-limited (429), no model fallbacks — failing over to next account`,
-				);
-				applyRateLimitCooldown(
-					account,
-					{
-						resetTime: cooldown.until,
-						resetIsInferred,
-						reason,
-						preserveStreak: isAllLimitedSelection(requestMeta),
-					},
-					ctx,
-				);
+				// ── family refusal: one model family's weekly limit, NOT account-wide ──
+				// A refused Fable request on an account whose Fable weekly limit is
+				// spent must not bench the account for every other family. The
+				// family is blocked until its limit resets and the request fails
+				// over with no account cooldown; the audit row and the hold for the
+				// all-limited replay below are the same as for an account bench.
+				const refusal = isClaudeProvider
+					? classifyRefusalScope({
+							headers: rawResponse.headers,
+							usageData: usageCache.get(account.id),
+							model: requestedModel,
+							now: Date.now(),
+							headerResetAt: resetIsInferred ? null : cooldown.until,
+						})
+					: null;
+				if (refusal?.scope === "family") {
+					const block = blockFamily(
+						account.id,
+						refusal.family,
+						refusal.until,
+						refusal.source,
+					);
+					log.warn(
+						`[ccflare] account=${account.name} family_block family=${refusal.family} until=${new Date(block?.until ?? refusal.until).toISOString()} source=${refusal.source} detail=${refusal.detail}`,
+					);
+				} else {
+					if (refusal?.scope === "unclassified") {
+						log.warn(
+							`[ccflare] account=${account.name} family_refusal_unclassified detail=${refusal.detail}`,
+						);
+					}
+					log.warn(
+						`Account ${account.name} rate-limited (429), no model fallbacks — failing over to next account`,
+					);
+					applyRateLimitCooldown(
+						account,
+						{
+							resetTime: cooldown.until,
+							resetIsInferred,
+							reason,
+							preserveStreak: isAllLimitedSelection(requestMeta),
+						},
+						ctx,
+					);
+				}
 				saveNoFallback429AuditRow();
 				if (!(await holdLimitRefusal(rawResponse))) {
 					cancelDiscardedResponseBody(rawResponse);
@@ -3303,6 +3341,11 @@ export async function proxyWithAccount(
 						log,
 					);
 					zai1305AlreadyChecked = true;
+					if (rawResponse.status === 429 && isClaudeProvider) {
+						log.info(
+							`[ccflare] account=${account.name} upstream_429 model=${nextBareModel} headers=${rateLimitHeaderSummary(rawResponse.headers)}`,
+						);
+					}
 					if (!(await isModelUnavailableError(rawResponse.clone()))) {
 						break; // Success — stop cycling
 					}
