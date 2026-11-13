@@ -121,7 +121,10 @@ export {
 	type ResponseHandlerOptions,
 } from "./response-handler";
 export type { ProxyRequest, ProxyResponse } from "./types";
-export type { UsageCollectorHealth } from "./usage-collector";
+export {
+	resetUsageCollectorForTests,
+	type UsageCollectorHealth,
+} from "./usage-collector";
 export {
 	startWalTruncateJob,
 	truncateWalAfterIntegrityCheck,

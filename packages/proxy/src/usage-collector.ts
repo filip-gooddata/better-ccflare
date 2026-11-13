@@ -1589,6 +1589,16 @@ export function tryGetUsageCollector(): UsageCollector | null {
 }
 
 /**
+ * Disposes the singleton and forgets it, so a test that ran `initProxy`
+ * against its own database leaves no collector behind for later test files.
+ */
+export function resetUsageCollectorForTests(): void {
+	_usageCollector?.setServedUsageSink(null);
+	_usageCollector?.dispose();
+	_usageCollector = null;
+}
+
+/**
  * Record the serving backend the response processor discovered, through the
  * same collector the response handler feeds with start/chunk/end.
  *
