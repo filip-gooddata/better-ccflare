@@ -182,7 +182,7 @@ describe("createUnservedApiGuard", () => {
 		expect(message).toBe(
 			"Refused unserved API path: GET /%61pi/x%0d%0aInjected:%20line%00",
 		);
-		expect(message).not.toMatch(/[\u0000-\u001f]/);
+		expect([...message].some((c) => c.charCodeAt(0) < 0x20)).toBe(false);
 	});
 
 	it("logs a refusal once per method and path per window, then reports the suppressed count", () => {

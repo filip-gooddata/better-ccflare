@@ -51,11 +51,11 @@ const MALFORMED_ESCAPE_READINGS: readonly MalformedEscapeReading[] = [
 // the characters around it into a new escape ("%6%091" reads "%61").
 function decodeOnce(path: string, reading: MalformedEscapeReading): string {
 	return path
-		.replace(ESCAPE, (escape: string, hex: string | undefined) => {
+		.replace(ESCAPE, (match: string, hex: string | undefined) => {
 			if (hex !== undefined)
 				return String.fromCharCode(Number.parseInt(hex, 16));
-			if (reading === "keep") return escape;
-			if (reading === "drop-percent") return escape.slice(1);
+			if (reading === "keep") return match;
+			if (reading === "drop-percent") return match.slice(1);
 			return "";
 		})
 		.replace(/[\t\n\r]/g, "");
