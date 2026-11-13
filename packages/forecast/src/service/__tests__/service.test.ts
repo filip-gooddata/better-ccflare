@@ -600,12 +600,20 @@ describe("forecast service: backfill", () => {
 
 describe("forecast service: stop", () => {
 	it("clears timers, stops the scheduler, awaits the running cycle; later notifies do nothing", async () => {
+		const idle = harness();
+		await idle.service.runOnce();
+		idle.service.notifyUsagePoll();
+		expect(idle.time.pending.length).toBe(1);
+		await idle.service.stop();
+		expect(idle.time.pending.length).toBe(0);
+		expect(idle.scheduler.stopped).toBe(true);
+
 		const h = harness();
 		h.engine.hold = new Deferred();
 		const running = h.service.runOnce();
 		await flush();
+		// queued behind the running computation; stop drops it
 		h.service.notifyUsagePoll();
-		expect(h.time.pending.length).toBe(1);
 		let stopped = false;
 		const stopping = h.service.stop().then(() => {
 			stopped = true;
@@ -692,5 +700,105 @@ describe("forecast service with the real scheduler and a fake runner", () => {
 		}
 		expect(runner.calls).toEqual([A]);
 		await again.service.stop();
+	});
+});
+
+describe("forecast service: queued work", () => {
+	it("runOnce covers a queued snapshot: the old timer does not fire a second computation", async () => {
+		const h = harness();
+		await h.service.runOnce();
+		await h.time.advance(1_000);
+		h.service.notifyUsagePoll();
+		expect(h.time.pending.length).toBe(1);
+		await h.time.advance(19_000);
+		await h.service.runOnce();
+		expect(h.time.pending.length).toBe(0);
+		await h.time.advance(10 * FORECAST_MIN_SPACING_MS);
+		expect(h.engine.inputs.map((i) => i.now)).toEqual([T0, T0 + 20_000]);
+	});
+
+	it("a snapshot just before a computation ends gives one follow-up after its settle wait", async () => {
+		const h = harness();
+		h.engine.hold = new Deferred();
+		const first = h.service.runOnce();
+		await h.time.advance(29_000);
+		h.service.notifyUsagePoll();
+		expect(h.time.pending.length).toBe(0);
+		h.engine.hold.resolve();
+		h.engine.hold = null;
+		await first;
+		await flush();
+		expect(h.time.pending.length).toBe(1);
+		await h.time.advance(10 * FORECAST_MIN_SPACING_MS);
+		expect(h.engine.inputs.map((i) => i.now)).toEqual([
+			T0,
+			T0 + 29_000 + FORECAST_POLL_SETTLE_MS,
+		]);
+	});
+
+	it("a later snapshot pushes the queued computation back to its own settle wait", async () => {
+		const h = harness();
+		await h.service.runOnce();
+		h.service.notifyUsagePoll();
+		await h.time.advance(28_000);
+		h.service.notifyUsagePoll();
+		expect(h.time.pending.length).toBe(1);
+		await h.time.advance(10 * FORECAST_MIN_SPACING_MS);
+		expect(h.engine.inputs.map((i) => i.now)).toEqual([
+			T0,
+			T0 + 28_000 + FORECAST_POLL_SETTLE_MS,
+		]);
+	});
+
+	it("idle waits for queued work, and stop releases it", async () => {
+		const h = harness();
+		h.service.notifyUsagePoll();
+		let idle = false;
+		const waiting = h.service.idle().then(() => {
+			idle = true;
+		});
+		await flush();
+		expect(idle).toBe(false);
+		await h.time.advance(FORECAST_POLL_SETTLE_MS);
+		await waiting;
+		expect(idle).toBe(true);
+		expect(h.engine.inputs.length).toBe(1);
+
+		h.service.notifyUsagePoll();
+		let idleAgain = false;
+		const again = h.service.idle().then(() => {
+			idleAgain = true;
+		});
+		await flush();
+		expect(idleAgain).toBe(false);
+		await h.service.stop();
+		await again;
+		expect(idleAgain).toBe(true);
+		expect(h.engine.inputs.length).toBe(1);
+	});
+
+	it("the provider answers even when the clock throws", () => {
+		const h = harness({
+			clock: {
+				now: () => {
+					throw new Error("clock broke");
+				},
+			},
+		});
+		const res = serve(h);
+		expect(res.reason).toBe("error");
+		expect(res.prewarm).toEqual({ enabled: false, planned: [], last: [] });
+	});
+
+	it("starts the backfill once transcriptsDir is set after an earlier sync", async () => {
+		const h = harness();
+		await h.service.runOnce();
+		await flush();
+		expect(h.backfills).toEqual([]);
+		h.settings.current = settings({ transcriptsDir: "/tmp/transcripts" });
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		await flush();
+		expect(h.backfills).toEqual(["/tmp/transcripts"]);
 	});
 });
