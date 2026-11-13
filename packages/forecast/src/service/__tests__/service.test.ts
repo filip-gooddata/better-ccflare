@@ -1003,25 +1003,24 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 		]);
 	});
 
-	it("is not repeated on every poll: again when the rule or a deciding number changes, else once an hour", async () => {
+	it("is not repeated on every poll: again when the rule or a number changes, else once an hour", async () => {
 		const h = harness();
 		h.engine.result = (i) => noForecast(i.now, calibrationDetail(2, 3.5));
 		await h.service.runOnce();
-		// demand keeps arriving: the unit sum grows on every poll, nothing decides differently
-		for (let i = 1; i <= 10; i++) {
-			const units = 3.5 + i;
-			h.engine.result = (inp) =>
-				noForecast(inp.now, calibrationDetail(2, units));
-			await cycle(h, FORECAST_MIN_SPACING_MS);
-		}
+		for (let i = 1; i <= 10; i++) await cycle(h, FORECAST_MIN_SPACING_MS);
 		expect(unavailableLines(h).length).toBe(1);
-		h.engine.result = (i) => noForecast(i.now, calibrationDetail(3, 20));
+		// the unit sum is one of the numbers: a new sum is a new line
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(2, 13.5));
 		await cycle(h, FORECAST_MIN_SPACING_MS);
 		expect(unavailableLines(h).length).toBe(2);
-		await cycle(h, HOUR);
-		expect(unavailableLines(h).length).toBe(3);
+		expect(unavailableLines(h)[1]).toContain("units=13.5");
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(3, 13.5));
 		await cycle(h, FORECAST_MIN_SPACING_MS);
 		expect(unavailableLines(h).length).toBe(3);
+		await cycle(h, HOUR);
+		expect(unavailableLines(h).length).toBe(4);
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(unavailableLines(h).length).toBe(4);
 	});
 
 	it("says once when the forecast is available again, and nothing while it stays available", async () => {

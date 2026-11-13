@@ -70,25 +70,16 @@ function describe(result: Extract<ForecastResult, { available: false }>): {
 		const line = `${head} rule=history recordedDays=${detail.recordedDays}/${detail.minRecordedDays} pool=${detail.pool}:${detail.poolDays}/${detail.minPoolDays}`;
 		return { line, key: line };
 	}
-	const parts: string[] = [];
-	const keys: string[] = [];
-	for (const l of detail.limits) {
-		const who = `${l.accountId}/${l.limit}`;
-		const decided = `instances=${l.instances} points=${l.points}/${l.minPoints}`;
-		parts.push(
-			`${who}: ${decided} units=${Math.round(l.units * 10) / 10} k=${l.k}`,
-		);
-		// The unit sum grows with every request; only whether it is positive decides.
-		keys.push(`${who}: ${decided} units>0=${l.units > 0} k=${l.k}`);
-	}
-	return {
-		line: `${head} rule=calibration ${parts.join("; ")}`,
-		key: `${head} rule=calibration ${keys.join("; ")}`,
-	};
+	const parts = detail.limits.map(
+		(l) =>
+			`${l.accountId}/${l.limit}: instances=${l.instances} points=${l.points}/${l.minPoints} units=${Math.round(l.units * 10) / 10} k=${l.k}`,
+	);
+	const line = `${head} rule=calibration ${parts.join("; ")}`;
+	return { line, key: line };
 }
 
 /**
- * Logs why there is no forecast when the reason, the rule or a deciding number changes, else
+ * Logs why there is no forecast when the reason, the rule or a printed number changes, else
  * at most once an hour; and once when the forecast is available again.
  */
 export function createAvailabilityLog(log: (msg: string) => void): {
