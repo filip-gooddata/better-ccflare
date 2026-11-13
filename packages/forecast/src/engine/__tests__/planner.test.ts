@@ -8,10 +8,12 @@ import {
 	openingGrid,
 	openingReason,
 	type PlanScore,
+	placementOf,
 	planForecast,
 	scorePlan,
 } from "../planner";
-import { onDemandPlan, simulate } from "../simulate";
+import type { SimulationResult } from "../model";
+import { onDemandPlan, type SimPlan, simulate } from "../simulate";
 import {
 	account,
 	HOUR,
@@ -167,17 +169,17 @@ describe("planForecast: an early opening that serves more of the day (amendment 
 			score: { ...base, lowPoint: points, typicalLow: typical },
 		});
 		// Within 0.5 points of S the typical low ranks first, so openings 1 to 4 outrank opening 5,
-		// which alone gains openMinGainPoints (0.5 against 0.4 and less).
+		// which alone gains openMinGainPoints (0.45 against 0.4 and less); all five share S's 0.5 bin.
 		const singles = [
 			up(1, 0.4, 90),
 			up(2, 0.3, 80),
 			up(3, 0.2, 70),
 			up(4, 0.1, 60),
-			up(5, 0.5),
+			up(5, 0.45),
 		];
-		expect(openingBeam(singles, base, 0.5)).toEqual([1, 2, 5]);
+		expect(openingBeam(singles, base, 0.45)).toEqual([1, 2, 5]);
 		// When one of the best already earns its place, the beam is the best three.
-		expect(openingBeam([up(0, 1.5), ...singles], base, 0.5)).toEqual([
+		expect(openingBeam([up(0, 1.5), ...singles], base, 0.45)).toEqual([
 			0, 1, 2,
 		]);
 	});
@@ -292,7 +294,12 @@ describe("placement reason tokens (amendment 2 B4, scored by S)", () => {
 					dayLowPoints: 120.6,
 					weekLowPoints: 60,
 				}),
-				score({ lowPoint: 60, otherLow: 120, dayLowPoints: 120, weekLowPoints: 60 }),
+				score({
+					lowPoint: 60,
+					otherLow: 120,
+					dayLowPoints: 120,
+					weekLowPoints: 60,
+				}),
 			),
 		).toBe("five-hour-low+0.6");
 		expect(decidingReason(score({ typicalLow: 101.2 }), score({}))).toBe(
@@ -390,4 +397,47 @@ describe("planForecast cost", () => {
 		expect(longestMs).toBeLessThan(60);
 		expect(wallMs).toBeLessThan(5000);
 	}, 30_000);
+});
+
+describe("placement: a held account goes behind every unheld one (amendment 5, E3)", () => {
+	test("idle acct-a heads, open acct-c follows, held acct-b is last although its plan scores better", () => {
+		const now = prague(12, 7);
+		const ctx = makeCtx({
+			now,
+			accounts: [
+				account({ id: "acct-a" }),
+				account({ id: "acct-b" }),
+				account({ id: "acct-c", fiveUsed: 20, fiveReset: prague(12, 9) }),
+			],
+			rate: () => 0,
+			settings: { prewarm: false },
+		});
+		const score = (lowPoint: number): PlanScore => ({
+			lowPoint,
+			otherLow: 100,
+			dayLowPoints: lowPoint,
+			weekLowPoints: 100,
+			typicalLow: 50,
+			departures: 0,
+			poolPoints: 300,
+		});
+		const plan: SimPlan = {
+			openAt: [null, now + 60 * MIN, null],
+			preferred: null,
+			move: null,
+		};
+		const evaluated = (lowPoint: number) => ({
+			plan,
+			result: null as unknown as SimulationResult,
+			score: score(lowPoint),
+		});
+		const advice = placementOf(
+			ctx,
+			[evaluated(30), evaluated(40), evaluated(20)],
+			evaluated(30),
+			evaluated(30),
+		);
+		expect(advice?.tiers).toEqual([["acct-a"], ["acct-c"], ["acct-b"]]);
+		expect(advice?.rule).toBe("forecast-open");
+	});
 });

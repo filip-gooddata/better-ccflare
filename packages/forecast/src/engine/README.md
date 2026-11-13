@@ -76,8 +76,9 @@ New (unattached) demand, and an attached session whose account is full (failover
 4. an open usable account, the earliest 5-hour reset first;
 5. last resort: any usable account, a held one included (it opens then).
 
-Account priority is not an engine input, so the live router's priority tie-break is not modelled
-(every account ties on it). Also not modelled: the live probe backoff, the router's 120-second hold,
+Not modelled: account priority. The live router orders idle accounts by priority first; the engine
+has no priority input and treats all priorities as equal (both live priorities are 0 today), so among
+idle accounts it orders by weekly pace deficit, then index. Also not modelled: the live probe backoff, the router's 120-second hold,
 the Fable-family guard, cold-start rotation, and the live order among open accounts (the simulation
 always takes the earliest reset). A hold executed live can leak, because a request without a session
 key or stale advice places by the plain rules.
@@ -92,10 +93,11 @@ per-day lows (`levelOf` at `HEAVY_LEVEL`), and S = min(5-hour low, weekly low), 
 zero. Higher is better. Served lines, the response and its floor at 0 are unchanged; only the planner
 scores this way. Fable is not part of S.
 
-Order (`compareScores`): S higher by more than `TIER_TOLERANCE_POINTS`; else the other limit's low;
-else the typical day's unfloored low (min over both limits of the median per-day low); else fewer
-departures from on demand (`departuresOf`: openings, a preferred account, a move); else the exact
-values.
+Order (`compareScores`): S higher by its fixed `TIER_TOLERANCE_POINTS`-wide bin (floor of S ÷ 0.5);
+in one bin the other limit's low, then the typical day's unfloored low (min over both limits of the
+median per-day low), both also by bin; then fewer departures from on demand (`departuresOf`: openings,
+a preferred account, a move); then the exact values. Fixed bins keep the order transitive; a pairwise
+"within 0.5 points" test can rank three plans in a cycle.
 6. **Response** (`response.ts`, `stops.ts`, `past.ts`). Pointwise percentile lines (`percentile.ts`),
    stops, `stopNow`, shortfall, Fable `outAt`, and the past series.
 

@@ -4,7 +4,12 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EngineContext, SimulationResult } from "../model";
-import { compareScores, openingEarns, type PlanScore, scorePlan } from "../planner";
+import {
+	compareScores,
+	openingEarns,
+	type PlanScore,
+	scorePlan,
+} from "../planner";
 import { onDemandPlan, simulate } from "../simulate";
 import { account, HOUR, MIN, makeCtx, prague } from "./fixtures-sim";
 
@@ -23,7 +28,9 @@ function ctxOf(): EngineContext {
 }
 
 /** A result with the given per-day 5-hour lines and unserved units; weekly lines stay far from zero. */
-function resultOf(days: { day: number[]; unserved: number[] }[]): SimulationResult {
+function resultOf(
+	days: { day: number[]; unserved: number[] }[],
+): SimulationResult {
 	const length = days[0].day.length;
 	return {
 		axis: { times: Array.from({ length }, (_, i) => now + i * 5 * MIN) },
@@ -148,7 +155,12 @@ describe("score order and gates (amendment 5, E2 and E3)", () => {
 	const score = (over: Partial<PlanScore>): PlanScore => ({ ...base, ...over });
 
 	test("S higher first when it differs by more than 0.5 points, whatever the rest", () => {
-		const a = score({ lowPoint: 10.6, otherLow: 0, typicalLow: 0, departures: 3 });
+		const a = score({
+			lowPoint: 10.6,
+			otherLow: 0,
+			typicalLow: 0,
+			departures: 3,
+		});
 		expect(compareScores(a, base)).toBeLessThan(0);
 	});
 
@@ -164,7 +176,12 @@ describe("score order and gates (amendment 5, E2 and E3)", () => {
 	});
 
 	test("then fewer departures from on demand", () => {
-		const a = score({ lowPoint: 10.4, otherLow: 50.4, typicalLow: 30.4, departures: 1 });
+		const a = score({
+			lowPoint: 10.4,
+			otherLow: 50.4,
+			typicalLow: 30.4,
+			departures: 1,
+		});
 		expect(compareScores(base, a)).toBeLessThan(0);
 		expect(compareScores(a, score({ departures: 2 }))).toBeLessThan(0);
 	});
@@ -184,5 +201,40 @@ describe("score order and gates (amendment 5, E2 and E3)", () => {
 				0.5,
 			),
 		).toBe(false);
+	});
+});
+
+describe("score order is transitive (advisor point 3)", () => {
+	const score = (lowPoint: number, otherLow: number): PlanScore => ({
+		lowPoint,
+		otherLow,
+		dayLowPoints: lowPoint,
+		weekLowPoints: otherLow,
+		typicalLow: 30,
+		departures: 0,
+		poolPoints: 200,
+	});
+	// Pairwise "within 0.5" made A beat B (other low), B beat C (other low) and C beat A (S by 0.8).
+	const a = score(0, 2);
+	const b = score(0.4, 1);
+	const c = score(0.8, 0);
+
+	test("S by its 0.5-point bin: C (bin 1) first, then A before B (same bin, other low)", () => {
+		expect(compareScores(c, a)).toBeLessThan(0);
+		expect(compareScores(a, b)).toBeLessThan(0);
+		expect(compareScores(c, b)).toBeLessThan(0);
+	});
+
+	test("every input order sorts to the same order", () => {
+		const orders = [
+			[a, b, c],
+			[a, c, b],
+			[b, a, c],
+			[b, c, a],
+			[c, a, b],
+			[c, b, a],
+		];
+		for (const order of orders)
+			expect([...order].sort(compareScores)).toEqual([c, a, b]);
 	});
 });

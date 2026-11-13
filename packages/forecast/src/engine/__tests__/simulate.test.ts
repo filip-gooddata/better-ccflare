@@ -652,7 +652,8 @@ describe("an idle account first (amendment 5, E1)", () => {
 			],
 			k5: { "acct-a": 10, "acct-b": 10 },
 			rate: (_m, _w, at) =>
-				at < prague(12, 7, 30) || (at >= prague(12, 8, 20) && at < prague(12, 11))
+				at < prague(12, 7, 30) ||
+				(at >= prague(12, 8, 20) && at < prague(12, 11))
 					? 0.02
 					: 0,
 			settings: { prewarm: false },

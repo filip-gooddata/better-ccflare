@@ -153,16 +153,28 @@ function higher(a: number, b: number, tol: number): number {
 }
 
 /**
+ * The fixed TIER_TOLERANCE_POINTS-wide bin of a score value. Values in one bin tie; comparing bins,
+ * not pairwise distances, keeps the order transitive (pairwise "within 0.5" can cycle).
+ */
+function bin(value: number): number {
+	return Math.floor(value / TIER_TOLERANCE_POINTS);
+}
+
+/** Higher bin first; 0 when a and b share a bin. */
+function higherBin(a: number, b: number): number {
+	return bin(b) - bin(a);
+}
+
+/**
  * Score order (amendment 5, E2): negative when `a` is the better plan (sorts first), positive when `b`
- * is. S higher; within TIER_TOLERANCE_POINTS the other limit's low, then the typical low, then fewer
- * departures from on demand; then the exact values in the same order.
+ * is. S higher by its TIER_TOLERANCE_POINTS bin; in one bin the other limit's low, then the typical
+ * low (also by bin), then fewer departures from on demand; then the exact values in the same order.
  */
 export function compareScores(a: PlanScore, b: PlanScore): number {
-	const tol = TIER_TOLERANCE_POINTS;
 	return (
-		higher(a.lowPoint, b.lowPoint, tol) ||
-		higher(a.otherLow, b.otherLow, tol) ||
-		higher(a.typicalLow, b.typicalLow, tol) ||
+		higherBin(a.lowPoint, b.lowPoint) ||
+		higherBin(a.otherLow, b.otherLow) ||
+		higherBin(a.typicalLow, b.typicalLow) ||
 		a.departures - b.departures ||
 		higher(a.lowPoint, b.lowPoint, SCORE_EPS) ||
 		higher(a.otherLow, b.otherLow, SCORE_EPS) ||
@@ -171,11 +183,10 @@ export function compareScores(a: PlanScore, b: PlanScore): number {
 }
 
 function equalWithinTier(a: PlanScore, b: PlanScore): boolean {
-	const tol = TIER_TOLERANCE_POINTS;
 	return (
-		Math.abs(a.lowPoint - b.lowPoint) <= tol &&
-		Math.abs(a.otherLow - b.otherLow) <= tol &&
-		Math.abs(a.typicalLow - b.typicalLow) <= tol
+		bin(a.lowPoint) === bin(b.lowPoint) &&
+		bin(a.otherLow) === bin(b.otherLow) &&
+		bin(a.typicalLow) === bin(b.typicalLow)
 	);
 }
 
@@ -209,15 +220,18 @@ export function decidingReason(top: PlanScore, next: PlanScore): string | null {
 		Math.abs(value) >= REASON_MIN_GAIN_POINTS
 			? value.toFixed(1)
 			: String(Number(value.toPrecision(1)));
-	const tol = TIER_TOLERANCE_POINTS;
 	const other = () =>
 		top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
-	for (const eps of [tol, SCORE_EPS]) {
-		if (Math.abs(top.lowPoint - next.lowPoint) > eps)
+	const differs = [
+		(a: number, b: number) => bin(a) !== bin(b),
+		(a: number, b: number) => Math.abs(a - b) > SCORE_EPS,
+	];
+	for (const differ of differs) {
+		if (differ(top.lowPoint, next.lowPoint))
 			return `low-point+${points(top.lowPoint - next.lowPoint)}`;
-		if (Math.abs(top.otherLow - next.otherLow) > eps)
+		if (differ(top.otherLow, next.otherLow))
 			return `${other()}+${points(top.otherLow - next.otherLow)}`;
-		if (Math.abs(top.typicalLow - next.typicalLow) > eps)
+		if (differ(top.typicalLow, next.typicalLow))
 			return `typical-low+${points(top.typicalLow - next.typicalLow)}`;
 	}
 	return null;
@@ -488,7 +502,7 @@ function heldClosed(ctx: EngineContext, plan: SimPlan): number[] {
  * forecast-open; else the idle accounts the plan does not hold head them, also forecast-open; an
  * account the plan holds closed goes behind every other.
  */
-function placementOf(
+export function placementOf(
 	ctx: EngineContext,
 	preferred: Evaluated[],
 	baseline: Evaluated,
@@ -501,6 +515,7 @@ function placementOf(
 	);
 	const due = dueRoutingOpening(ctx, plan);
 	const head = due >= 0 ? [due] : idleUnheld(ctx, plan);
+	const held = heldClosed(ctx, plan).filter((j) => !head.includes(j));
 	if (head.length > 0 && head.length < ctx.accounts.length) {
 		const gain = lowPointGain(best.score, baseline.score);
 		const reason =
@@ -508,17 +523,16 @@ function placementOf(
 			decidingReason(best.score, baseline.score) ??
 			"no-preference";
 		const rest = tiers
-			.map((tier) => tier.filter((j) => !head.includes(j)))
+			.map((tier) => tier.filter((j) => !head.includes(j) && !held.includes(j)))
 			.filter((tier) => tier.length > 0);
 		return {
-			tiers: [head, ...rest].map((tier) =>
+			tiers: [head, ...rest, ...(held.length > 0 ? [held] : [])].map((tier) =>
 				tier.map((j) => ctx.accounts[j].accountId),
 			),
 			rule: "forecast-open",
 			reason,
 		};
 	}
-	const held = heldClosed(ctx, plan);
 	const ordered = [
 		...tiers.map((tier) => tier.filter((j) => !held.includes(j))),
 		...tiers.map((tier) => tier.filter((j) => held.includes(j))),
