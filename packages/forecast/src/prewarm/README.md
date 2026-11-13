@@ -2,7 +2,9 @@
 
 Opens an account's 5-hour window ahead of demand with one tiny request through the real `claude`
 CLI, pinned to that account. OFF by default (`forecast.prewarm = false`). Nothing here runs unless
-WIRING constructs it.
+WIRING constructs it. With it off a planned opening is not a pre-warm: routing sends the next new
+session to that account from the planned time (rule `forecast-open`), and this scheduler fires only
+the one-shot `prewarmTest`; `status().planned` lists the plan's openings either way.
 
 - `runner.ts`: `createClaudeCliRunner(options)` spawns the CLI once and keeps only the exit code
   and duration. `nodeClaudeCliIo()` supplies the real process, file system and clock.

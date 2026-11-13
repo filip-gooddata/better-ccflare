@@ -141,7 +141,7 @@ How the values are read:
 - Paths (`claudePath`, `transcriptsDir`): a leading `~` is expanded to the home directory and the result must be absolute. `none` turns the setting off, as do JSON `null` and an empty string in the config file.
 - `fanLevels`: in the environment a comma-separated list, or `none` for an empty fan; in the config file a JSON array. 10, 50 and 90 are dropped (they are always the named light, typical and heavy lines), duplicates are removed and the list is sorted. One bad entry makes the whole list invalid.
 - `prewarmTest`: in the environment JSON or `none`; in the config file a JSON object or `null`. `account` is an account name or id; `at` is epoch milliseconds or an ISO 8601 time with a zone (`Z` or `±hh:mm`).
-- Pre-warm is off by default (`prewarm` is `false`).
+- Pre-warm is off by default (`prewarm` is `false`). With it off, a window opening the forecast plans is made by routing: from the planned time the next new session goes to that account (rule `forecast-open`) and opens its window. With it on, a pre-warm request opens the window at that time.
 
 The config file is read once, at start, so an edit to it applies after the next restart. `GET /api/config/strategy` reports the resolved values under `forecastSettings` (see [Get Current Strategy](#get-current-strategy)). The response format is specified in [forecast-endpoint.md](forecast-endpoint.md). When the forecast is computed, how session-pace uses it, the pre-warm guards and log lines, and which settings decide what is built at start: [Interruption Forecast](routing-architecture.md#interruption-forecast).
 
