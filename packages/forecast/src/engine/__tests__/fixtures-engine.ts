@@ -21,6 +21,7 @@ import type {
 	LiveSession,
 } from "../../types";
 import { BUCKET_MS } from "../../types";
+import { createRng } from "../rng";
 import { prague, settings, TZ } from "./fixtures-sim";
 
 export { prague, TZ };
@@ -61,6 +62,11 @@ export interface EngineFixture {
 	fiveHour: { a: AccountLimits["fiveHour"]; b: AccountLimits["fiveHour"] };
 	settings?: ForecastSettings;
 	sessions?: LiveSession[];
+	/**
+	 * Jitter on every reading's resetsAt, as the upstream sends it (default true): 0.1 to
+	 * 1.1 s either way, never whole seconds, seeded so every run sees the same numbers.
+	 */
+	resetJitter?: boolean;
 }
 
 interface Served {
@@ -179,6 +185,12 @@ function readingsFor(
 	f: EngineFixture,
 ): { readings: LimitReading[]; weeklyUsed: { a: number; b: number } } {
 	const readings: LimitReading[] = [];
+	const rng = createRng("fixtures-engine reset jitter");
+	const jitter = (reset: EpochMs): EpochMs => {
+		if (f.resetJitter === false) return reset;
+		const ms = 100 + 1 + rng.int(999);
+		return reset + (rng.uniform() < 0.5 ? -ms : ms);
+	};
 	const cum = { "acct-a": 0, "acct-b": 0 };
 	const instance: Record<string, EpochMs> = {};
 	const todayStart = localDayStart(f.now, TZ);
@@ -198,7 +210,7 @@ function readingsFor(
 			at,
 			window: "seven_day",
 			usedPct: Math.round(used),
-			resetsAt: reset,
+			resetsAt: jitter(reset),
 		});
 		readings.push(
 			weekly(s.from, before),
@@ -214,14 +226,14 @@ function readingsFor(
 				at: opened,
 				window: "five_hour",
 				usedPct: 0,
-				resetsAt: opened + 5 * 3_600_000,
+				resetsAt: jitter(opened + 5 * 3_600_000),
 			},
 			{
 				accountId: s.account,
 				at: firstHourEnd,
 				window: "five_hour",
 				usedPct: Math.round(K_FIVE_HOUR * firstHour),
-				resetsAt: opened + 5 * 3_600_000,
+				resetsAt: jitter(opened + 5 * 3_600_000),
 			},
 		);
 	}

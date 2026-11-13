@@ -21,6 +21,15 @@ export const MIN_CALIBRATION_POINTS = 5;
 /** The weighted unit sum must exceed this for an account's own k (a ratio needs a positive denominator). */
 export const MIN_CALIBRATION_UNITS = 0;
 
+/**
+ * How far a reading's resetsAt may lie from its window instance's first reading and still
+ * belong to it. The upstream sends one window's reset time with sub-second jitter (measured:
+ * at most about 1 s), while a real new window moves it by hours (5-hour limit) or days
+ * (weekly limits). Comparing with the instance's first reading, not the previous one, keeps
+ * a slow drift from chaining two windows together.
+ */
+export const RESET_TIME_TOLERANCE_MS = 60_000;
+
 /** Recency weight of something ageDays old: 0.5^(age / half-life) (exponential forgetting). */
 export function recencyWeight(ageDays: number, halfLifeDays: number): number {
 	if (!(halfLifeDays > 0)) return 1;
@@ -75,10 +84,26 @@ function ownK(e: Evidence | undefined): number | null {
 	return e.weightedPoints / e.weightedUnits;
 }
 
+/** `cur` continues the window instance that `head` opened and `prev` last extended (amendment 3, C1). */
+function sameInstance(
+	head: LimitReading,
+	prev: LimitReading,
+	cur: LimitReading,
+): boolean {
+	return (
+		head.resetsAt !== null &&
+		cur.resetsAt !== null &&
+		Math.abs(cur.resetsAt - head.resetsAt) <= RESET_TIME_TOLERANCE_MS &&
+		cur.usedPct >= prev.usedPct
+	);
+}
+
 /**
  * k = Σ w·Δpoints ÷ Σ w·units over window instances (ratio of sums, not a mean of
- * ratios). A window instance is a run of consecutive readings of one account and
- * limit with the same non-null resetsAt; Δpoints = last − first, never negative;
+ * ratios). A window instance is a maximal run of consecutive readings of one account
+ * and limit whose resetsAt is non-null and within RESET_TIME_TOLERANCE_MS of the run's
+ * first reading, and whose level never falls (a fall means the upstream counter was
+ * reset inside the window; each side is its own evidence). Δpoints = last − first, never negative;
  * units = the account's proxy-sourced demand between the two readings; w = the
  * recency weight of the instance's last reading. Instances ending before the
  * lookback are ignored. A missing k falls back to the largest own k of the other
@@ -129,8 +154,8 @@ export function calibrate(
 		for (let i = 1; i <= list.length; i++) {
 			const prev = list[i - 1] as LimitReading;
 			const cur = list[i];
-			if (cur && cur.resetsAt === prev.resetsAt) continue;
 			const head = list[runStart] as LimitReading;
+			if (cur && sameInstance(head, prev, cur)) continue;
 			runStart = i;
 			if (head.resetsAt === null || prev === head || prev.at < since) continue;
 			const delta = Math.max(0, prev.usedPct - head.usedPct);
