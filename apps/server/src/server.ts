@@ -33,6 +33,10 @@ import {
 	DatabaseFactory,
 	initPayloadEncryption,
 } from "@better-ccflare/database";
+import {
+	createClaudeCliRunner,
+	nodeClaudeCliIo,
+} from "@better-ccflare/forecast";
 import { AlertService, APIRouter, AuthService } from "@better-ccflare/http-api";
 import { localTimeZone } from "@better-ccflare/load-balancer";
 import { Logger, setConsoleLogging } from "@better-ccflare/logger";
@@ -101,6 +105,11 @@ import type {
 import { serve } from "bun";
 import { createUnservedApiGuard } from "./api-guard";
 import { createCodexUsageRefresher } from "./codex-usage-refresher";
+import {
+	awaitForecastStop,
+	createForecastWiring,
+	type ForecastWiring,
+} from "./forecast-wiring";
 import {
 	buildStrategy,
 	sessionPaceOptionsFrom,
@@ -200,6 +209,8 @@ export function createUsageSnapshotRecorder(
 	logger: Logger,
 ): (accountId: string, data: UsageData) => Promise<void> {
 	return async (accountId, data) => {
+		// The reading arrived now; persistence below may take a while.
+		const readAt = Date.now();
 		if (account.provider === "codex") {
 			const usage = data as unknown as Record<string, unknown>;
 			try {
@@ -232,7 +243,33 @@ export function createUsageSnapshotRecorder(
 			);
 		}
 		await applyUsagePauseThresholds(accountId, data, dbOps, logger);
+		if (account.provider === "anthropic") {
+			notifyUsageSnapshotListener(accountId, readAt);
+		}
 	};
+}
+
+let usageSnapshotListener:
+	| ((accountId: string, readAt: number) => void)
+	| null = null;
+
+/**
+ * Register the one listener told about every recorded Anthropic usage
+ * snapshot (the forecast's usage-poll moment) with when the reading arrived;
+ * null removes it.
+ */
+export function setUsageSnapshotListener(
+	listener: ((accountId: string, readAt: number) => void) | null,
+): void {
+	usageSnapshotListener = listener;
+}
+
+function notifyUsageSnapshotListener(accountId: string, readAt: number): void {
+	try {
+		usageSnapshotListener?.(accountId, readAt);
+	} catch {
+		// A listener failure must not cost the poller its snapshot.
+	}
 }
 
 /**
@@ -823,6 +860,7 @@ let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
+let forecastWiring: ForecastWiring | null = null;
 let memoryMonitorInterval: Timer | null = null;
 // Track usage polling retry timeouts for cleanup
 const usagePollingRetryTimeouts = new Map<string, NodeJS.Timeout>();
@@ -1535,6 +1573,24 @@ export default async function startServer(options?: {
 	});
 	stopVacuumCatchUpJob = unregisterVacuumCatchUp;
 
+	// Interruption forecast: constructs nothing when disabled at start-up.
+	const forecast = createForecastWiring({
+		config,
+		dbOps,
+		usage: usageCache,
+		pace: () => sessionPaceSettings(currentStrategy, config, startTimeZone),
+		proxyPort: () => serverInstance?.port ?? port,
+		proxyApiKey: () => null,
+		createRunner: (context) =>
+			createClaudeCliRunner({ ...nodeClaudeCliIo(), ...context }),
+	});
+	forecastWiring = forecast;
+	setUsageSnapshotListener(
+		forecast.service
+			? (accountId, readAt) => forecast.onUsageSnapshot(accountId, readAt)
+			: null,
+	);
+
 	const apiRouter = new APIRouter({
 		db,
 		config,
@@ -1577,6 +1633,7 @@ export default async function startServer(options?: {
 			sessionPaceSettings(currentStrategy, config, startTimeZone),
 		internalProbeSecret,
 		localControlSecret,
+		getForecast: forecast.provider,
 	});
 	const unservedApiGuard = createUnservedApiGuard({
 		logger: new Logger("ApiGuard"),
@@ -1729,9 +1786,12 @@ export default async function startServer(options?: {
 	});
 
 	strategy.initialize?.(strategyStore);
+	forecast.attachToStrategy(strategy);
 	currentStrategy = strategy;
 
-	await initProxy(() => config.getStorePayloads());
+	await initProxy(() => config.getStorePayloads(), {
+		servedUsageSink: forecast.servedUsageSink,
+	});
 
 	// Proxy context
 	const proxyContext: ProxyContext = {
@@ -1869,6 +1929,7 @@ export default async function startServer(options?: {
 				startTimeZone,
 			);
 			strategy.initialize?.(strategyStore);
+			forecast.attachToStrategy(strategy);
 			proxyContext.strategy = strategy;
 			currentStrategy = strategy;
 		}
@@ -2592,6 +2653,14 @@ async function handleGracefulShutdown(signal: string) {
 			cacheKeepaliveScheduler.stop();
 			cacheKeepaliveScheduler = null;
 		}
+		// Stop the forecast with the other triggers so no pre-warm starts while
+		// requests drain. A run already in flight is awaited after the drain,
+		// but never past the drain deadline, so the watchdog margin stays
+		// reserved for the usage drain and the database close.
+		setUsageSnapshotListener(null);
+		const forecastStopping = forecastWiring?.stop() ?? Promise.resolve();
+		const forecastDeadline = Date.now() + drainMs;
+		forecastWiring = null;
 
 		// Stop memory monitoring
 		if (memoryMonitorInterval) {
@@ -2679,6 +2748,18 @@ async function handleGracefulShutdown(signal: string) {
 		}
 
 		usageCache.clear(); // Stop all usage polling
+		// Before the database closes: the cycle and pre-warm records write to it.
+		const forecastStopped = await awaitForecastStop(
+			forecastStopping,
+			forecastDeadline - Date.now(),
+			undefined,
+			(error) => console.error("Forecast stop failed:", error),
+		);
+		if (!forecastStopped) {
+			console.error(
+				"Forecast pre-warm still running at the drain deadline; closing without it",
+			);
+		}
 		await drainUsageCollector();
 		await shutdown();
 		console.log("✅ Shutdown complete");
