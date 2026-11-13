@@ -112,6 +112,8 @@ describe("createUnservedApiGuard", () => {
 		["GET", "/%61pi%23frag"],
 		["GET", "/%61pi;x=1/nope"],
 		["GET", "/%61p%09i/nope"],
+		// Dropping the decoded tab joins "%6" and "1" into a new escape.
+		["GET", "/%6%091pi/nope"],
 		["POST", "/%61pi/event_logging/batch"],
 		["HEAD", "/%61pi/hello"],
 		["HEAD", "/api%2Fhello"],
@@ -133,6 +135,11 @@ describe("createUnservedApiGuard", () => {
 		["GET", "/api%"],
 		["GET", "/%api/nope"],
 		["GET", "/%25zzapi/nope"],
+		// Two malformed escapes allow mixed readings ("%zz" dropped whole,
+		// "%i" losing only its '%' reads /api/nope), so any such path is
+		// refused, API or not.
+		["GET", "/%zzap%i/nope"],
+		["POST", "/v1/messages%zz%zz"],
 	])("refuses the malformed escape %s %s that could read as an API path", (method, path) => {
 		const { check } = guardAt({ now: 0 });
 		expect(check(method, path)?.status).toBe(404);
@@ -150,6 +157,8 @@ describe("createUnservedApiGuard", () => {
 		["GET", "/%61piary"],
 		["GET", "/api%2Dx"],
 		["GET", "/x/%2e%2e/apiary"],
+		// Encoded exactly as deeply as the guard decodes (16 passes).
+		["POST", `/v1/messages%${"25".repeat(15)}3Fbeta=true`],
 	])("leaves the non-API path %s %s alone under every reading", (method, path) => {
 		const { check, warnings } = guardAt({ now: 0 });
 		expect(check(method, path)).toBeNull();
