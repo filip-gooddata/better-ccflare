@@ -282,6 +282,24 @@ export type UnavailableDetail =
 	  }
 	| { rule: "calibration"; limits: CalibrationLimitDetail[] };
 
+/** The day factor of design amendment 4 (D1) with its inputs. */
+export interface DayFactorDetail {
+	/** The factor the simulation uses: 1 + (clamped − 1) × weight. */
+	a: number;
+	/** (Y + c) ÷ (M + c). */
+	raw: number;
+	/** raw clamped to [DAY_FACTOR_MIN, DAY_FACTOR_MAX]. */
+	clamped: number;
+	/** Evidence weight min(1, M ÷ c). */
+	weight: number;
+	/** Today's units since local midnight. */
+	y: number;
+	/** The pool's weighted mean units over the same clock span. */
+	m: number;
+	/** DAY_FACTOR_PRIOR_SHARE × the pool's weighted mean daily total. */
+	c: number;
+}
+
 export type ForecastResult =
 	| { available: true; response: ForecastResponse; plan: Plan }
 	| {

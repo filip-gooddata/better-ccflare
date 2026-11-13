@@ -6,6 +6,7 @@ import type {
 	AccountId,
 	AccountLimits,
 	Calibration,
+	DayFactorDetail,
 	EpochMs,
 	ForecastInput,
 } from "../types";
@@ -93,7 +94,11 @@ export interface Scenarios {
 		noiseMode: NoiseMode;
 		/** Scale bandwidth h per pool used, keyed by the date it served ("YYYY-MM-DD"). */
 		bandwidths: Record<string, number>;
+		/** The factor applied to today (day.a). */
 		dayFactor: number;
+		/** The day factor with its inputs (design amendment 4, D1). */
+		day: DayFactorDetail;
+		/** Units per BUCKET_MS bucket over the last hour. */
 		recentRate: number;
 	};
 }

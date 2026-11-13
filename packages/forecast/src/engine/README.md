@@ -33,8 +33,20 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    no logarithm: they are left out of h, m and s², and a drawn zero-total day stays 0 with no scale noise.
    A pool with h = 0 or s² = 0 gets no scale noise. The unshrunk mode multiplies by exp(h·ε) instead.
    In both kernel modes it adds kernel noise on time: a uniform whole-bucket
-   shift within ±`timeShiftMin`. Today is scaled by the call-centre intraday day-factor update
-   a = (Y + c) ÷ (M + c). The last hour's rate is blended in with an exponentially decaying weight
+   shift within ±`timeShiftMin`. Today is scaled by the call-centre intraday day-factor update with an
+   evidence weight (design amendment 4): Y is today's units since local midnight, M the pool's weighted
+   mean units over the same clock span, c = `DAY_FACTOR_PRIOR_SHARE` × the pool's weighted mean daily
+   total (the pool is today's, so a weekend day uses the weekend pool); a_cl = (Y + c) ÷ (M + c) clamped
+   to [`DAY_FACTOR_MIN`, `DAY_FACTOR_MAX`], w = min(1, M ÷ c), and a = 1 + (a_cl − 1) × w. The ratio
+   assumes that demand so far is proportional to the day's demand; in a span where the pool has almost
+   no demand (a night) usage says nothing about the rest of the day, yet the ratio is at its most
+   extreme, so its effect grows with the pool's own evidence. The clamp comes first, so the span moves
+   the day by at most 1 + 3w up and 1 − 0.75w down whatever Y is. w reaches 1 once the pool's mean day
+   has accumulated a quarter of its total (late morning for the work-day pool); from then on a is the
+   clamped ratio. Known cost: an unusually early heavy morning gets its lift only as the pool's own day
+   gets under way; until then the load reaches the forecast through the current levels and the
+   last-hour blend. An empty pool, M + c not above 0, or c = 0 gives a = 1.
+   The last hour's rate is blended in with an exponentially decaying weight
    e^(−h/τ). The generator is seeded from the local day key.
 5. **Planner** (`planner.ts`, `simulate.ts`, `move-cost.ts`). This is a scenario-based receding-horizon
    search over openings, order and at most one move. Each candidate is a simulated depletion of every

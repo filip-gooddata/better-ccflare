@@ -12,7 +12,7 @@ import {
 	localDayStart,
 	localParts,
 } from "../time";
-import type { EpochMs, ForecastInput } from "../types";
+import type { DayFactorDetail, EpochMs, ForecastInput } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, poolFor } from "./days";
 import type {
@@ -149,6 +149,21 @@ export function dayFactor(
 	now: EpochMs,
 	timeZone: string,
 ): number {
+	return dayFactorDetail(table, pool, now, timeZone).a;
+}
+
+/**
+ * Design amendment 4, D1: the clamped ratio (Y + c) ÷ (M + c), weighted by the evidence
+ * w = min(1, M ÷ c) as a = 1 + (a_cl − 1) × w. Clamp first, then weight, so a burst in a span
+ * where the pool has little demand moves the day by at most 1 + 3w up or 1 − 0.75w down.
+ */
+export function dayFactorDetail(
+	table: DayTable,
+	pool: RecordedDay[],
+	now: EpochMs,
+	timeZone: string,
+): DayFactorDetail {
+	const y = table.today.unitsSoFar;
 	let weight = 0;
 	let total = 0;
 	let sameSpan = 0;
@@ -164,12 +179,24 @@ export function dayFactor(
 		total += d.weight * d.total;
 		sameSpan += d.weight * prefixUnits(d, elapsed);
 	}
-	if (!(weight > 0)) return 1;
+	const neutral = (m: number, c: number): DayFactorDetail => ({
+		a: 1,
+		raw: 1,
+		clamped: 1,
+		weight: 0,
+		y,
+		m,
+		c,
+	});
+	if (!(weight > 0)) return neutral(0, 0);
 	const c = DAY_FACTOR_PRIOR_SHARE * (total / weight);
 	const m = sameSpan / weight;
-	if (!(m + c > 0)) return 1;
-	const a = (table.today.unitsSoFar + c) / (m + c);
-	return Math.min(DAY_FACTOR_MAX, Math.max(DAY_FACTOR_MIN, a));
+	// c = 0: every day of the pool is empty, so there is no evidence to weigh
+	if (!(m + c > 0) || !(c > 0)) return neutral(m, c);
+	const raw = (y + c) / (m + c);
+	const clamped = Math.min(DAY_FACTOR_MAX, Math.max(DAY_FACTOR_MIN, raw));
+	const w = Math.min(1, m / c);
+	return { a: 1 + (clamped - 1) * w, raw, clamped, weight: w, y, m, c };
 }
 
 /** Index of each wall-clock slot (minute of day ÷ bucket) in a recorded day; -1 for a slot the day skipped. */
@@ -259,7 +286,8 @@ export async function buildScenarios(
 	);
 
 	const todayPool = poolFor(table, table.today.type);
-	const factorToday = dayFactor(table, todayPool, now, tz);
+	const dayToday = dayFactorDetail(table, todayPool, now, tz);
+	const factorToday = dayToday.a;
 	const maps = new Map<RecordedDay, Int32Array | null>();
 	const bandwidths: Record<string, number> = {};
 	const dates: DatePlan[] = [];
@@ -379,6 +407,7 @@ export async function buildScenarios(
 			noiseMode: mode,
 			bandwidths,
 			dayFactor: factorToday,
+			day: dayToday,
 			recentRate: r,
 		},
 	};

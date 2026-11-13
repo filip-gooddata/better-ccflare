@@ -190,6 +190,7 @@ export function makeCtx(spec: CtxSpec): EngineContext {
 				noiseMode: "off",
 				bandwidths: {},
 				dayFactor: 1,
+				day: { a: 1, raw: 1, clamped: 1, weight: 0, y: 0, m: 0, c: 0 },
 				recentRate: 0,
 			},
 		},

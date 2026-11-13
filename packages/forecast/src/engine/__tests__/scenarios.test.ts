@@ -231,6 +231,69 @@ describe("dayFactor", () => {
 		const { table } = flatTable(1);
 		expect(dayFactor(table, [], NOW, TZ)).toBe(1);
 	});
+
+	test("a pool whose days are all empty (c = 0) gives 1", () => {
+		const { table, pool } = flatTable(5);
+		const empty = pool.map((d) => ({
+			...d,
+			units: new Float64Array(288),
+			total: 0,
+		}));
+		expect(dayFactor(table, empty, NOW, TZ)).toBe(1);
+	});
+
+	// amendment 4, D1: c = 0.72 for flatTable; M = 0.01 per elapsed 5 minutes, so w = M ÷ c
+	// reaches 1 at 06:00 local (72 buckets).
+	const C_FLAT = 0.72;
+	function weightAt(t: number): number {
+		const m = (localParts(t, TZ).minuteOfDay / 5) * 0.01;
+		return Math.min(1, m / C_FLAT);
+	}
+
+	test("before the pool's day is a quarter done, the clamped factor is weighted by M ÷ c (amendment 4)", () => {
+		// 02:00 local: M = 0.24, w = 1/3; Y = 100 → raw (100.72 / 0.96) clamps to 4
+		const twoAm = Date.UTC(2026, 10, 12, 1, 0);
+		const { table, pool } = flatTable(100);
+		expect(dayFactor(table, pool, twoAm, TZ)).toBeCloseTo(
+			1 + (DAY_FACTOR_MAX - 1) / 3,
+			12,
+		);
+		// quiet: Y = 0 → raw 0.72 / 0.96 = 0.75, inside the range, weighted by 1/3
+		const quiet = flatTable(0);
+		expect(dayFactor(quiet.table, quiet.pool, twoAm, TZ)).toBeCloseTo(
+			1 + (0.75 - 1) / 3,
+			12,
+		);
+	});
+
+	test("once M ≥ c the factor is exactly the clamped ratio, upward and downward (amendment 4)", () => {
+		// 10:00: w = 1 (M = 1.2 ≥ c)
+		expect(weightAt(NOW)).toBe(1);
+		const up = flatTable(2.4);
+		expect(dayFactor(up.table, up.pool, NOW, TZ)).toBeCloseTo(3.12 / 1.92, 12);
+		const quiet = flatTable(0);
+		const a = dayFactor(quiet.table, quiet.pool, NOW, TZ);
+		expect(a).toBeCloseTo(0.72 / 1.92, 12);
+		expect(a).toBeLessThan(1);
+	});
+
+	test("for any Y the factor stays within 1 + (MAX − 1)·w and 1 − (1 − MIN)·w, and is continuous in the time of day (amendment 4)", () => {
+		const dayStart = localDayStart(NOW, TZ);
+		for (const y of [0, 0.05, 0.5, 2.4, 10, 1000]) {
+			const { table, pool } = flatTable(y);
+			let prev: number | null = null;
+			for (let min = 0; min < 1440; min++) {
+				const t = dayStart + min * 60_000;
+				const w = weightAt(t);
+				const a = dayFactor(table, pool, t, TZ);
+				expect(a).toBeLessThanOrEqual(1 + (DAY_FACTOR_MAX - 1) * w + 1e-12);
+				expect(a).toBeGreaterThanOrEqual(1 - (1 - DAY_FACTOR_MIN) * w - 1e-12);
+				// one minute moves w by at most 0.002 / 0.72 and the ratio by a little: no jump
+				if (prev !== null) expect(Math.abs(a - prev)).toBeLessThan(0.02);
+				prev = a;
+			}
+		}
+	});
 });
 
 describe("buildScenarios", () => {

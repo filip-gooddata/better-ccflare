@@ -34,8 +34,13 @@ import {
 const MIN = 60_000;
 // The median simulated day's first 5-hour fills must land within these of the recorded ones
 // (research 17): a simulated median, not a claim of exact replay. acct-a's median fill is 13:25.
-// The recorded day lies on the heavy side of its pool: the heavy line reproduces acct-b's 14:55
-// refusal exactly (BASELINE_STOP), while the median day fills acct-b at 15:18, 23 minutes later.
+// The recorded day lies on the heavy side of its pool: the heavy line puts acct-b's stop at 14:53,
+// two minutes before the recorded 14:55 refusal (BASELINE_STOP), while the median day fills acct-b
+// at 15:18. Day factor (amendment 4): at 07:00 the pool's mean day has 3.0 of its 182 units behind
+// it (w = M ÷ c = 0.067), so today's factor is 0.9997 where the unweighted rule gave 0.9956; the
+// slightly heavier day moved the heavy stop from 14:55 to 14:53, the typical stop from 15:20 to
+// 15:16 and left two short heavy-line stops under the 10:00 opening (14:53–15:00, 18:10–18:20)
+// that the planner's score does not count (its stop minutes stay 0 against 60 on demand).
 const TRACE_TOLERANCE_A_MS = 15 * MIN;
 const TRACE_TOLERANCE_B_MS = 30 * MIN;
 
@@ -69,18 +74,23 @@ function medianFirstFull(sim: SimulationResult, account: number): EpochMs {
 	return at[Math.floor(at.length / 2)] ?? Number.NaN;
 }
 
-// on demand: the recorded stop (refused 14:54:46, reset 16:00) on the heavy line
-const BASELINE_STOP = { start: prague(12, 14, 55), end: prague(12, 16) };
-// routing every new session to acct-b from 07:00 (no planned opening): one shorter, later stop
-const ROUTED_STOP = { start: prague(12, 16, 14), end: prague(12, 17) };
-// the typical (p50) line: the recorded day itself had a stop
+// on demand: the recorded stop (refused 14:54:46, reset 16:00) on the heavy line (14:55 before amendment 4)
+const BASELINE_STOP = { start: prague(12, 14, 53), end: prague(12, 16) };
+// routing every new session to acct-b from 07:00 (no planned opening): one shorter, later stop (16:14 before)
+const ROUTED_STOP = { start: prague(12, 16, 13), end: prague(12, 17) };
+// the typical (p50) line: the recorded day itself had a stop (15:20 before)
 const TYPICAL_BASELINE_STOP = {
-	start: prague(12, 15, 20),
+	start: prague(12, 15, 16),
 	end: prague(12, 16),
 };
+// the heavy line under the 10:00 opening (none before amendment 4); the planner's score counts 0 minutes
+const PLANNED_HEAVY_STOPS = [
+	{ start: prague(12, 14, 53), end: prague(12, 15) },
+	{ start: prague(12, 18, 10), end: prague(12, 18, 20) },
+];
 
 describe("2026-11-12 replay through compute()", () => {
-	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:55–16:00, typical stop 15:20–16:00", async () => {
+	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:53–16:00, typical stop 15:16–16:00", async () => {
 		const ctx = await contextOf(buildInput(replayFixture()));
 		const { baseline } = await planForecast(ctx);
 		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
@@ -101,7 +111,7 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(base.stops.typical).toEqual([TYPICAL_BASELINE_STOP]);
 	});
 
-	test("pre-warm off: the plan routes new sessions to acct-b from 10:00 (design 4.5); its window opens through the first demand at 10:00 and no heavy or typical stop is left, as with pre-warm", async () => {
+	test("pre-warm off: the plan routes new sessions to acct-b from 10:00 (design 4.5); its window opens through the first demand at 10:00; no typical stop and no scored heavy stop is left, as with pre-warm", async () => {
 		const input = buildInput(replayFixture());
 		const result = await createForecastEngine().compute(input);
 		if (!result.available) throw new Error(result.reason);
@@ -125,16 +135,17 @@ describe("2026-11-12 replay through compute()", () => {
 			);
 		expect(heavyLow(day)).toBe(0);
 		expect(heavyLow(base)).toBe(0);
-		expect(stops(day)).toEqual([]);
+		expect(stops(day)).toEqual(PLANNED_HEAVY_STOPS);
 		expect(stops(base)).toEqual([BASELINE_STOP]);
 		expect(score.stopMinutes).toBe(0);
 		expect(baseline.score.stopMinutes).toBe(60);
 		expect(score.weekLowPoints).toBeCloseTo(82.15, 1);
 		expect(day.stops.typical).toEqual([]);
-		expect(Math.min(...day.typical)).toBeCloseTo(9, 1);
+		// 9.0 before amendment 4
+		expect(Math.min(...day.typical)).toBeCloseTo(8.3, 1);
 	});
 
-	test("pre-warm off, why 10:00 and not all new sessions to acct-b from 07:00: that preference leaves a 40-minute heavy stop (16:14–17:00), the 10:00 routing-opening none", async () => {
+	test("pre-warm off, why 10:00 and not all new sessions to acct-b from 07:00: that preference leaves a 40-minute heavy stop (16:13–17:00), the 10:00 routing-opening none", async () => {
 		const ctx = await contextOf(buildInput(replayFixture()));
 		const base = onDemandPlan(ctx);
 		const preferSim = await simulate(ctx, { ...base, preferred: 1 });
@@ -151,7 +162,7 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(compareScores(open10, preferB)).toBeLessThan(0);
 	});
 
-	test("pre-warm on: the planner opens acct-b at 10:00 ahead of demand; no heavy or typical stop is left and the heavy low point is not lower than on demand", async () => {
+	test("pre-warm on: the planner opens acct-b at 10:00 ahead of demand; no typical stop and no scored heavy stop is left and the heavy low point is not lower than on demand", async () => {
 		const input = buildInput(
 			replayFixture({ settings: defaultSettings({ prewarm: true }) }),
 		);
@@ -167,7 +178,7 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(result.plan.placement?.rule).toBe("forecast-lookahead");
 		expect(result.plan.placement?.reason).toBe("reset-soon");
 		expect(result.plan.placement?.tiers).toEqual([["acct-a"], ["acct-b"]]);
-		expect(stops(day)).toEqual([]);
+		expect(stops(day)).toEqual(PLANNED_HEAVY_STOPS);
 		expect(score.stopMinutes).toBe(0);
 		expect(score.stopMinutes).toBeLessThan(baseline.score.stopMinutes);
 		expect(heavyLow(day)).toBeGreaterThanOrEqual(heavyLow(base));
