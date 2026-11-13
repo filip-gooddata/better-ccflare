@@ -199,6 +199,7 @@ export function makeTrace(axis: SampleAxis, spec: TraceSpec): SimTrace {
 		unserved,
 		outs: spec.outs ?? [],
 		fableOutAt: spec.fableOutAt ?? [null, null],
+		opens: [],
 	};
 }
 

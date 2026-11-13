@@ -80,8 +80,10 @@ function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
 			while (at <= now) at += WEEK_MS;
 			for (; at <= end; at += WEEK_MS) add(at);
 		}
+		// A planned opening resets 5 hours after its time: with pre-warm on always, with pre-warm off
+		// when demand is there at that time (else both values of the pair are equal).
 		const openAt = plan.openAt[index];
-		if (ctx.input.settings.prewarm && openAt != null && !isOpenNow(ctx, index))
+		if (openAt != null && !isOpenNow(ctx, index))
 			add(Math.max(openAt, now) + FIVE_HOUR_MS);
 	});
 	return [...jumps].sort((a, b) => a - b);
@@ -91,7 +93,7 @@ function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
  * Shared axis: now; every 5 minutes on the clock to fineEnd; every full hour to simEnd (both ends
  * included); horizon.dayEnd and horizon.weekEnd once each (twice when also a jump); every
  * deterministic jump twice (value before, value after). A reset of a window the
- * simulation itself opened is not on the axis; inside the 5-minute part (the 5-hour score window) a
+ * simulation itself opened on demand is not on the axis; inside the 5-minute part (the 5-hour score window) a
  * dip it hides lasts less than one step.
  */
 export function buildSampleAxis(ctx: EngineContext, plan: SimPlan): SampleAxis {
@@ -253,6 +255,7 @@ class DayRun {
 	prefActive = false;
 	unserved = 0;
 	outs: SimTrace["outs"] = [];
+	opens: SimTrace["opens"] = [];
 	fableOutAt: (EpochMs | null)[] = [];
 
 	constructor(readonly p: Prepared) {
@@ -277,6 +280,7 @@ class DayRun {
 		const { ctx, plan } = this.p;
 		const now = ctx.now;
 		this.outs = [];
+		this.opens = [];
 		this.fableOutAt = [];
 		this.unserved = 0;
 		this.prefActive = plan.preferred !== null;
@@ -325,8 +329,15 @@ class DayRun {
 		return !(this.isOpen(j) && this.used5[j] >= FULL_POINTS);
 	}
 
-	/** Account for unattached demand at t: preference, then base order (design 4.5); -1 when none. */
+	/**
+	 * Account for unattached demand at t; -1 when none (design 4.5). First a closed account whose
+	 * planned opening has come (only left pending with pre-warm off: the opening then means "route
+	 * unattached demand here from that time", and the first demand opens the window), then the
+	 * preference, then the base order.
+	 */
 	pick(t: EpochMs): number {
+		const due = this.dueOpening(t);
+		if (due >= 0) return due;
 		const preferred = this.p.plan.preferred;
 		// A preference never routes to an account ahead of its planned opening time.
 		if (
@@ -341,10 +352,6 @@ class DayRun {
 			if (this.isOpen(j) && this.usable(j, t))
 				if (best < 0 || this.reset5[j] < this.reset5[best]) best = j;
 		if (best >= 0) return best;
-		for (let j = 0; j < this.n; j++)
-			if (this.openPending[j] && this.openAt[j] <= t && this.usable(j, t))
-				if (best < 0 || this.openAt[j] < this.openAt[best]) best = j;
-		if (best >= 0) return best;
 		// Last resort: closed accounts with no planned opening first, so a scheduled opening keeps its time.
 		for (let j = 0; j < this.n; j++)
 			if (!this.openPending[j] && this.usable(j, t)) return j;
@@ -352,7 +359,22 @@ class DayRun {
 		return -1;
 	}
 
+	/** Closed account whose planned opening has come, earliest planned first; -1 when none. */
+	dueOpening(t: EpochMs): number {
+		let best = -1;
+		for (let j = 0; j < this.n; j++)
+			if (
+				this.openPending[j] &&
+				!this.isOpen(j) &&
+				this.openAt[j] <= t &&
+				this.usable(j, t)
+			)
+				if (best < 0 || this.openAt[j] < this.openAt[best]) best = j;
+		return best;
+	}
+
 	open(j: number, t: EpochMs): void {
+		this.opens.push({ account: j, at: t });
 		this.reset5[j] = t + FIVE_HOUR_MS;
 		this.used5[j] = 0;
 		if (this.openPending[j] && this.openAt[j] <= t) this.openPending[j] = 0;
@@ -402,6 +424,7 @@ class DayRun {
 			if (this.p.prewarm && this.openPending[j] && this.openAt[j] <= t) {
 				this.openPending[j] = 0;
 				if (!this.isOpen(j) && this.usable(j, this.openAt[j])) {
+					this.opens.push({ account: j, at: this.openAt[j] });
 					this.reset5[j] = this.openAt[j] + FIVE_HOUR_MS;
 					this.used5[j] = 0;
 				}
@@ -463,7 +486,13 @@ class DayRun {
 			}
 			const free = rate * (1 - (p.sessionShare.length > 0 ? phi : 0));
 			if (free > 0) {
-				const target = this.pick(t);
+				let target = this.pick(t);
+				// A due planned opening takes only the first unattached demand: it opens the window, and
+				// from then on the base order applies (design 4.5). Each due opening at t opens this way.
+				while (target >= 0 && target === this.dueOpening(t)) {
+					this.open(target, t);
+					target = this.pick(t);
+				}
 				if (target < 0) lost += free;
 				else rates[target] += free;
 			}
@@ -573,6 +602,7 @@ function runDay(
 		week: new Float32Array(len),
 		unserved: new Float32Array(len),
 		outs: [],
+		opens: [],
 		fableOutAt: [],
 	};
 	run.reset();
@@ -615,6 +645,7 @@ function runDay(
 		trace.unserved[i] = run.unserved;
 	}
 	trace.outs = run.outs;
+	trace.opens = run.opens;
 	trace.fableOutAt = run.fableOutAt;
 	return trace;
 }

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	compareScores,
 	decidingReason,
+	dueRoutingOpening,
 	OPEN_MIN_STOP_GAIN_MIN,
 	openingBeam,
 	openingEarns,
@@ -222,6 +223,76 @@ describe("planForecast: an early opening for a shorter heavy stop (amendment A2)
 		// Otherwise a gain still worth naming is named as before.
 		expect(openingReason(0.3, 0, 1)).toBe("open-ahead+0.3");
 		expect(openingReason(0.01, 4, 1)).toBeNull();
+	});
+});
+
+describe("planForecast: pre-warm off, a routing-opening whose time has come", () => {
+	// 10:00 of the 2026-11-12 shape: acct-a's window is 60 % used and resets at 11:00, acct-b is closed.
+	// Opening acct-b now through the next new session moves its reset to 15:00, inside the afternoon.
+	function at10(b: { blockedUntil?: number; weekUsed?: number } = {}) {
+		const now = prague(12, 10);
+		const weekReset = prague(13, 20);
+		return makeCtx({
+			now,
+			spread: 0.1,
+			accounts: [
+				account({
+					id: "acct-a",
+					fiveUsed: 60,
+					fiveReset: prague(12, 11),
+					weekUsed: 10,
+					weekReset,
+				}),
+				account({
+					id: "acct-b",
+					weekUsed: b.weekUsed ?? 10,
+					weekReset,
+					blockedUntil: b.blockedUntil,
+				}),
+			],
+			kW: { "acct-a": 0.05, "acct-b": 0.05 },
+			rate: (m, w) => {
+				if (w > 5) return 0;
+				if (m >= 600 && m < 795) return 0.68;
+				if (m >= 795 && m < 960) return 0.945;
+				return 0;
+			},
+			settings: { prewarm: false },
+			workStartMinute: 600,
+		});
+	}
+
+	test("the plan opens acct-b now and the placement sends new sessions there (forecast-open)", async () => {
+		const ctx = at10();
+		const { plan, score, baseline } = await planForecast(ctx);
+		expect(plan.openAt).toEqual({ "acct-b": ctx.now });
+		expect(score.stopMinutes).toBeLessThan(baseline.score.stopMinutes);
+		expect(plan.placement?.rule).toBe("forecast-open");
+		expect(plan.placement?.tiers[0]).toEqual(["acct-b"]);
+		expect(plan.placement?.tiers.flat().sort()).toEqual(["acct-a", "acct-b"]);
+	}, 30_000);
+
+	test("only an account that can take work now is a due routing-opening, and only with pre-warm off", () => {
+		const plan = (ctx: ReturnType<typeof at10>) => ({
+			...onDemandPlan(ctx),
+			openAt: [null, ctx.now],
+		});
+		const free = at10();
+		expect(dueRoutingOpening(free, plan(free))).toBe(1);
+		const later = at10();
+		expect(
+			dueRoutingOpening(later, {
+				...plan(later),
+				openAt: [null, later.now + MIN],
+			}),
+		).toBe(-1);
+		const blocked = at10({ blockedUntil: prague(12, 10, 30) });
+		expect(dueRoutingOpening(blocked, plan(blocked))).toBe(-1);
+		const weeklyOut = at10({ weekUsed: 100 });
+		expect(dueRoutingOpening(weeklyOut, plan(weeklyOut))).toBe(-1);
+		const prewarm = at10();
+		prewarm.input.settings.prewarm = true;
+		expect(dueRoutingOpening(prewarm, plan(prewarm))).toBe(-1);
 	});
 });
 

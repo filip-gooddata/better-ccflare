@@ -38,6 +38,10 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    (p90-of-demand) lines, in the order of design amendment 2 (B2): the smaller low-point share, then the
    minutes of heavy stops (fewer is better), then the other low-point share, then the smaller share on
    the typical lines (`compareScores`).
+   A planned opening (`openAt`) with pre-warm off is a routing-opening: from its time the first new
+   (unattached) demand goes to that closed account and opens its window, then the base order applies
+   again (design 4.5). The placement advice follows it: before the time, the usual tiers; once the time
+   has come and the window is still closed, `forecast-open` with that account first.
 6. **Response** (`response.ts`, `stops.ts`, `past.ts`). Pointwise percentile lines (`percentile.ts`),
    stops, `stopNow`, shortfall, Fable `outAt`, and the past series.
 
