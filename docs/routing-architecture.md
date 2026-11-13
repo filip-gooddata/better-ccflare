@@ -308,10 +308,10 @@ The interruption forecast projects how much pooled quota the Claude OAuth accoun
 
 ### When it is computed
 
-- After each successful usage poll (every `usage_poll_interval_ms`, default 90 s), a computation starts once the polls have settled for 5 s (`FORECAST_POLL_SETTLE_MS`), and never sooner than 30 s after the previous one started (`FORECAST_MIN_SPACING_MS`).
+- After each recorded usage snapshot of a Claude OAuth account (polled every `usage_poll_interval_ms`, default 90 s), a computation starts once the polls have settled for 5 s (`FORECAST_POLL_SETTLE_MS`), and never sooner than 30 s after the previous one started (`FORECAST_MIN_SPACING_MS`).
 - It runs off the request path, one at a time. Polls that arrive during a computation are coalesced into one follow-up run.
-- One run: record the proxy's own served requests as demand history (on the first successful run, when `transcriptsDir` is set, a one-time backfill from local Claude transcripts starts in the background; it reads usage metadata only and is never awaited); load the demand history for `historyLookbackDays`, the usage readings, each counted account's limits from the usage cache, and the live sessions; run the engine; keep the result; then tick the pre-warm scheduler.
-- A failed step is logged once per run and never reaches a request. The previous result is kept and ages.
+- One run: record the proxy's own served requests as demand history (after the first successful sync, when `transcriptsDir` is set, a one-time backfill from local Claude transcripts starts in the background; it reads usage metadata only and is never awaited); load the demand history and usage readings from the later of `historyLookbackDays` ago and the earliest stored demand bucket, each counted account's limits from the usage cache, and the live sessions; run the engine; keep the result; then tick the pre-warm scheduler.
+- Failures are logged once per run and never reach a request. A failed demand sync does not stop the run. An engine failure replaces the kept result with the no-forecast shape, `reason: "error"`. A run that fails before the engine keeps the previous result, which then ages.
 - `GET /api/forecast` only serves the kept result; it never computes.
 
 ### Fresh and stale
@@ -320,7 +320,7 @@ The kept result is **fresh** while it is available and no older than 3 poll inte
 
 ### How routing uses it
 
-Only `session-pace` takes advice, and only when `routing` is on. Under another strategy the forecast is still computed and served for display. Advice is the first step of the plan, replanned on every run:
+Only `session-pace` takes advice, only when `routing` is on, and only for requests that carry a client session id (requests without one are placed by the ordinary session-pace rules). Under another strategy the forecast is still computed and served for display. Advice is the first step of the plan, replanned on every run:
 
 - **New session**: the hard filters run first as before (availability, probe back-off, the model-family guard, never an account that is out). The plan gives look-ahead tiers; the first tier that holds a candidate wins, and inside it the usual session-pace ranking decides. Under advice the 5-hour 90 % guard is a tie-break inside the tier, not a filter. The placement is logged with the usual `session-pace place` line; its `rule` and `reason` come from the advice.
 - **Cold session**: a mapped session whose last request plus its cache lifetime has passed (1 hour when at least half of its cache writes were 1-hour writes, else 5 minutes; the idle setting while unknown) is placed like a new session. When it lands on another account the reason starts with `cold:`.
@@ -332,14 +332,16 @@ Only `session-pace` takes advice, and only when `routing` is on. Under another s
 
 ### Pre-warm
 
-Pre-warm opens an account's 5-hour window at the time the plan chose, with one one-word request through the real `claude` CLI (print mode, `prewarmModel`, default Haiku) pinned to that account through the proxy. It is **off by default** (`prewarm: false`). With it on, the scheduler fires only when the forecast is fresh, the plan's opening time has come, the latest reading (at most 10 minutes old) shows no open 5-hour window, the account is counted and not out, it is below `prewarmMaxPerDay` for the day, no pre-warm ran for it in the last 5 hours, and none is running. Records of the last 20 pre-warms survive a restart.
+Pre-warm opens an account's 5-hour window at the time the plan chose, with one one-word request through the real `claude` CLI (print mode, `prewarmModel`, default Haiku) pinned to that account through the proxy. It is **off by default** (`prewarm: false`). With it on, the scheduler fires only when the forecast is fresh, the plan's opening time has come, the account has a current usage reading (the usage cache keeps a reading for at most 10 minutes) that shows no open 5-hour window, the account is counted and not out, it is below `prewarmMaxPerDay` for the day, no pre-warm ran for it in the last 5 hours, and none is running. Records of the last 20 pre-warms survive a restart. Whether the window opened is judged only from a reading that arrived after the pre-warm finished.
 
-`prewarmTest` (`{ "account": <name or id>, "at": <time> }`) fires once at the first scheduler tick at or after `at`, whether or not `prewarm` is on and whether or not a forecast is available, and never twice for the same pair. Procedure: [packages/forecast/src/prewarm/README.md](../packages/forecast/src/prewarm/README.md#test-morning-run-by-the-supervisor-with-filip).
+**Local API keys**: the pre-warm request goes through this proxy without a local API key. When the proxy has active API keys (`/api/api-keys`), it answers that request 401 and no window opens; the `done` line then shows the CLI's non-zero exit.
+
+`prewarmTest` (`{ "account": <name or id>, "at": <time> }`) is one attempt at the first scheduler tick at or after `at`, whether or not `prewarm` is on and whether or not a forecast is available, and never twice for the same pair. It waits while the account has no current reading or a pre-warm for it is running, and it is skipped (and counted as done) when the account's 5-hour window is already open. Procedure: [packages/forecast/src/prewarm/README.md](../packages/forecast/src/prewarm/README.md#test-morning-run-by-the-supervisor-with-filip).
 
 Log lines (INFO):
 
 - `forecast prewarm fire account=<name> kind=<plan|test> scheduled=<iso> late=<seconds>`
-- `forecast prewarm done account=<name> exit=<code> ms=<n>`
+- `forecast prewarm done account=<name> exit=<code|none> ms=<n>`
 - `forecast prewarm result account=<name> windowOpened=<true|false> resetsAt=<iso|none>` (after the next readings)
 - `forecast prewarm skip account=<name> reason=<token>` (tokens include `window_open`, `daily_cap`, `not_counted`, `stale_reading`, `unknown_account`)
 
@@ -350,6 +352,6 @@ Log lines (INFO):
 Settings, defaults and formats: [Forecast Settings](./configuration.md#forecast-settings). The config file is read at start, so every change applies after a restart. Two of them also decide what is built at start:
 
 - `enabled: false` at start: nothing is constructed (no session tracking, no computation, no scheduler, no timers) and the endpoint answers `reason: "disabled"`. Turning it back on needs a restart.
-- `routing: false` at start: session-pace is not given the advisor. A running proxy also checks it on every routing call.
+- `routing: false` at start: session-pace is not given the advisor until a restart. With the advisor attached at start, every call also checks the current `enabled` and `routing` values and gives no advice when either is off.
 
 *Source: `packages/forecast/src/service/` (computation, freshness, advisor, endpoint provider), `packages/forecast/src/prewarm/` (scheduler and runner), `packages/load-balancer/src/strategies/session-pace.ts` (advice), `apps/server/src/forecast-wiring.ts` (construction).*

@@ -53,8 +53,9 @@ pace.4 is an upgrade of the installed pace.3 build, whose sha256 is
 
 4. After the deploy, `GET /api/config/strategy` carries `forecastSettings` and, with the forecast
    enabled, `forecast: { path: "/api/forecast", contractVersion: 1 }`; `GET /api/forecast` serves
-   the projection a few seconds after the first usage poll. Pre-warm stays off unless
-   `prewarm` is turned on (`FORECAST_PREWARM` or `forecast_prewarm`). See
+   the projection a few seconds after the first usage poll. Planned pre-warms stay off unless
+   `prewarm` is turned on (`FORECAST_PREWARM` or `forecast_prewarm`); a configured one-shot
+   `prewarmTest` still runs with `prewarm` off. See
    [Interruption Forecast](../docs/routing-architecture.md#interruption-forecast).
 
 ## What `--dry-run` does

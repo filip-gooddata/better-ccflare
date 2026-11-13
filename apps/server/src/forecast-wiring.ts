@@ -160,12 +160,14 @@ function fableWindow(data: AnyUsageData, now: EpochMs): LimitState | null {
 /**
  * Current limits of every Claude OAuth account from the accounts table and
  * the usage cache. Counted = not paused and no re-authentication pending; an
- * account without a cached reading has both windows closed.
+ * account without a cached reading has both windows closed. `readAt` is
+ * when the account's reading arrived, else `now`.
  */
 export async function loadClaudeLimits(
 	dbOps: Pick<DatabaseOperations, "getAllAccounts">,
 	usage: { get(accountId: string): AnyUsageData | null },
 	now: EpochMs,
+	readAt: (accountId: string) => EpochMs | null = () => null,
 ): Promise<AccountLimits[]> {
 	const accounts = await dbOps.getAllAccounts();
 	return accounts.filter(isClaudeOAuthAccount).map((account) => {
@@ -183,7 +185,7 @@ export async function loadClaudeLimits(
 				: CLOSED,
 			fable: data ? fableWindow(data, now) : null,
 			blockedUntil: cooldown != null && cooldown > now ? cooldown : null,
-			readAt: now,
+			readAt: readAt(account.id) ?? now,
 		};
 	});
 }
@@ -258,13 +260,21 @@ export function createForecastWiring(
 		},
 	};
 
+	// When each account's reading arrived, so the scheduler judges a pre-warm
+	// by a reading taken after it rather than by the time limits were loaded.
+	const readTimes = new Map<string, EpochMs>();
 	let service: ForecastService | null = null;
 	const scheduler = createPrewarmScheduler({
 		runner,
 		store,
 		settings,
 		forecast: () => service?.forecastView() ?? null,
-		limits: () => service?.limits() ?? [],
+		// Only accounts with a current reading (the usage cache drops readings
+		// older than 10 minutes): without one the window state is unknown.
+		limits: () =>
+			(service?.limits() ?? []).filter(
+				(limits) => ports.usage.get(limits.accountId) !== null,
+			),
 		timeZone: () => ports.pace().timeZone,
 		clock,
 		timer,
@@ -277,7 +287,13 @@ export function createForecastWiring(
 		store,
 		engine: ports.engine ?? createForecastEngine(),
 		tracker,
-		loadLimits: (now) => loadClaudeLimits(ports.dbOps, ports.usage, now),
+		loadLimits: (now) =>
+			loadClaudeLimits(
+				ports.dbOps,
+				ports.usage,
+				now,
+				(id) => readTimes.get(id) ?? null,
+			),
 		scheduler,
 		clock,
 		timer,
@@ -295,7 +311,8 @@ export function createForecastWiring(
 			if (!hasAdvisorSetter(strategy)) return;
 			strategy.setForecastAdvisor(routingAtStart ? created.advisor : null);
 		},
-		onUsageSnapshot() {
+		onUsageSnapshot(accountId) {
+			readTimes.set(accountId, clock.now());
 			created.notifyUsagePoll();
 		},
 		// Resolves once no cycle and no pre-warm run is in flight; a run can take

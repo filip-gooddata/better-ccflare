@@ -458,6 +458,21 @@ describe("usage snapshot hook", () => {
 });
 
 describe("loadClaudeLimits", () => {
+	it("stamps readAt with when the reading arrived, else the load time", async () => {
+		const dbOps = tempDb();
+		await insertClaude(dbOps, "a", "alpha");
+		await insertClaude(dbOps, "b", "beta");
+		const limits = await loadClaudeLimits(
+			dbOps,
+			{ get: () => ({}) as UsageData },
+			NOW,
+			(id) => (id === "a" ? NOW - 2 * MIN : null),
+		);
+		const readAt = new Map(limits.map((l) => [l.accountId, l.readAt]));
+		expect(readAt.get("a")).toBe(NOW - 2 * MIN);
+		expect(readAt.get("b")).toBe(NOW);
+	});
+
 	it("reads Claude OAuth accounts only, with counted, cooldown and closed windows", async () => {
 		const dbOps = tempDb();
 		await insertClaude(dbOps, "a", "alpha");
@@ -808,6 +823,7 @@ describe("pre-warm through the wiring", () => {
 		settings: Partial<ForecastSettings>,
 		dbOps = tempDb(),
 		time?: FakeTime,
+		readings = true,
 	) {
 		if ((await dbOps.getAllAccounts()).length === 0) {
 			await insertClaude(dbOps, "acct-a", "alpha");
@@ -817,7 +833,13 @@ describe("pre-warm through the wiring", () => {
 		const engine = new RecordingEngine((i) =>
 			availableResult(i.now, { openAt: { "acct-a": i.now - MIN } }),
 		);
-		return { dbOps, h: wire({ dbOps, settings, engine, time }) };
+		const h = wire({ dbOps, settings, engine, time });
+		if (readings) {
+			// Current readings with no open window on either account.
+			h.usage.set("acct-a", {} as UsageData);
+			h.usage.set("acct-b", {} as UsageData);
+		}
+		return { dbOps, h };
 	}
 
 	async function polls(h: Harness, n: number) {
@@ -876,6 +898,44 @@ describe("pre-warm through the wiring", () => {
 		).toBeTrue();
 		expect(errors).toHaveLength(1);
 		expect(time.pending).toHaveLength(0);
+	});
+
+	it("an account without a current usage reading is never pre-warmed", async () => {
+		const { h } = await prewarmSetup(
+			{ prewarm: true },
+			tempDb(),
+			undefined,
+			false,
+		);
+		await polls(h, 3);
+		expect(h.runner.calls).toEqual([]);
+		h.usage.set("acct-a", {} as UsageData);
+		await polls(h, 1);
+		expect(h.runner.calls).toEqual(["acct-a"]);
+	});
+
+	it("judges windowOpened only from a reading taken after the run", async () => {
+		const { h } = await prewarmSetup({ prewarm: true });
+		await polls(h, 1);
+		expect(h.runner.calls).toEqual(["acct-a"]);
+		const last = () => h.wiring.provider?.().prewarm?.last[0];
+		// Cycles driven by the other account leave acct-a's pre-run reading.
+		for (let i = 0; i < 2; i++) {
+			h.wiring.onUsageSnapshot("acct-b");
+			await h.time.advance(POLL);
+			await h.wiring.service?.idle();
+		}
+		expect(last()?.windowOpened).toBeNull();
+		h.usage.set("acct-a", {
+			five_hour: {
+				utilization: 1,
+				resets_at: new Date(h.time.now + 5 * HOUR).toISOString(),
+			},
+		} as UsageData);
+		h.wiring.onUsageSnapshot("acct-a");
+		await h.time.advance(POLL);
+		await h.wiring.service?.idle();
+		expect(last()?.windowOpened).toBeTrue();
 	});
 
 	it("prewarm off: across several polls the runner is never called", async () => {
