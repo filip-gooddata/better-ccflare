@@ -1,11 +1,11 @@
-> This is a copy of spec revision 4 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 5 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 4 · 2026-11-13 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 5 · 2026-11-13 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -44,9 +44,11 @@ Clients must ignore fields they do not know.
 - **Counted accounts** (`accounts`): the Claude accounts that can take work now: not paused, not logged out (no
   re-authentication pending). Ids are the ids of `/api/accounts`.
 - **Pooled 5-hour quota left** (the `day` quantity): per counted account, 100 minus its 5-hour utilisation; an
-  account with no open 5-hour window counts 100. An account whose WEEKLY limit is used up counts 0 here until its
-  weekly reset, because its 5-hour quota cannot be used. So this line at 0 means "no counted account can take
-  work", whichever limit caused it.
+  account with no open 5-hour window counts 100. An account that cannot take work for a reason other than its
+  5-hour limit counts 0 here until that reason ends, because its 5-hour quota cannot be used. There are two such
+  reasons: its WEEKLY limit is used up (until its weekly reset), or it is refused by upstream with a cooldown
+  running (until the cooldown ends). So this line at 0 means "no counted account can take work", whichever limit
+  caused it.
 - **Pooled weekly quota left** (the `week` quantity): per counted account, 100 minus its weekly utilisation. The
   5-hour state does not enter.
 - **Series shape**: one shared time axis per block (`times`) and one value array per level, all the same length.
@@ -253,7 +255,8 @@ for the record.
 2. **Weekly exhaustion enters the day line.** An account that is out on its weekly limit counts 0 in the pooled
    5-hour line (section 3). Without this the day line could show quota that cannot be used, and a real hard stop
    (one account out for the week, the other out for 5 hours) would not show as a day stop. Consequence: a weekly
-   stop also appears as a day stop while it overlaps today.
+   stop also appears as a day stop while it overlaps today. Since revision 5 the same holds for an account that
+   is refused by upstream with a cooldown running.
 3. **`shortfall` names its stop** (`shortfall.stop`) and refers to `stopNow` when a stop is running, because a
    running stop is not in `stops.typical`. Draft 3 says "the first typical stop".
 4. **`perAccount` leftover.** When `points` exceeds what fits both accounts' fills, the leftover goes to
@@ -264,6 +267,14 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 5, 2026-11-13: one rule widened; no field added, removed, renamed or retyped. Section 3: an account
+  that is refused by upstream with a cooldown running counts 0 in the pooled 5-hour line until the cooldown ends,
+  as an account out on its weekly limit already did. Before, the unused 5-hour quota of such an account held the
+  line above 0 while no work could be served, so no stop and no shortfall were reported (seen live on 2026-11-13:
+  the line stood at 100 for three hours of a stop). The rule applies to the projected `day` lines and to the
+  current point; `day.past` follows it from the moment the proxy knows the cooldown began. `stopNow` already
+  counted such an account as out (section 5). `contractVersion` stays 1.
 
 - Revision 4, 2026-11-13: wording only; no field added, removed, renamed or retyped. Section 4 and the `prewarm`
   row of section 6 say what a planned opening is when the pre-warm is off (the default): the proxy routes the
