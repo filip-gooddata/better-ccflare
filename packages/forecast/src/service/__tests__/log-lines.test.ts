@@ -114,6 +114,21 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		);
 	});
 
+	it("ends with the planner's S for the chosen plan and for on demand (amendment 5, E5)", () => {
+		const line = inputsLine({
+			...detail(),
+			lowPoint: 59.94,
+			lowPointOnDemand: -13.81,
+		});
+		expect(line).toEndWith(
+			` ${B}/five_hour=1.9877 borrowed instances=0 points=0 oldestH=none newestH=none` +
+				` cap: ${A} r=13.22 binds=no; ${B} r=none binds=no lowPoint=59.9 lowPointOnDemand=-13.8`,
+		);
+		expect(inputsLine({ ...detail(), lowPoint: Number.NaN })).not.toContain(
+			"lowPoint",
+		);
+	});
+
 	it("prints nothing but numbers, fixed words and account ids", () => {
 		const d = detail({
 			workStartMinute: null,

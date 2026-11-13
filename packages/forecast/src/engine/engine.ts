@@ -40,6 +40,7 @@ import type {
 	EngineContext,
 	NoiseMode,
 	NoiseOptions,
+	PlanLowPoints,
 	RecordedDay,
 } from "./model";
 import { capBinds, capRatio } from "./past";
@@ -217,15 +218,23 @@ async function computeForecast(
 ): Promise<ForecastResult> {
 	const ctx = await prepare(input, { noiseMode });
 	if ("rule" in ctx) return unavailable(input, "insufficient_history", ctx);
-	const { plan, result } = await planForecast(ctx);
+	const { plan, result, score, baseline } = await planForecast(ctx);
 	await yieldToEventLoop();
 
 	const response = buildResponse(ctx, result);
 	checkBlock(response.day);
 	checkBlock(response.week);
-	return ctx.inputs
-		? { available: true, response, plan, inputs: ctx.inputs }
-		: { available: true, response, plan };
+	if (!ctx.inputs) return { available: true, response, plan };
+	const lowPoints: PlanLowPoints = {
+		lowPoint: score.lowPoint,
+		lowPointOnDemand: baseline.score.lowPoint,
+	};
+	return {
+		available: true,
+		response,
+		plan,
+		inputs: { ...ctx.inputs, ...lowPoints },
+	};
 }
 
 function historyDetail(table: DayTable): UnavailableDetail {

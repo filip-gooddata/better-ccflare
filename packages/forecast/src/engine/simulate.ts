@@ -12,6 +12,7 @@ import type {
 	SimTrace,
 	SimulationResult,
 } from "./model";
+import { addLocalDays, localDayStart, localParts } from "../time";
 import { moveCostUnits } from "./move-cost";
 import { capRatio } from "./past";
 import { yieldToEventLoop } from "./yield";
@@ -264,6 +265,8 @@ class DayRun {
 	outs: SimTrace["outs"] = [];
 	opens: SimTrace["opens"] = [];
 	fableOutAt: (EpochMs | null)[] = [];
+	/** Elapsed work share of a weekly window at a time, by "reset:time"; the same for every day. */
+	readonly elapsedShare = new Map<string, number>();
 
 	constructor(readonly p: Prepared) {
 		this.n = p.n;
@@ -336,22 +339,31 @@ class DayRun {
 		return !(this.isOpen(j) && this.used5[j] >= FULL_POINTS);
 	}
 
+	/** The plan holds the closed account until a later opening time. */
+	held(j: number, t: EpochMs): boolean {
+		return this.openPending[j] === 1 && this.openAt[j] > t;
+	}
+
 	/**
-	 * Account for unattached demand at t; -1 when none (design 4.5). First a closed account whose
-	 * planned opening has come (only left pending with pre-warm off: the opening then means "route
-	 * unattached demand here from that time", and the first demand opens the window), then the
-	 * preference, then the base order.
+	 * Account for unattached demand at t, and for a session whose account can no longer take it; -1
+	 * when none (design 4.5, amendment 5 E1). First a closed account whose planned opening has come
+	 * (only left pending with pre-warm off: the opening then means "route unattached demand here from
+	 * that time", and the first demand opens the window); then an idle account (usable, window not
+	 * running, not held), as the live router places a new session; then the preference; then the open
+	 * account that resets first; then the last resorts.
 	 */
 	pick(t: EpochMs): number {
 		const due = this.dueOpening(t);
 		if (due >= 0) return due;
+		const idle = this.idleFirst(t);
+		if (idle >= 0) return idle;
 		const preferred = this.p.plan.preferred;
 		// A preference never routes to an account ahead of its planned opening time.
 		if (
 			this.prefActive &&
 			preferred !== null &&
 			this.usable(preferred, t) &&
-			!(this.openPending[preferred] && this.openAt[preferred] > t)
+			!this.held(preferred, t)
 		)
 			return preferred;
 		let best = -1;
@@ -364,6 +376,37 @@ class DayRun {
 			if (!this.openPending[j] && this.usable(j, t)) return j;
 		for (let j = 0; j < this.n; j++) if (this.usable(j, t)) return j;
 		return -1;
+	}
+
+	/**
+	 * Usable account whose window is not running and that the plan does not hold; the larger weekly
+	 * pace deficit first, then the lower index (the engine has no account priority); -1 when none.
+	 */
+	idleFirst(t: EpochMs): number {
+		let best = -1;
+		for (let j = 0; j < this.n; j++) {
+			if (this.isOpen(j) || this.held(j, t) || !this.usable(j, t)) continue;
+			if (best < 0 || this.weeklyDeficit(j, t) > this.weeklyDeficit(best, t))
+				best = j;
+		}
+		return best;
+	}
+
+	/**
+	 * Weekly pace deficit at t, as the live router computes it: the share of the weekly window's local
+	 * work time elapsed minus the share used; 0 without a known weekly reset.
+	 */
+	weeklyDeficit(j: number, t: EpochMs): number {
+		const resetAt = this.resetW[j];
+		if (!Number.isFinite(resetAt)) return 0;
+		const key = `${resetAt}:${t}`;
+		let elapsed = this.elapsedShare.get(key);
+		if (elapsed === undefined) {
+			const { timeZone, workDays } = this.p.ctx.input.pace;
+			elapsed = elapsedWorkShare(resetAt, t, timeZone, workDays);
+			this.elapsedShare.set(key, elapsed);
+		}
+		return elapsed - this.usedW[j];
 	}
 
 	/** Closed account whose planned opening has come, earliest planned first; -1 when none. */
@@ -600,6 +643,45 @@ function startWeekly(
 	let next = resetsAt;
 	while (next <= now) next += WEEK_MS;
 	return [0, next];
+}
+
+/** Milliseconds of [from, to) on local days whose ISO weekday is at most workDays. */
+function workMs(
+	from: EpochMs,
+	to: EpochMs,
+	timeZone: string,
+	workDays: number,
+): number {
+	if (to <= from) return 0;
+	let dayStart = localDayStart(from, timeZone);
+	let total = 0;
+	for (let i = 0; i < 400; i++) {
+		const dayEnd = addLocalDays(dayStart, 1, timeZone);
+		if (localParts(dayStart, timeZone).isoWeekday <= workDays)
+			total += Math.max(0, Math.min(to, dayEnd) - Math.max(from, dayStart));
+		if (dayEnd >= to) break;
+		dayStart = dayEnd;
+	}
+	return total;
+}
+
+/**
+ * Share of the weekly window ending at resetAt that has elapsed at t, in points, counting local work
+ * time only (the live router's weeklyPaceDeficit); seven work days or no work time: calendar time.
+ */
+function elapsedWorkShare(
+	resetAt: EpochMs,
+	t: EpochMs,
+	timeZone: string,
+	workDays: number,
+): number {
+	const start = resetAt - WEEK_MS;
+	const total = workDays >= 7 ? 0 : workMs(start, resetAt, timeZone, workDays);
+	const share =
+		total > 0
+			? (workMs(start, t, timeZone, workDays) * 100) / total
+			: ((t - start) / WEEK_MS) * 100;
+	return Math.min(100, Math.max(0, share));
 }
 
 function roundToMinute(at: EpochMs): EpochMs {
