@@ -3204,7 +3204,7 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
-				attemptedModels.push(requestedModel);
+				attemptedModels.push(outgoing.model || requestedModel);
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(

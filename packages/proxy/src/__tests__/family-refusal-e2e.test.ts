@@ -560,6 +560,36 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 			logged(`account=${GD} family_refusal_unclassified`).length,
 		).toBeGreaterThan(0);
 	});
+
+	it("judges the family by the models sent upstream, not the model the client asked for", async () => {
+		usageCache.set(GD, usage(measuredGooddata()));
+		usageCache.set(AI, usage(measuredGooddataAi()));
+		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
+		const calls = installUpstream(({ account, model }) => {
+			if (account === GD && model.startsWith("claude-fable"))
+				return toResponse(gdRefusal);
+			return ok200(account, model);
+		});
+		const { ctx, row } = makeCtx(
+			[
+				makeAccount(GD, {
+					model_mappings: JSON.stringify({
+						opus: [FABLE, "claude-fable-5-2"],
+					}),
+				}),
+				makeAccount(AI, { rate_limited_until: FIVE_HOUR_RESET_AI }),
+			],
+			paceStrategy(),
+		);
+
+		await send(ctx, makeRequest(OPUS));
+		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
+			FABLE,
+			"claude-fable-5-2",
+		]);
+		expect(row(GD).rate_limited_until).toBeNull();
+		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
+	});
 });
 
 describe("scenario 2: sticky sessions after a family 429", () => {
