@@ -262,7 +262,10 @@ describe("simulate", () => {
 			const ctx = build(false);
 			const { axis, traces } = await simulate(ctx, plan);
 			const [t] = traces;
-			expect(axis.times.filter((x) => x === openAt + 5 * HOUR)).toHaveLength(1);
+			// The planned reset is a jump pair; demand came only at 08:00, so both values are equal.
+			const r = indexAt(axis.times, openAt + 5 * HOUR);
+			expect(axis.times[r + 1]).toBe(openAt + 5 * HOUR);
+			expect(t.day[r]).toBe(t.day[r + 1]);
 			expect(t.outs[0]).toEqual({
 				account: 1,
 				at: now + 3 * HOUR + 40 * MIN,
@@ -275,6 +278,99 @@ describe("simulate", () => {
 				3,
 			);
 		});
+	});
+
+	describe("pre-warm off: a planned routing-opening while another window is open (design 4.5)", () => {
+		// acct-a open until 11:00, acct-b closed and planned for 08:00; 1 point a minute from 07:00.
+		const now = prague(12, 7);
+		const plannedAt = prague(12, 8);
+		const build = () =>
+			makeCtx({
+				now,
+				days: 1,
+				accounts: [
+					account({ id: "acct-a", fiveReset: prague(12, 11) }),
+					account({ id: "acct-b" }),
+				],
+				k5: { "acct-a": 10, "acct-b": 10 },
+				rate: (_m, _w, at) => (at < prague(12, 11) ? 0.1 : 0),
+				settings: { prewarm: false },
+			});
+
+		test("the first unattached demand at the planned time opens acct-b; then the base order sends demand back to acct-a", async () => {
+			const { traces } = await simulate(build(), {
+				openAt: [null, plannedAt],
+				preferred: null,
+				move: null,
+			});
+			const [t] = traces;
+			expect(t.opens).toEqual([{ account: 1, at: plannedAt }]);
+			// acct-a (earliest reset first) keeps the demand and fills at 08:40; acct-b takes it from there.
+			expect(t.outs).toEqual([
+				{ account: 0, at: prague(12, 8, 40), limit: "five_hour" },
+				{ account: 1, at: prague(12, 10, 20), limit: "five_hour" },
+			]);
+		});
+
+		test("on demand acct-b opens only when acct-a is full", async () => {
+			const { traces } = await simulate(build(), onDemandPlan(build()));
+			expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8, 40) }]);
+		});
+
+		test("a preference for the open account does not hold back the due opening", async () => {
+			const { traces } = await simulate(build(), {
+				openAt: [null, plannedAt],
+				preferred: 0,
+				move: null,
+			});
+			expect(traces[0].opens).toEqual([{ account: 1, at: plannedAt }]);
+			expect(traces[0].outs[0]).toEqual({
+				account: 0,
+				at: prague(12, 8, 40),
+				limit: "five_hour",
+			});
+		});
+
+		test("without demand at the planned time the window waits for the first demand after it", async () => {
+			const ctx = makeCtx({
+				now,
+				days: 1,
+				accounts: [
+					account({ id: "acct-a", fiveReset: prague(12, 11) }),
+					account({ id: "acct-b" }),
+				],
+				k5: { "acct-a": 10, "acct-b": 10 },
+				rate: (_m, _w, at) =>
+					at >= prague(12, 9) && at < prague(12, 10) ? 0.1 : 0,
+				settings: { prewarm: false },
+			});
+			const { traces } = await simulate(ctx, {
+				openAt: [null, plannedAt],
+				preferred: null,
+				move: null,
+			});
+			expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 9) }]);
+		});
+	});
+
+	test("pre-warm on: the opening at the planned time is recorded", async () => {
+		const now = prague(12, 7);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({ id: "acct-a", fiveReset: prague(12, 11) }),
+				account({ id: "acct-b" }),
+			],
+			rate: () => 0,
+			settings: { prewarm: true },
+		});
+		const { traces } = await simulate(ctx, {
+			openAt: [null, prague(12, 8)],
+			preferred: null,
+			move: null,
+		});
+		expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8) }]);
 	});
 
 	test("last resort: a closed account with no planned opening goes before one planned for later", async () => {

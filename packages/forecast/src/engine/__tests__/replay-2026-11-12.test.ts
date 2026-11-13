@@ -71,14 +71,13 @@ function medianFirstFull(sim: SimulationResult, account: number): EpochMs {
 
 // on demand: the recorded stop (refused 14:54:46, reset 16:00) on the heavy line
 const BASELINE_STOP = { start: prague(12, 14, 55), end: prague(12, 16) };
-// routing new sessions to acct-b from 07:00: one shorter stop, later in the afternoon
+// routing every new session to acct-b from 07:00 (no planned opening): one shorter, later stop
 const ROUTED_STOP = { start: prague(12, 16, 14), end: prague(12, 17) };
 // the typical (p50) line: the recorded day itself had a stop
 const TYPICAL_BASELINE_STOP = {
 	start: prague(12, 15, 20),
 	end: prague(12, 16),
 };
-const TYPICAL_ROUTED_STOP = { start: prague(12, 16, 34), end: prague(12, 17) };
 
 describe("2026-11-12 replay through compute()", () => {
 	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:55–16:00, typical stop 15:20–16:00", async () => {
@@ -102,31 +101,54 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(base.stops.typical).toEqual([TYPICAL_BASELINE_STOP]);
 	});
 
-	test("pre-warm off: routing alone sends new sessions to acct-b from 07:00 (forecast-open); the heavy stop shrinks from 60 to 40 unserved minutes and moves to 16:14–17:00, the low point stays 0", async () => {
+	test("pre-warm off: the plan routes new sessions to acct-b from 10:00 (design 4.5); its window opens through the first demand at 10:00 and no heavy or typical stop is left, as with pre-warm", async () => {
 		const input = buildInput(replayFixture());
 		const result = await createForecastEngine().compute(input);
 		if (!result.available) throw new Error(result.reason);
 		const day = result.response.day as ForecastBlock;
 
 		const ctx = await contextOf(input);
-		const { baseline, score, plan } = await planForecast(ctx);
+		const { baseline, score, plan, result: sim } = await planForecast(ctx);
 		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
 
-		expect(result.plan.openAt).toEqual({ "acct-b": null });
-		expect(result.plan.placement?.rule).toBe("forecast-open");
-		expect(result.plan.placement?.tiers).toEqual([["acct-b"], ["acct-a"]]);
-		// decided by score item 2 against the next tier (amendment 2, B4)
-		expect(result.plan.placement?.reason).toBe("stop-shorter+20min");
+		expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 10) });
+		// Before 10:00 new sessions follow the base order (acct-a resets first); from 10:00 the next
+		// computation advises forecast-open for acct-b until its window is open.
+		expect(result.plan.placement?.rule).toBe("forecast-lookahead");
+		expect(result.plan.placement?.reason).toBe("reset-soon");
+		expect(result.plan.placement?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 		expect(plan.placement).toEqual(result.plan.placement);
+		// every simulated day opens acct-b at 10:00 through demand, once
+		for (const trace of sim.traces)
+			expect(trace.opens.filter((o) => o.account === 1)[0]?.at).toBe(
+				prague(12, 10),
+			);
 		expect(heavyLow(day)).toBe(0);
 		expect(heavyLow(base)).toBe(0);
-		expect(stops(day)).toEqual([ROUTED_STOP]);
+		expect(stops(day)).toEqual([]);
 		expect(stops(base)).toEqual([BASELINE_STOP]);
-		expect(score.stopMinutes).toBe(40);
+		expect(score.stopMinutes).toBe(0);
 		expect(baseline.score.stopMinutes).toBe(60);
-		expect(score.weekLowPoints).toBeCloseTo(84.59, 1);
-		// the typical line also keeps a shorter, later stop
-		expect(day.stops.typical).toEqual([TYPICAL_ROUTED_STOP]);
+		expect(score.weekLowPoints).toBeCloseTo(82.15, 1);
+		expect(day.stops.typical).toEqual([]);
+		expect(Math.min(...day.typical)).toBeCloseTo(9, 1);
+	});
+
+	test("pre-warm off, why 10:00 and not all new sessions to acct-b from 07:00: that preference leaves a 40-minute heavy stop (16:14–17:00), the 10:00 routing-opening none", async () => {
+		const ctx = await contextOf(buildInput(replayFixture()));
+		const base = onDemandPlan(ctx);
+		const preferSim = await simulate(ctx, { ...base, preferred: 1 });
+		const preferB = scorePlan(ctx, preferSim);
+		const open10 = scorePlan(
+			ctx,
+			await simulate(ctx, { ...base, openAt: [null, prague(12, 10)] }),
+		);
+		expect(stops(buildResponse(ctx, preferSim).day as ForecastBlock)).toEqual([
+			ROUTED_STOP,
+		]);
+		expect(preferB.stopMinutes).toBe(40);
+		expect(open10.stopMinutes).toBe(0);
+		expect(compareScores(open10, preferB)).toBeLessThan(0);
 	});
 
 	test("pre-warm on: the planner opens acct-b at 10:00 ahead of demand; no heavy or typical stop is left and the heavy low point is not lower than on demand", async () => {

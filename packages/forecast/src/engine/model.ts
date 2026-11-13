@@ -138,6 +138,8 @@ export interface SimTrace {
 	outs: { account: number; at: EpochMs; limit: OutLimit }[];
 	/** Per account index: when its Fable use reached 100, or null (also null without a Fable k). */
 	fableOutAt: (EpochMs | null)[];
+	/** 5-hour windows opening (by demand or by pre-warm), in time order. */
+	opens: { account: number; at: EpochMs }[];
 }
 
 export interface SimulationResult {

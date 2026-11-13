@@ -439,7 +439,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		plan: {
 			computedAt: ctx.now,
 			openAt,
-			placement: placementOf(ctx, finalPreferred, baseline, best.plan),
+			placement: placementOf(ctx, finalPreferred, baseline, best),
 			moves: move ? [move] : [],
 			workStartMinute: ctx.workStartMinute,
 		},
@@ -454,29 +454,75 @@ function round1(value: number): number {
 	return Math.round(value * 10) / 10;
 }
 
-/** Tiers from the plans that prefer each account; null when every account is in one tier. */
+/** Accounts grouped into tiers of plan scores equal within the tier tolerance, best first. */
+function tiersOf(scored: { score: PlanScore; j: number }[]): number[][] {
+	const order = [...scored].sort(
+		(a, b) => compareScores(a.score, b.score) || a.j - b.j,
+	);
+	const tiers: number[][] = [];
+	let head: PlanScore | null = null;
+	for (const { score, j } of order) {
+		if (head && equalWithinTier(head, score)) tiers[tiers.length - 1].push(j);
+		else {
+			tiers.push([j]);
+			head = score;
+		}
+	}
+	return tiers;
+}
+
+/**
+ * Closed account whose planned routing-opening has come (pre-warm off), earliest planned first; -1
+ * when none. The next new session carries it out: the advice sends new sessions there until the
+ * window is open, and the next computation sees it open (design 4.5).
+ */
+function dueRoutingOpening(ctx: EngineContext, plan: SimPlan): number {
+	if (ctx.input.settings.prewarm) return -1;
+	let due = -1;
+	plan.openAt.forEach((at, j) => {
+		if (at == null || at > ctx.now || isOpenNow(ctx, j)) return;
+		const dueAt = plan.openAt[due];
+		if (due < 0 || (dueAt != null && at < dueAt)) due = j;
+	});
+	return due;
+}
+
+/**
+ * Tiers from the plans that prefer each account; null when every account is in one tier. A due
+ * routing-opening (dueRoutingOpening) heads the tiers with rule forecast-open.
+ */
 function placementOf(
 	ctx: EngineContext,
 	preferred: Evaluated[],
 	baseline: Evaluated,
-	plan: SimPlan,
+	best: Evaluated,
 ): PlacementAdvice | null {
 	if (preferred.length < 2) return null;
-	const order = preferred
-		.map((evaluated, j) => ({ evaluated, j }))
-		.sort(
-			(a, b) =>
-				compareScores(a.evaluated.score, b.evaluated.score) || a.j - b.j,
-		);
-	const tiers: number[][] = [];
-	let head: PlanScore | null = null;
-	for (const { evaluated, j } of order) {
-		if (head && equalWithinTier(head, evaluated.score))
-			tiers[tiers.length - 1].push(j);
-		else {
-			tiers.push([j]);
-			head = evaluated.score;
-		}
+	const plan = best.plan;
+	const tiers = tiersOf(
+		preferred.map((evaluated, j) => ({ score: evaluated.score, j })),
+	);
+	const due = dueRoutingOpening(ctx, plan);
+	if (due >= 0) {
+		const gain = item1GainPoints(best.score, baseline.score);
+		const reason =
+			openingReason(
+				gain,
+				stopGainMinutes(best.score, baseline.score),
+				ctx.input.settings.openMinGainPoints,
+			) ??
+			decidingReason(best.score, baseline.score) ??
+			"no-preference";
+		const rest = tiers
+			.map((tier) => tier.filter((j) => j !== due))
+			.filter((tier) => tier.length > 0);
+		return {
+			tiers: [[due], ...rest].map((tier) =>
+				tier.map((j) => ctx.accounts[j].accountId),
+			),
+			rule: "forecast-open",
+			reason,
+		};
 	}
 	if (tiers.length < 2) return null;
 	const first = tiers[0][0];
