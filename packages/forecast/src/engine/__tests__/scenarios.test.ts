@@ -53,6 +53,7 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		historyLookbackDays: 28,
 		recentTauMin: 60,
 		sessionTurnoverMin: 60,
+		workStartSharePct: 5,
 		...over,
 	};
 }

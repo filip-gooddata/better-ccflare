@@ -96,6 +96,7 @@ function defaultForecastFields() {
 			historyLookbackDays: 56,
 			recentTauMin: 45,
 			sessionTurnoverMin: 60,
+			workStartSharePct: 5,
 		},
 		forecast: { path: "/api/forecast", contractVersion: 1 },
 	};
@@ -427,6 +428,7 @@ describe("GET /api/config/strategy forecast fields", () => {
 		"simulatedDays",
 		"timeShiftMin",
 		"transcriptsDir",
+		"workStartSharePct",
 	];
 
 	it("has exactly these keys with the forecast on, and every existing field unchanged", async () => {

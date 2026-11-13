@@ -60,8 +60,10 @@ Not known until the test morning:
    key before sending).
 2. That the proxy, receiving an `x-api-key` request for an OAuth account, sends it upstream with
    the account's OAuth token and the request succeeds (exit 0).
-3. Whether the proxy has local API keys configured (then `x-api-key` must be one of them; WIRING
-   passes it as `proxyApiKey`). Without one, a 401 from the proxy shows as a non-zero exit.
+3. Whether the proxy has local API keys configured. The wiring passes no local key: the server
+   sets `proxyApiKey` to return null, so the runner sends the placeholder key. If the installed
+   proxy has active local API keys, it answers the pre-warm request with 401, which shows as a
+   non-zero exit. Open point for the test morning.
 4. That a Haiku `claude -p` request opens the 5-hour window (research 13 says any counted request
    does; not observed for Haiku through this proxy).
 5. Whether a timer due while the lid is closed fires in a dark wake or only after the Mac wakes.
