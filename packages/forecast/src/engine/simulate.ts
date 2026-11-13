@@ -488,8 +488,8 @@ class DayRun {
 			if (free > 0) {
 				let target = this.pick(t);
 				// A due planned opening takes only the first unattached demand: it opens the window, and
-				// from then on the base order applies (design 4.5).
-				if (target >= 0 && target === this.dueOpening(t)) {
+				// from then on the base order applies (design 4.5). Each due opening at t opens this way.
+				while (target >= 0 && target === this.dueOpening(t)) {
 					this.open(target, t);
 					target = this.pick(t);
 				}

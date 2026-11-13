@@ -331,6 +331,49 @@ describe("simulate", () => {
 			});
 		});
 
+		test("two openings due at once both open through the first demand; the demand stays on acct-a", async () => {
+			const ctx = makeCtx({
+				now,
+				days: 1,
+				accounts: [
+					account({ id: "acct-a", fiveReset: prague(12, 11) }),
+					account({ id: "acct-b" }),
+					account({ id: "acct-c" }),
+				],
+				k5: { "acct-a": 10, "acct-b": 10, "acct-c": 10 },
+				rate: (_m, _w, at) => (at < prague(12, 11) ? 0.1 : 0),
+				settings: { prewarm: false },
+			});
+			const { traces } = await simulate(ctx, {
+				openAt: [null, plannedAt, plannedAt],
+				preferred: null,
+				move: null,
+			});
+			expect(traces[0].opens).toEqual([
+				{ account: 1, at: plannedAt },
+				{ account: 2, at: plannedAt },
+			]);
+			expect(traces[0].outs[0]).toEqual({
+				account: 0,
+				at: prague(12, 8, 40),
+				limit: "five_hour",
+			});
+		});
+
+		test("a preference for the planned account is its own plan: after the opening it keeps the demand", async () => {
+			const { traces } = await simulate(build(), {
+				openAt: [null, plannedAt],
+				preferred: 1,
+				move: null,
+			});
+			expect(traces[0].opens).toEqual([{ account: 1, at: plannedAt }]);
+			expect(traces[0].outs[0]).toEqual({
+				account: 1,
+				at: prague(12, 9, 40),
+				limit: "five_hour",
+			});
+		});
+
 		test("without demand at the planned time the window waits for the first demand after it", async () => {
 			const ctx = makeCtx({
 				now,
