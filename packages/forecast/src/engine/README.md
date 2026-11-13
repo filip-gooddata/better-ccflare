@@ -34,8 +34,10 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    e^(−h/τ). The generator is seeded from the local day key.
 5. **Planner** (`planner.ts`, `simulate.ts`, `move-cost.ts`). This is a scenario-based receding-horizon
    search over openings, order and at most one move. Each candidate is a simulated depletion of every
-   account, with refill jumps at resets. Candidates get a leximin score on the lowest point of the heavy
-   (p90-of-demand) lines.
+   account, with refill jumps at resets. Candidates get a lexicographic score on the heavy
+   (p90-of-demand) lines, in the order of design amendment 2 (B2): the smaller low-point share, then the
+   minutes of heavy stops (fewer is better), then the other low-point share, then the smaller share on
+   the typical lines (`compareScores`).
 6. **Response** (`response.ts`, `stops.ts`, `past.ts`). Pointwise percentile lines (`percentile.ts`),
    stops, `stopNow`, shortfall, Fable `outAt`, and the past series.
 
@@ -72,10 +74,16 @@ The user-facing knobs (`simulatedDays`, `timeShiftMin`, `recentTauMin`, `session
 `openMinGainPoints`, `moveMinGainPoints`, `minStopPoints`, `fanLevels`, history half-life and lookback)
 are `ForecastSettings`, not constants.
 
-Opening ahead of need (`openingEarns`, amendment A2): a window opens early when that raises score item 1
-by `openMinGainPoints`, or when items 1 and 2 tie within `TIER_TOLERANCE_POINTS` and the heavy stop
-minutes fall by at least `OPEN_MIN_STOP_GAIN_MIN`. The placement reason is then `open-ahead+<points>` or
-`open-ahead-stop-<minutes>min`.
+Opening ahead of need (`openingEarns`, amendment 2 B3): a window opens early when that raises score
+item 1 by `openMinGainPoints`, or when item 1 ties within `TIER_TOLERANCE_POINTS` and the heavy stop
+minutes fall by at least `OPEN_MIN_STOP_GAIN_MIN`; never for the other share or the typical share alone.
+The placement reason is then `open-ahead+<points>` or `open-ahead-stop-<minutes>min`.
+
+Placement reason (amendment 2 B4), one token: `open-ahead+<points>` or `open-ahead-stop-<minutes>min`
+for an opening ahead of need; else `low-point+<points>` for a gain of item 1 over the on-demand plan;
+else `reset-soon`; else the first score item on which the first tier beats the second, with its gain
+(`decidingReason`): `low-point+<points>`, `stop-shorter+<minutes>min`, `weekly-low+<points>` or
+`five-hour-low+<points>`, `typical-low+<points>`.
 
 Learned work start (`workStartMinute`, amendment A3): the median, over the last `WORK_START_RECENT_DAYS`
 work days with demand, of the local minute at which the day's cumulative demand first reaches
