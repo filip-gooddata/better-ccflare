@@ -40,6 +40,7 @@ export function settings(
 		historyLookbackDays: 56,
 		recentTauMin: 60,
 		sessionTurnoverMin: 90,
+		workStartSharePct: 5,
 		...over,
 	};
 }
