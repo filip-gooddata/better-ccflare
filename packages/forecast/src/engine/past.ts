@@ -258,6 +258,7 @@ export function pastSeries(ctx: EngineContext, quantity: Quantity): Series {
 		prevT = t;
 	}
 	if (last().t < ctx.now) change(prevT, ctx.now, nowValue);
+	else last().v = nowValue;
 	const kept = quantity === "week" ? thin(entries) : entries;
 	return { times: kept.map((e) => e.t), values: kept.map((e) => e.v) };
 }

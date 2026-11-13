@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { pooledLeftNow } from "../past";
+import type { LimitReading, LimitWindow } from "../../types";
+import { pastSeries, pooledLeftNow } from "../past";
 import { buildSampleAxis, onDemandPlan, simulate } from "../simulate";
+import {
+	makeCtx as makeResponseCtx,
+	NOW,
+	account as responseAccount,
+} from "./fixtures-response";
 import { account, HOUR, indexAt, makeCtx, prague } from "./fixtures-sim";
 
 describe("a refusal cooldown counts 0 in the 5-hour pool until it ends (spec section 3)", () => {
@@ -155,5 +161,66 @@ describe("a refusal cooldown counts 0 in the 5-hour pool until it ends (spec sec
 			onDemandPlan(ctx),
 		);
 		expect(buildSampleAxis(ctx, onDemandPlan(ctx)).times).toEqual(plain.times);
+	});
+});
+
+describe("a cooldown ending before the 5-hour reset, under demand", () => {
+	test("the account counts its quota left again from blockedUntil and takes the demand from there", async () => {
+		const now = prague(12, 8);
+		const blockedUntil = now + HOUR;
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({
+					id: "acct-a",
+					fiveUsed: 30,
+					fiveReset: now + 5 * HOUR,
+					blockedUntil,
+				}),
+				account({ id: "acct-b", fiveUsed: 100, fiveReset: now + 6 * HOUR }),
+			],
+			rate: () => 0.1,
+		});
+		const { axis, traces } = await simulate(ctx, onDemandPlan(ctx));
+		const [t] = traces;
+		const b = indexAt(axis.times, blockedUntil);
+		expect(axis.times[b + 1]).toBe(blockedUntil);
+		expect([t.day[0], t.day[b], t.day[b + 1]]).toEqual([0, 0, 70]);
+		expect(t.unserved[b]).toBeGreaterThan(0);
+		expect(t.unserved[b + 2]).toBe(0);
+		expect(t.day[b + 2]).toBeLessThan(70);
+	});
+});
+
+describe("day.past ends at the current point", () => {
+	test("a reading exactly at now does not bring back the quota of an account in a cooldown", () => {
+		const a = responseAccount("acct-a", {
+			fiveHour: { usedPct: 30, resetsAt: NOW + 2 * HOUR },
+			weekly: { usedPct: 10, resetsAt: NOW + 100 * HOUR },
+			blockedUntil: NOW + 5 * HOUR,
+		});
+		const b = responseAccount("acct-b", {
+			fiveHour: { usedPct: 40, resetsAt: NOW + 3 * HOUR },
+			weekly: { usedPct: 10, resetsAt: NOW + 100 * HOUR },
+		});
+		const read = (
+			id: string,
+			window: LimitWindow,
+			usedPct: number,
+			resetsAt: number,
+		): LimitReading => ({ accountId: id, window, at: NOW, usedPct, resetsAt });
+		const ctx = makeResponseCtx({
+			accounts: [a, b],
+			readings: [
+				read("acct-a", "five_hour", 30, NOW + 2 * HOUR),
+				read("acct-a", "seven_day", 10, NOW + 100 * HOUR),
+				read("acct-b", "five_hour", 40, NOW + 3 * HOUR),
+				read("acct-b", "seven_day", 10, NOW + 100 * HOUR),
+			],
+		});
+		const past = pastSeries(ctx, "day");
+		expect(past.times.at(-1)).toBe(NOW);
+		expect(past.values.at(-1)).toBe(60);
 	});
 });
