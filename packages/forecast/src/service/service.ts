@@ -78,7 +78,7 @@ export interface ForecastService {
 	forecastView(): PrewarmForecastView | null;
 	/** Resolves when no computation is running or queued and the scheduler is idle. */
 	idle(): Promise<void>;
-	/** Clears timers, stops the scheduler, awaits the running computation; later notifies do nothing. */
+	/** Clears timers, stops the scheduler, awaits the running computation and pre-warm runs in flight; later notifies do nothing. */
 	stop(): Promise<void>;
 }
 
@@ -96,13 +96,15 @@ export function createForecastService(
 	let lastLimits: AccountLimits[] = [];
 	let consumedMoves = new Set<string>();
 	let running: Promise<void> | null = null;
-	let followUp = false;
+	/** A usage snapshot arrived that no started computation has covered yet. */
+	let wanted = false;
+	let lastNotifyAt: EpochMs | null = null;
 	let lastStart: EpochMs | null = null;
-	let settleHandle: unknown = null;
-	let spacingHandle: unknown = null;
+	/** The one timer for queued work; its deadline covers both the settle wait and the spacing. */
+	let pendingHandle: unknown = null;
 	let stopped = false;
-	let synced = false;
 	let backfillStarted = false;
+	let quietWaiters: (() => void)[] = [];
 
 	const backfill =
 		deps.backfill ??
@@ -152,10 +154,7 @@ export function createForecastService(
 		const failures: string[] = [];
 		try {
 			await syncProxyDemand({ db }, now);
-			if (!synced) {
-				synced = true;
-				startBackfill();
-			}
+			startBackfill();
 		} catch (error) {
 			failures.push(`sync=${message(error)}`);
 		}
@@ -207,8 +206,42 @@ export function createForecastService(
 			logger.warn(`forecast cycle failed ${failures.join(" ")}`);
 	};
 
+	const clearPending = () => {
+		if (pendingHandle !== null) timer.clear(pendingHandle);
+		pendingHandle = null;
+	};
+
+	const settleQuiet = () => {
+		if (running || pendingHandle !== null) return;
+		const waiters = quietWaiters;
+		quietWaiters = [];
+		for (const resolve of waiters) resolve();
+	};
+
+	/** Arms the one pending timer for the latest snapshot, no earlier than the spacing allows. */
+	const schedule = () => {
+		clearPending();
+		if (stopped || !wanted || running) return;
+		const now = clock.now();
+		const at = Math.max(
+			(lastNotifyAt ?? now) + FORECAST_POLL_SETTLE_MS,
+			lastStart === null ? now : lastStart + FORECAST_MIN_SPACING_MS,
+		);
+		pendingHandle = timer.set(
+			() => {
+				pendingHandle = null;
+				if (!stopped && wanted && !running) void start();
+				settleQuiet();
+			},
+			Math.max(0, at - now),
+		);
+	};
+
+	/** Starts a computation now; it covers every snapshot seen so far. */
 	const start = (): Promise<void> => {
 		if (running) return running;
+		clearPending();
+		wanted = false;
 		lastStart = clock.now();
 		const current = cycle()
 			.catch((error: unknown) => {
@@ -216,35 +249,11 @@ export function createForecastService(
 			})
 			.finally(() => {
 				running = null;
-				if (followUp && !stopped) {
-					followUp = false;
-					request();
-				}
+				schedule();
+				settleQuiet();
 			});
 		running = current;
 		return current;
-	};
-
-	/** Starts a computation as soon as the spacing allows, or queues one follow-up. */
-	const request = () => {
-		if (stopped) return;
-		if (running) {
-			followUp = true;
-			return;
-		}
-		if (spacingHandle !== null) return;
-		const wait =
-			lastStart === null
-				? 0
-				: lastStart + FORECAST_MIN_SPACING_MS - clock.now();
-		if (wait <= 0) {
-			void start();
-			return;
-		}
-		spacingHandle = timer.set(() => {
-			spacingHandle = null;
-			if (!stopped) void start();
-		}, wait);
 	};
 
 	const advisor: ForecastAdvisor = {
@@ -296,8 +305,9 @@ export function createForecastService(
 	};
 
 	const provider = (): ForecastResponse => {
-		const now = clock.now();
+		let now = Date.now();
 		try {
+			now = clock.now();
 			const base =
 				kept && fresh(now)
 					? kept.result.response
@@ -305,7 +315,11 @@ export function createForecastService(
 			const prewarm = deps.scheduler ? deps.scheduler.status() : emptyPrewarm();
 			return { ...base, prewarm };
 		} catch (error) {
-			logger.warn(`forecast provider failed ${message(error)}`);
+			try {
+				logger.warn(`forecast provider failed ${message(error)}`);
+			} catch {
+				// never throws
+			}
 			return {
 				...unavailableResponse(now, "error", []),
 				prewarm: emptyPrewarm(),
@@ -317,13 +331,12 @@ export function createForecastService(
 		notifyUsagePoll() {
 			try {
 				if (stopped) return;
-				if (settleHandle !== null) timer.clear(settleHandle);
-				settleHandle = timer.set(() => {
-					settleHandle = null;
-					request();
-				}, FORECAST_POLL_SETTLE_MS);
-			} catch (error) {
-				logger.warn(`forecast notify failed ${message(error)}`);
+				wanted = true;
+				lastNotifyAt = clock.now();
+				// while a computation runs, its end schedules the follow-up
+				if (!running) schedule();
+			} catch {
+				// never throws
 			}
 		},
 		runOnce() {
@@ -344,24 +357,23 @@ export function createForecastService(
 		},
 		async idle() {
 			for (;;) {
-				const current = running;
-				if (current) {
-					await current;
+				if (running || pendingHandle !== null) {
+					await new Promise<void>((resolve) => quietWaiters.push(resolve));
 					continue;
 				}
 				await deps.scheduler?.idle();
-				if (!running) return;
+				if (!running && pendingHandle === null) return;
 			}
 		},
 		async stop() {
 			stopped = true;
-			followUp = false;
-			if (settleHandle !== null) timer.clear(settleHandle);
-			if (spacingHandle !== null) timer.clear(spacingHandle);
-			settleHandle = null;
-			spacingHandle = null;
+			wanted = false;
+			clearPending();
 			deps.scheduler?.stop();
 			if (running) await running;
+			settleQuiet();
+			// pre-warm runs in flight finish and record before the database closes
+			await deps.scheduler?.idle();
 		},
 	};
 }
