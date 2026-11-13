@@ -55,7 +55,15 @@ describe("off", () => {
 		expect(w.runner.calls).toEqual([]);
 		expect(w.lines).toEqual([]);
 		expect(w.timer.pending).toEqual([]);
-		expect(s.status()).toEqual({ enabled: false, planned: [], last: [] });
+		// The openings stay listed: with prewarm off routing makes them.
+		expect(s.status()).toEqual({
+			enabled: false,
+			planned: [
+				{ accountId: "a", openAt: T0 - H },
+				{ accountId: "b", openAt: T0 + MIN },
+			],
+			last: [],
+		});
 	});
 });
 
@@ -637,7 +645,25 @@ describe("status", () => {
 			last: prior,
 		});
 		w.state.settings = settings({ prewarm: false });
+		expect(s.status()).toEqual({
+			enabled: false,
+			planned: [
+				{ accountId: "a", openAt: T0 + H },
+				{ accountId: "b", openAt: T0 + 2 * H },
+			],
+			last: prior,
+		});
+	});
+
+	test("planned is empty without an available forecast, whatever prewarm says", async () => {
+		const { w, s } = onWorld({ forecast: null });
+		await s.tick(T0);
 		expect(s.status().planned).toEqual([]);
-		expect(s.status().enabled).toBe(false);
+		w.state.settings = settings({ prewarm: false });
+		w.state.forecast = {
+			available: false,
+			plan: plan({ a: T0 + H }),
+		};
+		expect(s.status().planned).toEqual([]);
 	});
 });
