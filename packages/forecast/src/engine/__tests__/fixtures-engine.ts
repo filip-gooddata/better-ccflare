@@ -245,14 +245,16 @@ function unitsBetween(f: EngineFixture, from: EpochMs, to: EpochMs): number {
 // ── the 2026-11-12 shape (research 17) ──────────────────────────────────
 
 /**
- * Units per local hour of the 2026-11-12 day at K_FIVE_HOUR = 2, from the trace only: 60 points
- * 08–11 (acct-a's window that resets at 11:00), about 100 points 11:00–13:17 (acct-a full),
- * about 100 points 13:10–14:55 (acct-b full), little demand while both are out (15 refused
- * requests in the 15:00 hour), 30 points 16:00–16:30, tailing off in the evening.
+ * Units per local hour of the 2026-11-12 day at K_FIVE_HOUR = 2, from the record (research 17):
+ * one overnight request at 01:00 (acct-a's 00:50–05:50 window reached 3 %); demand from 06:00
+ * that takes acct-a's window resetting at 11:00 to 60 points by 11:00 (60 % at 10:58:18); 88
+ * points 11:00–13:00 and 48 per hour after, so acct-a's next window is full at about 13:15
+ * (13:17:41); acct-b then takes 35 units per hour and is full at about 14:55 (refused 14:54:46);
+ * little demand while both are out (31 refused requests until 15:55:37); 30 points
+ * 16:00–16:30 (30 % at 16:29:56), tailing off in the evening.
  */
 export const DAY_2026_11_12 = [
-	0, 0, 0, 0, 0, 0, 0.5, 0.5, 10, 10, 10, 22, 22, 26, 30, 4, 20, 8, 3, 1, 0, 0,
-	0, 0,
+	0, 1, 0, 0, 0, 0, 2, 4, 6, 8, 10, 22, 22, 24, 35, 4, 30, 8, 3, 1, 0, 0, 0, 0,
 ];
 
 /** Recorded days scale the 2026-11-12 shape by a fixed per-day factor (spread for the bandwidth). */
@@ -269,8 +271,9 @@ export const replayHourly: HourlyShape = (key, isoWeekday) => {
 };
 
 /**
- * Morning of 2026-11-12, 07:00: acct-a's window opened at about 06:07 and resets at 11:00
- * (trace: 0% at 06:12), acct-b has no open window (trace: none from 00:34 to 13:11).
+ * Morning of 2026-11-12, 07:00: acct-a's window opened at 06:00 with the first demand and
+ * resets at 11:00 (record: 0 % at 06:12:18), 4 points used in the 06:00 hour; acct-b has no
+ * open window (record: none from 00:34 to 13:11).
  */
 export function replayFixture(
 	over: Partial<EngineFixture> = {},
@@ -281,7 +284,7 @@ export function replayFixture(
 		hourly: replayHourly,
 		weeklyReset: { a: prague(15, 15), b: prague(17, 3) },
 		fiveHour: {
-			a: { usedPct: 0, resetsAt: prague(12, 11) },
+			a: { usedPct: 4, resetsAt: prague(12, 11) },
 			b: { usedPct: 0, resetsAt: null },
 		},
 		...over,
@@ -377,5 +380,12 @@ export const profileHourly: HourlyShape = (key, isoWeekday) => {
 
 /** 2026-11-12 07:00 with the recorded days of the aggregated profile; account state as the replay. */
 export function profileFixture(): EngineFixture {
-	return replayFixture({ historyDays: 37, hourly: profileHourly });
+	return replayFixture({
+		historyDays: 37,
+		hourly: profileHourly,
+		fiveHour: {
+			a: { usedPct: 0, resetsAt: prague(12, 11) },
+			b: { usedPct: 0, resetsAt: null },
+		},
+	});
 }
