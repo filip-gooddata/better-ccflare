@@ -101,8 +101,11 @@ async function typicalStops(ctx: EngineContext): Promise<Interval[]> {
 	return day.stops.typical;
 }
 
-function overlaps(x: Interval, y: Interval): boolean {
-	return x.start < y.end && y.start < x.end;
+function iso(stops: Interval[]): Array<[string, string]> {
+	return stops.map((s) => [
+		new Date(s.start).toISOString(),
+		new Date(s.end).toISOString(),
+	]);
 }
 
 describe("day factor with an evidence weight (amendment 4)", () => {
@@ -125,9 +128,14 @@ describe("day factor with an evidence weight (amendment 4)", () => {
 
 		const withNight = await typicalStops(night);
 		const without = await typicalStops(quiet);
-		for (const s of withNight) {
-			expect(without.some((t) => overlaps(s, t))).toBe(true);
-		}
+		// the same single stop, both ends pinned (Prague time): 14:50-16:00 with the night,
+		// 15:09-15:55 without
+		expect(iso(without)).toEqual([
+			["2026-11-12T14:09:00.000Z", "2026-11-12T14:55:00.000Z"],
+		]);
+		expect(iso(withNight)).toEqual([
+			["2026-11-12T13:50:00.000Z", "2026-11-12T15:00:00.000Z"],
+		]);
 	});
 
 	test("the diagnostics carry a_raw, a_cl, w, a, Y, M and c", async () => {
