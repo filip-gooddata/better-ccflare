@@ -93,8 +93,11 @@ export interface ForecastWiring {
 	provider: (() => ForecastResponse) | undefined;
 	/** Give session-pace the advisor (routing on at start-up); other strategies get nothing. */
 	attachToStrategy(strategy: unknown): void;
-	/** Called after every recorded usage snapshot of a Claude account. */
-	onUsageSnapshot(accountId: string): void;
+	/**
+	 * Called after every recorded usage snapshot of a Claude account, with
+	 * when the reading arrived (default: now).
+	 */
+	onUsageSnapshot(accountId: string, readAt?: EpochMs): void;
 	stop(): Promise<void>;
 }
 
@@ -311,8 +314,8 @@ export function createForecastWiring(
 			if (!hasAdvisorSetter(strategy)) return;
 			strategy.setForecastAdvisor(routingAtStart ? created.advisor : null);
 		},
-		onUsageSnapshot(accountId) {
-			readTimes.set(accountId, clock.now());
+		onUsageSnapshot(accountId, readAt) {
+			readTimes.set(accountId, readAt ?? clock.now());
 			created.notifyUsagePoll();
 		},
 		// Resolves once no cycle and no pre-warm run is in flight; a run can take

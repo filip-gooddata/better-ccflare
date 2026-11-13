@@ -209,6 +209,8 @@ export function createUsageSnapshotRecorder(
 	logger: Logger,
 ): (accountId: string, data: UsageData) => Promise<void> {
 	return async (accountId, data) => {
+		// The reading arrived now; persistence below may take a while.
+		const readAt = Date.now();
 		if (account.provider === "codex") {
 			const usage = data as unknown as Record<string, unknown>;
 			try {
@@ -242,26 +244,29 @@ export function createUsageSnapshotRecorder(
 		}
 		await applyUsagePauseThresholds(accountId, data, dbOps, logger);
 		if (account.provider === "anthropic") {
-			notifyUsageSnapshotListener(accountId);
+			notifyUsageSnapshotListener(accountId, readAt);
 		}
 	};
 }
 
-let usageSnapshotListener: ((accountId: string) => void) | null = null;
+let usageSnapshotListener:
+	| ((accountId: string, readAt: number) => void)
+	| null = null;
 
 /**
  * Register the one listener told about every recorded Anthropic usage
- * snapshot (the forecast's usage-poll moment); null removes it.
+ * snapshot (the forecast's usage-poll moment) with when the reading arrived;
+ * null removes it.
  */
 export function setUsageSnapshotListener(
-	listener: ((accountId: string) => void) | null,
+	listener: ((accountId: string, readAt: number) => void) | null,
 ): void {
 	usageSnapshotListener = listener;
 }
 
-function notifyUsageSnapshotListener(accountId: string): void {
+function notifyUsageSnapshotListener(accountId: string, readAt: number): void {
 	try {
-		usageSnapshotListener?.(accountId);
+		usageSnapshotListener?.(accountId, readAt);
 	} catch {
 		// A listener failure must not cost the poller its snapshot.
 	}
@@ -1582,7 +1587,7 @@ export default async function startServer(options?: {
 	forecastWiring = forecast;
 	setUsageSnapshotListener(
 		forecast.service
-			? (accountId) => forecast.onUsageSnapshot(accountId)
+			? (accountId, readAt) => forecast.onUsageSnapshot(accountId, readAt)
 			: null,
 	);
 

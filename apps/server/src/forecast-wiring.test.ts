@@ -440,6 +440,38 @@ describe("usage snapshot hook", () => {
 		expect(seen).toEqual(["c1"]);
 	});
 
+	it("passes when the reading arrived, not when persistence finished", async () => {
+		const dbOps = tempDb();
+		let persistedAt = 0;
+		const slowDb = new Proxy(dbOps, {
+			get(target, prop, receiver) {
+				if (prop === "recordUsageSnapshot") {
+					return async (...args: unknown[]) => {
+						await new Promise((resolve) => setTimeout(resolve, 25));
+						persistedAt = Date.now();
+						return (
+							target.recordUsageSnapshot as (...a: unknown[]) => unknown
+						).apply(target, args);
+					};
+				}
+				return Reflect.get(target, prop, receiver);
+			},
+		});
+		const seen: Array<[string, number]> = [];
+		setUsageSnapshotListener((id, readAt) => seen.push([id, readAt]));
+		const before = Date.now();
+		await createUsageSnapshotRecorder(
+			{ id: "c1", name: "c1", provider: "anthropic" },
+			slowDb,
+			new Logger("test"),
+		)("c1", {
+			five_hour: { utilization: 5, resets_at: null },
+		} as unknown as UsageData);
+		expect(seen).toHaveLength(1);
+		expect(seen[0][1]).toBeGreaterThanOrEqual(before);
+		expect(seen[0][1]).toBeLessThan(persistedAt);
+	});
+
 	it("keeps recording when the listener throws", async () => {
 		const dbOps = tempDb();
 		setUsageSnapshotListener(() => {
@@ -925,6 +957,12 @@ describe("pre-warm through the wiring", () => {
 			await h.time.advance(POLL);
 			await h.wiring.service?.idle();
 		}
+		expect(last()?.windowOpened).toBeNull();
+		// A closed-window reading that arrived before the run but was persisted
+		// after it still says nothing about the run.
+		h.wiring.onUsageSnapshot("acct-a", h.time.now - 4 * POLL);
+		await h.time.advance(POLL);
+		await h.wiring.service?.idle();
 		expect(last()?.windowOpened).toBeNull();
 		h.usage.set("acct-a", {
 			five_hour: {
