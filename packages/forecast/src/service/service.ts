@@ -161,7 +161,13 @@ export function createForecastService(
 		try {
 			const settings = deps.settings();
 			const pace = deps.pace();
-			const historyFrom = now - settings.historyLookbackDays * DAY_MS;
+			// Days before the first stored bucket were never recorded; inside
+			// [historyFrom, now) the engine reads a missing bucket as zero demand.
+			const earliest = await store.earliest();
+			const historyFrom = Math.max(
+				now - settings.historyLookbackDays * DAY_MS,
+				earliest ?? now,
+			);
 			const [history, accountHistory, readings] = await Promise.all([
 				store.loadPooled(historyFrom, now),
 				store.loadByAccount(historyFrom, now),
