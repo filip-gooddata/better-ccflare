@@ -1,11 +1,11 @@
-> This is a copy of spec revision 2 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 4 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 2 · 2026-11-12 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 4 · 2026-11-13 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -22,6 +22,11 @@ change that breaks a reader bumps `contractVersion`.
 The field is absent when the forecast is switched off (setting `forecast.enabled` false). A client calls `path`
 only when the field is present and it understands `contractVersion`. The same response also gains
 `forecastSettings` (always present; the effective settings, like `sessionPace`); the UI does not need it.
+
+Names of settings: this document writes a setting as `forecast.<name>`. The same setting is the field
+`forecastSettings.<name>` of this response (so `forecast.enabled` is `forecastSettings.enabled`), the environment
+variable `FORECAST_<NAME>` and the config key `forecast_<name>`. The set of settings may grow without a spec
+revision; `docs/configuration.md` in the proxy repository lists them.
 
 ## 2. Request
 
@@ -56,6 +61,10 @@ recent weeks, scaled by how today has gone so far, and joined to the last hour's
 recorded day. Because only a few dozen recorded days exist, each simulated day also gets its own small random shift
 in time (up to 30 minutes either way) and its own random scale around today's level, so the 400 days differ from
 each other and levels two percentile points apart (8 simulated days apart) are not systematically identical. The
+method is a smoothed bootstrap of whole recorded days. The width of the random scale comes from the recorded days
+themselves (the normal-reference bandwidth rule on the logarithm of their daily totals), and the scale is applied
+in the variance-preserving ("shrunk") form of Silverman and Young (1987), so the simulated days keep the mean and
+the spread of the recorded days and are not made wider by the added noise. The
 random draws are fixed per local day, so the lines do not flicker between two computations. Every simulated day
 is run through the same routing plan the proxy is following (including the window openings it has planned).
 
@@ -67,13 +76,16 @@ above in (100 − NN) % of the simulated days. `light` = p10, `typical` = p50 (t
 
 **Ordering is guaranteed for all 41 lines**: all levels are percentiles of the same simulated quantity at the same
 time point, so at every index `light ≥ p12 ≥ p14 ≥ … ≥ p48 ≥ typical ≥ p52 ≥ … ≥ p88 ≥ heavy`. Equality is possible
-(always at
-`computedAt`, wherever all simulated days agree, such as at 0 and at the full pool, and with little history the
-lines may nearly coincide). The price of this: a level line is not one
-single simulated day. Resets of windows that are open now, and openings the proxy has planned, happen at the same
-time in every simulated day and show as exact jumps. A window that opens "whenever demand first reaches that
-account" opens at different times in different simulated days, so its later reset shows as a rise spread over a
-few steps, not as one jump.
+wherever all simulated days agree, such as at 0 and at the full pool, and with little history the lines may nearly
+coincide. At `computedAt` all levels are equal as a consequence (every simulated day starts from the same
+reading); that is not a separate rule a reader has to check. The price of this: a level line is not one
+single simulated day. Resets of windows that are open now happen at the same time in every simulated day and
+show as exact jumps. So do openings the proxy has planned when it makes them itself by a pre-warm request
+(setting `forecast.prewarm` on). With that setting off (the default) a planned opening is made by routing: from
+the planned time the first new demand goes to that account and opens its window, so the opening happens at or
+shortly after the planned time and its reset is close to one jump. A window that opens "whenever demand first
+reaches that account" opens at different times in different simulated days, so its later reset shows as a rise
+spread over a few steps, not as one jump.
 
 The routing planner plans against `heavy` (p90). That is unchanged by the extra levels.
 
@@ -90,7 +102,9 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
   no expected demand is therefore NOT a stop and is not listed, although the line is drawn at 0. If demand is
   expected in any part of the interval, the whole interval is reported.
 - `start` is the first minute the line is at 0. `end` is the first minute it is above 0 again (the reset that
-  brings quota back), or the end of the projection if none comes before it.
+  brings quota back), or the end of the projection if none comes before it. Both are instants in their own
+  right: they usually coincide with an entry of `times` (zero points and jumps are on the axis), but a reader
+  must not rely on finding them there.
 - **`stopNow`** is a fact, not a projection: every counted account is out right now according to the latest
   readings (5-hour utilisation at 100 with a reset still ahead, weekly at 100, or refused by upstream with a
   cooldown running). `start` = when the last account went out, `end` = the earliest moment a counted account comes
@@ -106,7 +120,7 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `contractVersion` | 1. |
 | `computedAt` | When this forecast was computed. |
 | `available` | `false` = no forecast; then `reason` is set, `accounts` may be empty, `day` and `week` are `null`, `fable` is `{}`. |
-| `reason` | `null` when available. Else `insufficient_history` (too few recorded days or too few usage readings to calibrate), `error` (the computation failed), or `disabled` (switched off; a client that follows discovery never sees it). |
+| `reason` | `null` when available. Else `insufficient_history` (too few recorded days or too few usage readings to calibrate), `error` (the computation failed, or there is no current result: just after a start before the first computation, or when the last result is older than three usage polls), or `disabled` (switched off; a client that follows discovery never sees it, because the discovery field and the forecast are switched by the same setting). |
 | `accounts` | Ids of the counted accounts. |
 | `levels` | `{ "light": 10, "typical": 50, "heavy": 90 }`: the percentile behind each named level. |
 | `day.past` | `{ times, values }`: pooled 5-hour quota left from local midnight to `computedAt`, one entry per change in the readings, jumps as two entries. Starts later than midnight when the proxy has no earlier readings. |
@@ -123,10 +137,10 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `week.stops`, `week.stopNow`, `week.pastStops`, `week.shortfall` | As for `day`, for the weekly limits, in points of a weekly limit. `end` = the first weekly reset that brings quota back. |
 | `fable` | `{ "<id>": { "outAt": time or null } }` per counted account: when its weekly Fable sub-limit reaches 100 % on the typical projection (the median over the simulated days, rounded down to the hour), or `null` when at least half of the simulated days reach its reset first. Display only; routing keeps the 90 % Fable guard. |
 
-| `prewarm` | Optional. Diagnostics of the window pre-warm, for the pre-warm test and for operators; the UI ignores it. `{ enabled, planned: [{ accountId, openAt }], last: [{ accountId, kind, scheduledAt, firedAt, exitCode, windowOpened, resetsAt }] }`. `enabled` = setting `forecast.prewarm`. `planned` = window openings the plan would make by a pre-warm request. `last` = the most recent pre-warm requests, newest first (at most 20): `kind` is `"plan"` or `"test"`, `windowOpened` is `true`/`false` once a later usage reading has shown whether the 5-hour window opened, `null` before that; `resetsAt` is that window's reset. Present whenever the forecast is switched on, also when `available` is false. |
+| `prewarm` | Optional. Diagnostics of the window pre-warm, for the pre-warm test and for operators; the UI ignores it. `{ enabled, planned: [{ accountId, openAt }], last: [{ accountId, kind, scheduledAt, firedAt, exitCode, windowOpened, resetsAt }] }`. `enabled` = setting `forecast.prewarm`. `planned` = the window openings in the current plan, each with its planned time: made by a pre-warm request when `enabled` is true, and by routing the first new demand to that account from that time when `enabled` is false. `last` = the most recent pre-warm requests, newest first (at most 20): `kind` is `"plan"` or `"test"`, `windowOpened` is `true`/`false` once a later usage reading has shown whether the 5-hour window opened, `null` before that; `resetsAt` is that window's reset. Present whenever the forecast is switched on, also when `available` is false. |
 
-Size: about 300 time points × 42 arrays for the day and 170 × 42 for the week, values at one decimal: 150 to 250 kB
-uncompressed.
+Size: up to about 300 time points × 42 arrays for the day and 170 × 42 for the week, values at one decimal: at
+most 150 to 250 kB uncompressed; about 80 to 90 kB measured on the test fixtures.
 
 ## 7. Full example
 
@@ -250,6 +264,20 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 4, 2026-11-13: wording only; no field added, removed, renamed or retyped. Section 4 and the `prewarm`
+  row of section 6 say what a planned opening is when the pre-warm is off (the default): the proxy routes the
+  first new demand to that account from the planned time. `prewarm.planned` lists the planned openings in both
+  cases. `contractVersion` stays 1.
+
+- Revision 3, 2026-11-13: wording only; no field added, removed, renamed or retyped. One clarification a client
+  may act on: `reason` = `error` is also what the proxy serves when it has no current result (see section 6), so
+  it can be transient just after a proxy start. Section 1: how setting names map to `forecastSettings`, environment and config keys. Section 4: the method is
+  named (smoothed bootstrap, variance-preserving form of Silverman and Young 1987, bandwidth from the recorded
+  days); equality of the levels at `computedAt` is stated as a consequence, not a rule. Section 5: a stop's
+  `start` and `end` are instants and need not be entries of `times`. Section 6: `error` also covers "no current
+  result" (just after a start, or a result older than three usage polls); why `disabled` is never seen after
+  discovery; measured size. `contractVersion` stays 1.
 
 - Revision 2, 2026-11-12: default `forecast.fanLevels` is now every 2 percentile points (`p12` … `p48`, `p52` …
   `p88`, 38 keys) for the smooth fan; same format, more keys. 400 simulated days, each with its own small random

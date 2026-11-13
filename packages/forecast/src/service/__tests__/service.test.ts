@@ -551,6 +551,23 @@ describe("forecast service: fresh and stale", () => {
 		});
 	});
 
+	it("without a scheduler, planned still lists the kept plan's openings, prewarm on or off", async () => {
+		for (const prewarm of [false, true]) {
+			const h = harness({ scheduler: null, settings: { prewarm } });
+			h.engine.result = (i) =>
+				available(
+					i.now,
+					availablePlan(i.now, { [A]: T0 + 30 * MIN, [B]: null }),
+				);
+			await h.service.runOnce();
+			expect(serve(h).prewarm).toEqual({
+				enabled: prewarm,
+				planned: [{ accountId: A, openAt: T0 + 30 * MIN }],
+				last: [],
+			});
+		}
+	});
+
 	it("the provider never throws", async () => {
 		const h = harness();
 		await h.service.runOnce();
@@ -744,6 +761,32 @@ describe("forecast service with the real scheduler and a fake runner", () => {
 		expect(serve(h).prewarm?.enabled).toBe(false);
 		await h.service.stop();
 	});
+
+	for (const prewarm of [false, true]) {
+		it(`prewarm.planned lists the plan's window openings with prewarm ${prewarm ? "on" : "off"}`, async () => {
+			const time = new FakeTime();
+			const h = withScheduler(
+				{ prewarm },
+				new FakeStore(),
+				time,
+				new FakeRunner(),
+				{ [A]: T0 + 3 * 60 * MIN, [B]: T0 + 60 * MIN },
+			);
+			await h.service.runOnce();
+			await h.service.idle();
+			const res = serve(h);
+			expect(res.prewarm).toEqual({
+				enabled: prewarm,
+				planned: [
+					{ accountId: B, openAt: T0 + 60 * MIN },
+					{ accountId: A, openAt: T0 + 3 * 60 * MIN },
+				],
+				last: [],
+			});
+			expect(validateForecastResponse(res)).toEqual([]);
+			await h.service.stop();
+		});
+	}
 
 	it("prewarmTest fires once for the named account, and not again after a restart", async () => {
 		const time = new FakeTime();

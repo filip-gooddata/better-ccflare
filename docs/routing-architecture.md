@@ -332,6 +332,8 @@ Only `session-pace` takes advice, only when `routing` is on, and only for reques
 
 ### Pre-warm
 
+A window opening in the plan (`openAt`) means one of two things, and only `prewarm` decides which. With `prewarm` off (the default) the opening is made by routing: from the planned time the next new session is placed on that account with rule `forecast-open`, its first request opens the window, sessions already attached to other accounts stay where they are, and no pre-warm request is sent; with `prewarm` on the scheduler below opens the window itself at that time.
+
 Pre-warm opens an account's 5-hour window at the time the plan chose, with one one-word request through the real `claude` CLI (print mode, `prewarmModel`, default Haiku) pinned to that account through the proxy. It is **off by default** (`prewarm: false`). With it on, the scheduler fires only when the forecast is fresh, the plan's opening time has come, the account has a current usage reading (the usage cache keeps a reading for at most 10 minutes) that shows no open 5-hour window, the account is counted and not out, it is below `prewarmMaxPerDay` for the day, no pre-warm ran for it in the last 5 hours, and none is running. Records of the last 20 pre-warms survive a restart. Whether the window opened is judged only from a reading that arrived after the pre-warm finished.
 
 **Local API keys**: the pre-warm request goes through this proxy without a local API key. When the proxy has active API keys (`/api/api-keys`), it answers that request 401 and no window opens; the `done` line then shows the CLI's non-zero exit.
@@ -345,7 +347,7 @@ Log lines (INFO):
 - `forecast prewarm result account=<name> windowOpened=<true|false> resetsAt=<iso|none>` (after the next readings)
 - `forecast prewarm skip account=<name> reason=<token>` (tokens include `window_open`, `daily_cap`, `not_counted`, `stale_reading`, `unknown_account`)
 
-`GET /api/forecast` reports the planned and recent pre-warms under `prewarm`.
+`GET /api/forecast` lists the plan's window openings under `prewarm.planned` whether `prewarm` is on (made by a pre-warm request) or off (made by routing), and the recent pre-warms under `prewarm.last`.
 
 ### Settings and restarts
 

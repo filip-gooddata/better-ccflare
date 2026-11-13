@@ -380,6 +380,32 @@ describe("SessionPaceStrategy with a forecast advisor", () => {
 			expect(strategy.select([a, b, c], meta(S1))[0].id).toBe("c");
 		});
 
+		it("forecast-open places only new sessions: an attached session stays where it is", () => {
+			mapTo(S1, a);
+			advisor.ttl.set(S1, HOUR);
+			advisor.placement = {
+				tiers: [["c"]],
+				rule: "forecast-open",
+				reason: "reset-soon",
+			};
+			const lines = captureLines(strategy);
+			setSystemTime(new Date(NOW + MIN));
+			const live = meta(S1);
+			expect(strategy.select([a, b, c], live)[0].id).toBe("a");
+			strategy.onRequestServed(live, a, 200);
+			expect(lines).toEqual([]);
+			const fresh = meta("s-new");
+			expect(strategy.select([a, b, c], fresh)[0].id).toBe("c");
+			strategy.onRequestServed(fresh, c, 200);
+			expect(lines).toHaveLength(1);
+			expect(lines[0]).toStartWith(
+				`session-pace place session=${sessionLogTag("s-new")} account=c-name rule=forecast-open reason=reset-soon `,
+			);
+			expect(advisor.appliedCalls).toEqual([
+				["place", "s-new", "c", NOW + MIN],
+			]);
+		});
+
 		it("keeps the mapping and calls no applied when the move target did not serve", () => {
 			mapTo(S1, a);
 			advisor.ttl.set(S1, HOUR);

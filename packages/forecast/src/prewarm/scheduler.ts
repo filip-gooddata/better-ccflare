@@ -124,6 +124,21 @@ function parseHistory(
 	return {};
 }
 
+/**
+ * The window openings of the current plan, earliest first. Listed whatever
+ * `settings.prewarm` says: with it on a pre-warm request makes the opening,
+ * with it off routing sends the first new demand there from `openAt`.
+ */
+export function plannedOpenings(
+	forecast: PrewarmForecastView | null,
+): PrewarmStatus["planned"] {
+	if (!forecast?.available || !forecast.plan) return [];
+	return Object.entries(forecast.plan.openAt)
+		.filter((e): e is [AccountId, EpochMs] => e[1] !== null)
+		.map(([accountId, openAt]) => ({ accountId, openAt }))
+		.sort((a, b) => a.openAt - b.openAt);
+}
+
 export function createPrewarmScheduler(
 	deps: PrewarmSchedulerDeps,
 ): PrewarmScheduler {
@@ -371,17 +386,9 @@ export function createPrewarmScheduler(
 		},
 		status() {
 			const settings = deps.settings();
-			const forecast = deps.forecast();
-			const planned =
-				settings.prewarm && forecast?.available && forecast.plan
-					? Object.entries(forecast.plan.openAt)
-							.filter((e): e is [AccountId, EpochMs] => e[1] !== null)
-							.map(([accountId, openAt]) => ({ accountId, openAt }))
-							.sort((a, b) => a.openAt - b.openAt)
-					: [];
 			return {
 				enabled: settings.prewarm,
-				planned,
+				planned: plannedOpenings(deps.forecast()),
 				last: records.map((r) => ({ ...r })),
 			};
 		},

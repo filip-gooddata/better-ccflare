@@ -3,9 +3,10 @@ import { runTranscriptBackfill } from "../history/backfill";
 import type { ForecastDb } from "../history/ports";
 import { earliestProxyBucket, syncProxyDemand } from "../history/proxy-demand";
 import { loadReadings } from "../history/readings";
-import type {
-	PrewarmForecastView,
-	PrewarmScheduler,
+import {
+	type PrewarmForecastView,
+	type PrewarmScheduler,
+	plannedOpenings,
 } from "../prewarm/scheduler";
 import type {
 	AccountId,
@@ -300,6 +301,16 @@ export function createForecastService(
 		},
 	};
 
+	const forecastView = (): PrewarmForecastView | null => {
+		try {
+			if (!deps.settings().enabled) return null;
+			const plan = freshPlan(clock.now());
+			return plan ? { available: true, plan } : null;
+		} catch {
+			return null;
+		}
+	};
+
 	const emptyPrewarm = (): PrewarmStatus => {
 		let enabled = false;
 		try {
@@ -307,7 +318,7 @@ export function createForecastService(
 		} catch {
 			// keep false
 		}
-		return { enabled, planned: [], last: [] };
+		return { enabled, planned: plannedOpenings(forecastView()), last: [] };
 	};
 
 	const provider = (): ForecastResponse => {
@@ -352,15 +363,7 @@ export function createForecastService(
 		advisor,
 		provider,
 		limits: () => lastLimits,
-		forecastView() {
-			try {
-				if (!deps.settings().enabled) return null;
-				const plan = freshPlan(clock.now());
-				return plan ? { available: true, plan } : null;
-			} catch {
-				return null;
-			}
-		},
+		forecastView,
 		async idle() {
 			for (;;) {
 				if (running || pendingHandle !== null) {
