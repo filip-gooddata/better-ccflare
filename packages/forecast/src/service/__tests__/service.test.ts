@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { resolveForecastSettings } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
 import { validateForecastResponse } from "../../contract/validate";
@@ -12,7 +13,6 @@ import {
 	FakeStore,
 	limits,
 	plan,
-	settings,
 } from "../../prewarm/__tests__/fakes";
 import {
 	createPrewarmScheduler,
@@ -43,6 +43,24 @@ import {
 } from "../service";
 
 const MIN = 60_000;
+
+/** Resolved defaults with single-field overrides; never a complete settings literal. */
+function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
+	return {
+		...resolveForecastSettings({
+			env: {},
+			file: {},
+			home: "/home/tester",
+			warn: () => {},
+		}),
+		enabled: true,
+		routing: false,
+		prewarm: false,
+		prewarmTest: null,
+		transcriptsDir: null,
+		...over,
+	};
+}
 const T0 = Date.UTC(2026, 10, 12, 6, 0);
 const POLL = 90_000;
 const [A, B] = specFull.accounts as [string, string];
@@ -208,6 +226,8 @@ class FakeTracker implements SessionTrackerLike {
 class FakeScheduler implements PrewarmScheduler {
 	ticks: EpochMs[] = [];
 	stopped = false;
+	onTick: (() => void) | null = null;
+	idleGate: Deferred | null = null;
 	state: PrewarmStatus = {
 		enabled: true,
 		planned: [{ accountId: A, openAt: T0 + 60 * MIN }],
@@ -217,11 +237,14 @@ class FakeScheduler implements PrewarmScheduler {
 	async tick(now: EpochMs) {
 		this.log.push("scheduler.tick");
 		this.ticks.push(now);
+		this.onTick?.();
 	}
 	status() {
 		return this.state;
 	}
-	async idle() {}
+	async idle() {
+		await this.idleGate?.promise;
+	}
 	stop() {
 		this.stopped = true;
 	}
@@ -347,9 +370,19 @@ describe("forecast service: one cycle", () => {
 		expect(first("engine")).toBeLessThan(first("scheduler.tick"));
 		expect(h.log.at(-1)).toBe("scheduler.tick");
 
+		// the new result is kept before the tick reads it
+		const next = harness({ settings: { prewarm: true } });
+		const seen: (boolean | null)[] = [];
+		next.scheduler.onTick = () =>
+			seen.push(next.service.forecastView()?.available ?? null);
+		await next.service.runOnce();
+		expect(seen).toEqual([true]);
+
 		const input = h.engine.inputs[0];
 		expect(input?.now).toBe(T0);
-		expect(input?.historyFrom).toBe(T0 - 56 * 24 * 60 * MIN);
+		expect(input?.historyFrom).toBe(
+			T0 - settings().historyLookbackDays * 24 * 60 * MIN,
+		);
 		expect(input?.pace).toBe(PACE);
 		expect(input?.accounts.map((a) => a.accountId)).toEqual([A, B]);
 		expect(h.tracker.liveCalls).toEqual([[T0, PACE.idleMs]]);
@@ -607,6 +640,20 @@ describe("forecast service: stop", () => {
 		await idle.service.stop();
 		expect(idle.time.pending.length).toBe(0);
 		expect(idle.scheduler.stopped).toBe(true);
+
+		// stop waits for pre-warm runs in flight (scheduler.idle)
+		const gated = harness();
+		await gated.service.runOnce();
+		gated.scheduler.idleGate = new Deferred();
+		let gatedDone = false;
+		const gatedStop = gated.service.stop().then(() => {
+			gatedDone = true;
+		});
+		await flush();
+		expect(gatedDone).toBe(false);
+		gated.scheduler.idleGate.resolve();
+		await gatedStop;
+		expect(gatedDone).toBe(true);
 
 		const h = harness();
 		h.engine.hold = new Deferred();
