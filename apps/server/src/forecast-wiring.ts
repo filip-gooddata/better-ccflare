@@ -38,6 +38,7 @@ import {
 	extractWeeklyWindow,
 	type UsageData,
 } from "@better-ccflare/providers";
+import { getFamilyBlock } from "@better-ccflare/proxy";
 import {
 	type Account,
 	isEligibleForReauthDeadline,
@@ -161,6 +162,26 @@ function fableWindow(data: AnyUsageData, now: EpochMs): LimitState | null {
 }
 
 /**
+ * The Fable input of one account. While upstream has refused Fable on the
+ * account (a family block), the limit reads as used up until the block lifts,
+ * with or without a reading: the block is the newer fact. The account itself
+ * stays open for other models, so `blockedUntil` is left alone.
+ */
+function fableInput(
+	accountId: string,
+	data: AnyUsageData | null,
+	now: EpochMs,
+): LimitState | null {
+	const reading = data ? fableWindow(data, now) : null;
+	const block = getFamilyBlock(accountId, "fable", now);
+	if (!block) return reading;
+	return {
+		usedPct: Math.max(100, reading?.usedPct ?? 0),
+		resetsAt: block.until,
+	};
+}
+
+/**
  * Current limits of every Claude OAuth account from the accounts table and
  * the usage cache. Counted = not paused and no re-authentication pending; an
  * account without a cached reading has both windows closed. `readAt` is
@@ -186,7 +207,7 @@ export async function loadClaudeLimits(
 			weekly: data
 				? limitState(extractWeeklyWindow(data, "anthropic"), now)
 				: CLOSED,
-			fable: data ? fableWindow(data, now) : null,
+			fable: fableInput(account.id, data, now),
 			blockedUntil: cooldown != null && cooldown > now ? cooldown : null,
 			readAt: readAt(account.id) ?? now,
 		};
