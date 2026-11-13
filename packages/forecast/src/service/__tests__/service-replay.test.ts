@@ -15,12 +15,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseOperations } from "@better-ccflare/database";
 import { validateForecastResponse } from "../../contract/validate";
-import { createForecastEngine } from "../../engine/engine";
 import {
 	buildInput,
 	replayFixture,
 } from "../../engine/__tests__/fixtures-engine";
 import { prague } from "../../engine/__tests__/fixtures-sim";
+import { createForecastEngine } from "../../engine/engine";
 import type { ForecastDb, UsageSnapshotDbRow } from "../../history/ports";
 import { FakeRunner, FakeStore } from "../../prewarm/__tests__/fakes";
 import { createPrewarmScheduler } from "../../prewarm/scheduler";
@@ -77,7 +77,9 @@ function fixtureStore(current: { input: ForecastInput }): DemandStore {
 	return {
 		async upsert() {},
 		async loadPooled(from, to) {
-			return current.input.history.filter((b) => b.start >= from && b.start < to);
+			return current.input.history.filter(
+				(b) => b.start >= from && b.start < to,
+			);
 		},
 		async loadByAccount(from, to) {
 			return current.input.accountHistory.filter(

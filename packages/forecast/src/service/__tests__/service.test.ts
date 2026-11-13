@@ -555,7 +555,10 @@ describe("forecast service: fresh and stale", () => {
 		for (const prewarm of [false, true]) {
 			const h = harness({ scheduler: null, settings: { prewarm } });
 			h.engine.result = (i) =>
-				available(i.now, availablePlan(i.now, { [A]: T0 + 30 * MIN, [B]: null }));
+				available(
+					i.now,
+					availablePlan(i.now, { [A]: T0 + 30 * MIN, [B]: null }),
+				);
 			await h.service.runOnce();
 			expect(serve(h).prewarm).toEqual({
 				enabled: prewarm,
