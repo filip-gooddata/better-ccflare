@@ -545,16 +545,11 @@ describe("forecast on: a poll computes and /api/forecast serves it (real engine)
 	}, 60_000);
 
 	it("answers insufficient_history when the sandbox has too little history", async () => {
+		// One recorded day under the default lookback: the days before the
+		// store's earliest bucket are not counted as zero demand.
 		const dbOps = tempDb();
-		const { input, usage } = await seedReplay(dbOps, 28);
-		// Fewer days in reach than the engine's minimum of five recorded days.
-		const h = wire({
-			dbOps,
-			now: input.now,
-			pace: input.pace,
-			usage,
-			settings: { historyLookbackDays: 3 },
-		});
+		const { input, usage } = await seedReplay(dbOps, 1);
+		const h = wire({ dbOps, now: input.now, pace: input.pace, usage });
 		await h.wiring.service?.runOnce();
 		const body = await (
 			await get(
