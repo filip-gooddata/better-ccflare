@@ -64,7 +64,7 @@ export function warmSessions(ctx: EngineContext): LiveSession[] {
 	);
 }
 
-/** Deterministic jump times in (now, simEnd]: resets of windows open now, weekly resets, pre-warm resets. */
+/** Deterministic jump times in (now, simEnd]: resets of windows open now, weekly resets, pre-warm resets, cooldown ends. */
 function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
 	const { now } = ctx;
 	const end = ctx.horizon.simEnd;
@@ -85,6 +85,7 @@ function jumpTimes(ctx: EngineContext, plan: SimPlan): EpochMs[] {
 		const openAt = plan.openAt[index];
 		if (openAt != null && !isOpenNow(ctx, index))
 			add(Math.max(openAt, now) + FIVE_HOUR_MS);
+		if (account.blockedUntil !== null) add(account.blockedUntil);
 	});
 	return [...jumps].sort((a, b) => a - b);
 }
@@ -551,10 +552,12 @@ class DayRun {
 		if (t < b) this.unserved += rate * (b - t);
 	}
 
-	day(): number {
+	/** Pooled 5-hour quota left at t; `before` is the value just before a jump at t. */
+	day(t: EpochMs, before = false): number {
 		let sum = 0;
 		for (let j = 0; j < this.n; j++) {
 			if (this.usedW[j] >= FULL_POINTS) continue;
+			if (before ? this.blocked[j] >= t : this.blocked[j] > t) continue;
 			sum += this.isOpen(j) ? 100 - this.used5[j] : 100;
 		}
 		return sum;
@@ -614,7 +617,7 @@ function runDay(
 		run.sessionAt[p.moveSession] = p.moveTo;
 		run.charge(p.moveTo, p.sessionCost[p.moveSession], now);
 	}
-	trace.day[0] = run.day();
+	trace.day[0] = run.day(now);
 	trace.week[0] = run.week();
 	for (let i = 1; i < len; i++) {
 		const a = times[i - 1];
@@ -639,8 +642,9 @@ function runDay(
 			}
 		}
 		// The first of a jump pair is the value just before the jump.
-		if (!(i + 1 < len && times[i + 1] === b)) run.applyDue(b);
-		trace.day[i] = run.day();
+		const beforeJump = i + 1 < len && times[i + 1] === b;
+		if (!beforeJump) run.applyDue(b);
+		trace.day[i] = run.day(b, beforeJump);
 		trace.week[i] = run.week();
 		trace.unserved[i] = run.unserved;
 	}

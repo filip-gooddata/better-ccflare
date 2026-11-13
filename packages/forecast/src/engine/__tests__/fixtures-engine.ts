@@ -60,6 +60,8 @@ export interface EngineFixture {
 	weeklyReset: { a: EpochMs; b: EpochMs };
 	/** The accounts' 5-hour state now (weekly use comes from the history). */
 	fiveHour: { a: AccountLimits["fiveHour"]; b: AccountLimits["fiveHour"] };
+	/** Refusal cooldowns running now (default none). */
+	blockedUntil?: { a?: EpochMs | null; b?: EpochMs | null };
 	settings?: ForecastSettings;
 	sessions?: LiveSession[];
 	/**
@@ -135,8 +137,22 @@ export function buildInput(f: EngineFixture): ForecastInput {
 
 	const { readings, weeklyUsed } = readingsFor(served, f);
 	const accounts: AccountLimits[] = [
-		account("acct-a", f.fiveHour.a, weeklyUsed.a, f.weeklyReset.a, f.now),
-		account("acct-b", f.fiveHour.b, weeklyUsed.b, f.weeklyReset.b, f.now),
+		account(
+			"acct-a",
+			f.fiveHour.a,
+			weeklyUsed.a,
+			f.weeklyReset.a,
+			f.now,
+			f.blockedUntil?.a,
+		),
+		account(
+			"acct-b",
+			f.fiveHour.b,
+			weeklyUsed.b,
+			f.weeklyReset.b,
+			f.now,
+			f.blockedUntil?.b,
+		),
 	];
 	return {
 		now: f.now,
@@ -162,6 +178,7 @@ function account(
 	weeklyUsed: number,
 	weeklyReset: EpochMs,
 	now: EpochMs,
+	blockedUntil: EpochMs | null = null,
 ): AccountLimits {
 	return {
 		accountId: id,
@@ -170,7 +187,7 @@ function account(
 		fiveHour,
 		weekly: { usedPct: weeklyUsed, resetsAt: weeklyReset },
 		fable: null,
-		blockedUntil: null,
+		blockedUntil,
 		readAt: now,
 	};
 }
@@ -299,6 +316,150 @@ export function replayFixture(
 			a: { usedPct: 4, resetsAt: prague(12, 11) },
 			b: { usedPct: 0, resetsAt: null },
 		},
+		...over,
+	};
+}
+
+// ── the days up to 2026-11-13, 12:06 (flat-at-100 investigation) ─────────
+
+/**
+ * Pooled units per local hour of each recorded day from 2026-10-16 to 2026-11-13, summed from the
+ * demand buckets the flat-at-100 investigation ran on (aggregated numbers only). On 2026-11-13
+ * the record ends at 12:05, so the 12:00 hour holds twelve times the 10.3 units of its one bucket.
+ */
+export const DAYS_TO_2026_11_13: Record<string, number[]> = {
+	"2026-10-16": [
+		0.2, 0.1, 0, 0.4, 0.4, 0.2, 0.3, 0.1, 8, 12.5, 8.7, 5.6, 2.3, 2.5, 5.3,
+		10.6, 0.2, 1, 0.4, 0.3, 0.2, 0.1, 0.2, 0.1,
+	],
+	"2026-10-17": [
+		0.3, 0.4, 0.3, 0.1, 0.1, 0.3, 0, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.2, 0.3,
+		0.2, 0.1, 0.1, 0.1, 0.3, 0.1, 0.2, 0.1, 0.1,
+	],
+	"2026-10-18": [
+		0.1, 0.3, 0.1, 0.1, 0.4, 0.4, 0, 0.1, 0.3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		0, 0, 0, 0,
+	],
+	"2026-10-19": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	],
+	"2026-10-20": [
+		0, 0, 0, 1.3, 0.2, 0.3, 0.3, 0.3, 10.4, 8.3, 6, 8.5, 0, 14.7, 5.1, 8.5, 6.2,
+		0, 0.9, 0.4, 0.3, 0.1, 0.1, 0,
+	],
+	"2026-10-21": [
+		0, 0, 0.4, 0.2, 0.2, 0.1, 0.2, 0.2, 7.7, 7.2, 10.8, 9.1, 5.7, 0, 10.6, 11.7,
+		7.3, 1.4, 0.6, 0.1, 0.5, 0.6, 0.1, 0.4,
+	],
+	"2026-10-22": [
+		0.6, 0.3, 0.3, 0.4, 0.4, 0.4, 0.5, 0.2, 9.1, 15.1, 13.9, 19.2, 0.5, 1.9, 0,
+		16.2, 5.4, 4.6, 0, 0.4, 0.1, 0.2, 0.1, 0.1,
+	],
+	"2026-10-23": [
+		0, 0, 0, 0.2, 0.2, 0.1, 0.1, 0.1, 0.3, 0.1, 0.1, 0.3, 0.1, 0.3, 0, 0.1, 0,
+		0, 0, 0, 0, 0, 0.4, 0,
+	],
+	"2026-10-24": [
+		0.2, 0, 0.1, 0.2, 0.2, 0.2, 0, 0.1, 0, 0, 0.3, 0, 0, 0, 0.1, 0.1, 0, 0, 0.2,
+		0, 0, 0, 0, 0,
+	],
+	"2026-10-25": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	],
+	"2026-10-26": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 3.9, 6.3, 3, 7.4, 5, 8.6, 11.3, 0, 0, 0, 0, 0, 0,
+		0, 0,
+	],
+	"2026-10-27": [
+		0, 0, 0, 0.7, 0.6, 3.4, 1, 0.7, 3.4, 13.4, 9, 2.7, 4.6, 10.5, 7, 5.7, 7.5,
+		5.4, 2.6, 4.6, 0.2, 0, 2.7, 3.7,
+	],
+	"2026-10-28": [
+		0.9, 0.5, 0.7, 0.2, 0.6, 0.1, 0.1, 1.1, 0.4, 0.7, 0.5, 0.4, 0.1, 0.1, 0.1,
+		0.2, 0.1, 0.1, 0.1, 0.1, 6.9, 8.8, 2.9, 0.5,
+	],
+	"2026-10-29": [
+		0.6, 0.6, 0.5, 0.4, 1.1, 0.4, 0.2, 1.9, 0.3, 8.4, 14.4, 7.4, 11.5, 15.4,
+		5.4, 0, 12.1, 14, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3,
+	],
+	"2026-10-30": [
+		0, 0.1, 0.3, 0.3, 0.3, 0.1, 0.2, 0.1, 0.4, 6.1, 12.9, 7.3, 7.1, 7.5, 8.2,
+		4.8, 7.6, 5.4, 2, 0.3, 0, 0, 0, 0,
+	],
+	"2026-10-31": [
+		0, 0, 0, 0, 0.2, 0, 0, 0.2, 0, 0, 0, 0.3, 0, 0, 0, 0, 0.4, 0, 0, 0, 0, 0.3,
+		0, 0,
+	],
+	"2026-11-01": [
+		0, 0.2, 0, 0, 0, 0, 0, 0, 0, 0.2, 0, 0, 0.2, 0, 0, 0, 0.1, 0, 0.2, 0.2, 0,
+		0, 0, 0,
+	],
+	"2026-11-02": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0.1, 0, 1, 0, 3.7, 2.9, 5.1, 5.8, 0.3, 0, 0, 0,
+		0, 0, 0,
+	],
+	"2026-11-03": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 12.7, 18.1, 10.7, 0, 0, 19.2, 14.2, 6.1, 0, 0, 0,
+		0, 0, 0, 0,
+	],
+	"2026-11-04": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 10.1, 9.5, 13.6, 8.5, 9.9, 16.7, 14.1, 12, 7.6,
+		0, 0, 1.1, 0.3, 0, 0,
+	],
+	"2026-11-05": [
+		0.8, 0.2, 0.2, 0.1, 0.3, 0.1, 0.2, 0.2, 0.1, 9.4, 11.3, 5.2, 8.1, 8.6, 5.5,
+		10.7, 8.7, 6.7, 0.1, 0.8, 0.6, 0.5, 0.2, 0,
+	],
+	"2026-11-06": [
+		0.5, 0.2, 0.2, 0.4, 0.1, 0.4, 0.5, 0.3, 0.2, 17.2, 28.5, 21.3, 4.2, 20.3,
+		16.6, 11.8, 7.1, 6.2, 1.7, 2.6, 0, 0, 0.4, 0,
+	],
+	"2026-11-07": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	],
+	"2026-11-08": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	],
+	"2026-11-09": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 4.4, 2.6, 1, 5.5, 0.8, 2, 3.4, 1.9, 0, 0, 0,
+		0, 0, 0,
+	],
+	"2026-11-10": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 18.6, 25, 20.9, 0, 0, 16.7, 24.5, 15.8, 9.6, 0,
+		0, 0, 0, 0, 0,
+	],
+	"2026-11-11": [
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 13.6, 9.1, 9.9, 4.8, 4.2, 10.7, 16.9, 15.8, 13.6,
+		0.2, 0.7, 0.5, 0.6, 0.4, 0.4,
+	],
+	"2026-11-12": [
+		0.2, 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0, 19.7, 15.1, 16.1, 26.3, 33.2,
+		20.8, 0, 31.6, 18.7, 56.6, 0, 0, 63.1, 1.8, 16.1,
+	],
+	"2026-11-13": [
+		20, 41.6, 25, 21.3, 16, 1.5, 0.2, 0.5, 11, 16.7, 17.6, 40.4, 123.6, 0, 0, 0,
+		0, 0, 0, 0, 0, 0, 0, 0,
+	],
+};
+
+/**
+ * 2026-11-13, 12:06:02.785 (flat-at-100 investigation): acct-a's window is at 79 % and resets
+ * at 14:00:00.663, but upstream refused it with a cooldown until 2026-11-15 14:59:59, one
+ * second before its weekly reset; acct-b's window is at 21 % and resets at 17:00:00.011.
+ */
+export function replay1113Fixture(
+	over: Partial<EngineFixture> = {},
+): EngineFixture {
+	return {
+		now: prague(13, 12, 6, 2) + 785,
+		historyDays: 28,
+		hourly: (key) => DAYS_TO_2026_11_13[key] ?? new Array<number>(24).fill(0),
+		weeklyReset: { a: prague(15, 15) + 664, b: prague(17, 3) + 11 },
+		fiveHour: {
+			a: { usedPct: 79, resetsAt: prague(13, 14) + 663 },
+			b: { usedPct: 21, resetsAt: prague(13, 17) + 11 },
+		},
+		blockedUntil: { a: prague(15, 14, 59, 59) },
 		...over,
 	};
 }

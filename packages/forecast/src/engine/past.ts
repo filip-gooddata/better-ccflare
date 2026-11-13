@@ -89,15 +89,21 @@ function limitsOut(
 	return full(fiveHour, t, before) || full(weekly, t, before);
 }
 
-/** Pooled quota left of the counted accounts as last read. */
+/**
+ * Pooled quota left of the counted accounts as last read. Day: an account in a
+ * running refusal cooldown counts 0 (spec section 3).
+ */
 export function pooledLeftNow(
 	accounts: AccountLimits[],
 	quantity: Quantity,
 	now: EpochMs,
 ): number {
 	let sum = 0;
-	for (const a of accounts)
+	for (const a of accounts) {
+		if (quantity === "day" && a.blockedUntil !== null && a.blockedUntil > now)
+			continue;
 		sum += accountLeft(quantity, a.fiveHour, a.weekly, now);
+	}
 	return sum;
 }
 
