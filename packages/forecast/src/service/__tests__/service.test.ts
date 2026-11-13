@@ -192,8 +192,10 @@ class FakeDemandStore extends FakeStore implements DemandStore {
 		this.log.push("store.loadByAccount");
 		return [];
 	}
+	/** Start of the earliest stored bucket; by default older than any lookback. */
+	earliestAt: EpochMs | null = T0 - 400 * 24 * 60 * MIN;
 	async earliest() {
-		return null;
+		return this.earliestAt;
 	}
 }
 
@@ -268,6 +270,7 @@ interface Harness {
 	scheduler: FakeScheduler;
 	settings: { current: ForecastSettings };
 	backfills: string[];
+	store: FakeDemandStore;
 	db: ForecastDb;
 	failSync: { on: boolean };
 }
@@ -306,12 +309,13 @@ function harness(
 	const current = { current: settings(over.settings) };
 	const failSync = { on: false };
 	const db = loggingDb(log, failSync);
+	const store = new FakeDemandStore(log);
 	const { settings: _s, time: _t, ...rest } = over;
 	const service = createForecastService({
 		settings: () => current.current,
 		pace: () => PACE,
 		db,
-		store: new FakeDemandStore(log),
+		store,
 		engine,
 		tracker,
 		loadLimits: async (now) => {
@@ -342,6 +346,7 @@ function harness(
 		scheduler,
 		settings: current,
 		backfills,
+		store,
 		db,
 		failSync,
 	};
@@ -455,6 +460,22 @@ describe("forecast service: one cycle", () => {
 		expect(h.warns.length).toBe(1);
 		expect(h.warns[0]).toContain("sync=db locked");
 		expect(serve(h).available).toBe(true);
+	});
+});
+
+describe("forecast service: history range", () => {
+	it("starts the history at the earliest stored bucket inside the lookback", async () => {
+		const h = harness();
+		h.store.earliestAt = T0 - 2 * 24 * 60 * MIN;
+		await h.service.runOnce();
+		expect(h.engine.inputs[0]?.historyFrom).toBe(T0 - 2 * 24 * 60 * MIN);
+	});
+
+	it("an empty store gives an empty history range", async () => {
+		const h = harness();
+		h.store.earliestAt = null;
+		await h.service.runOnce();
+		expect(h.engine.inputs[0]?.historyFrom).toBe(T0);
 	});
 });
 
