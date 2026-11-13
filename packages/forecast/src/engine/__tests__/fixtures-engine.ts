@@ -378,7 +378,11 @@ export const profileHourly: HourlyShape = (key, isoWeekday) => {
 	return shape.map((v) => (sum > 0 ? (total * v) / sum : 0));
 };
 
-/** 2026-11-12 07:00 with the recorded days of the aggregated profile; account state as the replay. */
+/**
+ * 2026-11-12 07:00 with the recorded days of the aggregated profile. The account snapshot is the
+ * one this fixture had before the replay was rebuilt (acct-a open at 0 %, resets 11:00; acct-b
+ * closed), kept so the profile report stays comparable; it is not the replay's 4 % morning.
+ */
 export function profileFixture(): EngineFixture {
 	return replayFixture({
 		historyDays: 37,

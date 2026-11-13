@@ -46,6 +46,8 @@ describe("Saturday morning", () => {
 		if (!result.available) throw new Error(result.reason);
 		expect(validateForecastResponse(result.response)).toEqual([]);
 		expect(result.response.week).not.toBeNull();
+		// the week block ends at acct-b's weekly reset, Tuesday 03:00 (horizon.ts)
+		expect(result.response.week?.times.at(-1)).toBe(prague(17, 3));
 	});
 
 	test("the weekend pool is drawn: Saturday's demand is far below the following Monday's over the same hours", async () => {
@@ -60,7 +62,7 @@ describe("Saturday morning", () => {
 		expect(saturday).toBeLessThan(0.1 * monday);
 	});
 
-	test("the week block reaches through the following work week; the work start is learned from work days only", async () => {
+	test("the week block reaches through Monday; the work start is learned from work days only", async () => {
 		const ctx = await prepareEngineContext(buildInput(saturdayFixture()), {
 			noise: true,
 		});

@@ -15,7 +15,12 @@ import type {
 } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { EngineContext, SimulationResult } from "../model";
-import { planForecast, scorePlan } from "../planner";
+import {
+	compareScores,
+	openingEarns,
+	planForecast,
+	scorePlan,
+} from "../planner";
 import { buildResponse } from "../response";
 import { onDemandPlan, simulate } from "../simulate";
 import {
@@ -26,11 +31,12 @@ import {
 } from "./fixtures-engine";
 
 const MIN = 60_000;
-// The median simulated day's first 5-hour fills must land within this of the recorded ones
-// (research 17). The recorded day lies on the heavy side of its pool: the heavy line reproduces
-// its 14:55 refusal exactly (BASELINE_STOP), while the median day fills acct-b about 23 minutes
-// later (measured: acct-a 13:25, acct-b 15:18).
-const TRACE_TOLERANCE_MS = 30 * MIN;
+// The median simulated day's first 5-hour fills must land within these of the recorded ones
+// (research 17): a simulated median, not a claim of exact replay. acct-a's median fill is 13:25.
+// The recorded day lies on the heavy side of its pool: the heavy line reproduces acct-b's 14:55
+// refusal exactly (BASELINE_STOP), while the median day fills acct-b at 15:18, 23 minutes later.
+const TRACE_TOLERANCE_A_MS = 15 * MIN;
+const TRACE_TOLERANCE_B_MS = 30 * MIN;
 
 async function contextOf(input: ForecastInput): Promise<EngineContext> {
 	const ctx = await prepareEngineContext(input, { noise: true });
@@ -76,10 +82,10 @@ describe("2026-11-12 replay through compute()", () => {
 		const fullA = medianFirstFull(baseline.result, 0);
 		const fullB = medianFirstFull(baseline.result, 1);
 		expect(Math.abs(fullA - prague(12, 13, 17))).toBeLessThanOrEqual(
-			TRACE_TOLERANCE_MS,
+			TRACE_TOLERANCE_A_MS,
 		);
 		expect(Math.abs(fullB - prague(12, 14, 55))).toBeLessThanOrEqual(
-			TRACE_TOLERANCE_MS,
+			TRACE_TOLERANCE_B_MS,
 		);
 		expect(heavyLow(base)).toBe(0);
 		expect(stops(base)).toEqual([BASELINE_STOP]);
@@ -141,6 +147,11 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(open9.stopMinutes).toBe(0);
 		expect(open9.weekLowPoints).toBeCloseTo(81.97, 1);
 		expect(baseScore.weekLowPoints).toBeCloseTo(84.31, 1);
+		// the opening does not earn its place, and the on-demand plan ranks above it
+		expect(
+			openingEarns(open9, baseScore, ctx.input.settings.openMinGainPoints),
+		).toBe(false);
+		expect(compareScores(baseScore, open9)).toBeLessThan(0);
 	});
 
 	test("the response covers the morning state: acct-a's 11:00 reset is a jump, day ends at midnight", async () => {
