@@ -289,8 +289,9 @@ flowchart TD
 
 A 429 from an Anthropic account can concern one model family's weekly limit (`weekly_scoped`, e.g. Fable) rather than the account. `proxy-operations.ts` logs every upstream 429 as `[ccflare] account=<name> upstream_429 model=<model> headers=<name>=<value>; …` (only `anthropic-ratelimit-*`, `x-ratelimit-*`, `retry-after`, `x-should-retry`; never auth headers, cookies or bodies) and classifies it (`handlers/family-refusal.ts`):
 
-- `anthropic-ratelimit-unified-representative-claim` naming the family's window (e.g. `seven_day_fable`) → **family**; naming `five_hour` or `seven_day` → **account-wide**.
-- Otherwise the usage readings: 5-hour or `weekly_all` at or above 100% → **account-wide**; every `weekly_scoped` row of the requested family at or above 100% with 5-hour and `weekly_all` below 100% → **family**.
+- `anthropic-ratelimit-unified-representative-claim` of `five_hour` or `seven_day`, or a 5-hour or `weekly_all` reading at or above 100% with a future reset → **account-wide** (an exhausted account window outranks a family claim).
+- The claim exactly `seven_day_<family>` for the requested family (e.g. `seven_day_fable`) → **family**. Other claim values are ignored. Whether Anthropic sends this header on such a refusal is not yet confirmed.
+- Otherwise the usage readings: every `weekly_scoped` row of the requested family at or above 100%, with both the 5-hour and `weekly_all` readings present and below 100% → **family**.
 - Anything else (no usage readings, unknown family, family below 100%) → **unclassified**.
 
 Reset times cannot be used: on an account whose weekly Fable and overall weekly limits reset at the same instant, the two are indistinguishable by reset.
@@ -302,12 +303,12 @@ A standing block excludes the account for that family in selection regardless of
 ```mermaid
 flowchart TD
     A["Upstream 429 from an Anthropic account"] --> B["Log upstream_429 with rate-limit headers"]
-    B --> C{"representative-claim header?"}
-    C -->|"family window"| F["Family"]
-    C -->|"five_hour / seven_day"| W["Account-wide"]
-    C -->|"absent or other"| D{"Usage readings"}
-    D -->|"5h or weekly_all >= 100%"| W
-    D -->|"family rows all >= 100%,<br/>5h and weekly_all below"| F
+    B --> C{"claim five_hour / seven_day,<br/>or 5h or weekly_all >= 100%?"}
+    C -->|"yes"| W["Account-wide"]
+    C -->|"no"| E{"claim seven_day_family?"}
+    E -->|"yes"| F["Family"]
+    E -->|"absent or other"| D{"Family readings"}
+    D -->|"family rows all >= 100%,<br/>5h and weekly_all read and below"| F
     D -->|"none / unknown family /<br/>family below 100%"| U["Unclassified"]
     F --> F2["blockFamily until family reset,<br/>log family_block, no cooldown, fail over"]
     W --> W2["Bench account<br/>(cooldown_applied reason=model_fallback_429)"]

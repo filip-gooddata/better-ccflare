@@ -426,9 +426,10 @@ Every upstream 429 from an Anthropic account is logged first:
 
 The line carries only the `anthropic-ratelimit-*`, `x-ratelimit-*`, `retry-after` and `x-should-retry` headers, never authorization headers, cookies or bodies. The refusal is then classified:
 
-1. **Header.** `anthropic-ratelimit-unified-representative-claim` names the limit that refused. A family window (e.g. `seven_day_fable`) makes it a family refusal; `five_hour` or `seven_day` makes it account-wide.
-2. **Usage readings**, when the header names neither. The 5-hour or all-models weekly reading at or above 100% makes it account-wide. Every `weekly_scoped` row of the requested family at or above 100%, with the 5-hour and all-models weekly readings below 100%, makes it a family refusal.
-3. **Unclassified**: anything else, such as no usage readings, a model outside the known families (Fable, Opus, Sonnet, Haiku), or the family below 100%.
+1. **Account readings.** The 5-hour or all-models weekly reading at or above 100% (with a future reset) makes it account-wide, whatever the header says.
+2. **Header.** `anthropic-ratelimit-unified-representative-claim` names the limit that refused. `five_hour` or `seven_day` makes it account-wide; exactly `seven_day_<family>` for the requested family (e.g. `seven_day_fable` on a Fable request) makes it a family refusal. Other values are ignored. Whether Anthropic sends this header on such a refusal is not yet confirmed; the `upstream_429` line will show it.
+3. **Family readings**, when the header settles nothing. Every `weekly_scoped` row of the requested family at or above 100%, with both the 5-hour and all-models weekly readings present and below 100%, makes it a family refusal.
+4. **Unclassified**: anything else, such as no usage readings (they are polled, and dropped after 10 minutes), a model outside the known families (Fable, Opus, Sonnet, Haiku), or the family below 100%.
 
 Reset times cannot separate the cases: on an account whose weekly Fable and all-models weekly limits reset at the same instant they are identical.
 
