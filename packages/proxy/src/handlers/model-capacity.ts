@@ -270,6 +270,104 @@ export function clearFamilyExhaustionForAccount(accountId: string): void {
 	for (const key of negativeCache.keys()) {
 		if (key.startsWith(prefix)) negativeCache.delete(key);
 	}
+	clearFamilyBlocksForAccount(accountId);
+}
+
+// ── Family blocks ───────────────────────────────────────────────────────────
+//
+// Set when upstream refuses a request with a 429 that concerns one model
+// family on one account (its weekly_scoped limit), as opposed to the account
+// as a whole. The block excludes the account for that family until the
+// family's limit resets, whatever the overage signal says, and leaves the
+// account routable for every other family. Unlike the negative cache above it
+// lasts until the named reset, not a fixed TTL. In memory only: after a
+// restart the account's own weekly_scoped telemetry keeps the family out.
+
+/** What told the classifier that the refusal concerned the family. */
+export type FamilyBlockSource = "header" | "usage";
+
+export interface FamilyBlock {
+	accountId: string;
+	family: string;
+	/** Epoch ms when the family's limit resets and the block lifts. */
+	until: number;
+	source: FamilyBlockSource;
+	/** Epoch ms when the block was recorded. */
+	setAt: number;
+}
+
+const familyBlocks = new Map<string, FamilyBlock>();
+
+/**
+ * Blocks (accountId, family) until `untilMs`. A reset that is not in the
+ * future records nothing and returns null. When a block already stands, the
+ * later of the two resets is kept.
+ */
+export function blockFamily(
+	accountId: string,
+	family: string,
+	untilMs: number,
+	source: FamilyBlockSource,
+	now: number = Date.now(),
+): FamilyBlock | null {
+	if (!Number.isFinite(untilMs) || untilMs <= now) return null;
+	const key = negativeCacheKey(accountId, family);
+	const existing = getFamilyBlock(accountId, family, now);
+	if (existing && existing.until >= untilMs) return existing;
+	const block: FamilyBlock = {
+		accountId,
+		family,
+		until: untilMs,
+		source,
+		setAt: now,
+	};
+	familyBlocks.set(key, block);
+	return block;
+}
+
+/** The standing block for (accountId, family), or null. Evicts an expired one. */
+export function getFamilyBlock(
+	accountId: string,
+	family: string,
+	now: number = Date.now(),
+): FamilyBlock | null {
+	const key = negativeCacheKey(accountId, family);
+	const block = familyBlocks.get(key);
+	if (!block) return null;
+	if (block.until <= now) {
+		familyBlocks.delete(key);
+		return null;
+	}
+	return block;
+}
+
+/** Every standing block of one account. Evicts expired ones. */
+export function getFamilyBlocksForAccount(
+	accountId: string,
+	now: number = Date.now(),
+): FamilyBlock[] {
+	const blocks: FamilyBlock[] = [];
+	for (const [key, block] of familyBlocks) {
+		if (block.accountId !== accountId) continue;
+		if (block.until <= now) {
+			familyBlocks.delete(key);
+			continue;
+		}
+		blocks.push(block);
+	}
+	return blocks;
+}
+
+/** Drops every block of one account (account removed or reset by hand). */
+export function clearFamilyBlocksForAccount(accountId: string): void {
+	for (const [key, block] of familyBlocks) {
+		if (block.accountId === accountId) familyBlocks.delete(key);
+	}
+}
+
+/** Test-only: reset all family blocks between test cases. */
+export function clearFamilyBlocks(): void {
+	familyBlocks.clear();
 }
 
 // ── model_family_exhausted response ─────────────────────────────────────────
