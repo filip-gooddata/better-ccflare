@@ -98,9 +98,6 @@ export interface ForecastWiring {
 	stop(): Promise<void>;
 }
 
-/** Longest shutdown waits for a pre-warm run in flight before the database closes. */
-export const FORECAST_SHUTDOWN_PREWARM_WAIT_MS = 5_000;
-
 const unrefTimer: ForecastTimer = {
 	set(fn, ms) {
 		const handle = setTimeout(fn, ms);
@@ -271,16 +268,8 @@ export function createForecastWiring(
 		onUsageSnapshot() {
 			created.notifyUsagePoll();
 		},
-		async stop() {
-			await created.stop();
-			let handle: unknown;
-			await Promise.race([
-				scheduler.idle(),
-				new Promise<void>((resolve) => {
-					handle = unrefTimer.set(resolve, FORECAST_SHUTDOWN_PREWARM_WAIT_MS);
-				}),
-			]);
-			unrefTimer.clear(handle);
-		},
+		// The service also waits for a pre-warm run in flight (bounded by the
+		// runner's timeout), so the database can close afterwards.
+		stop: () => created.stop(),
 	};
 }
