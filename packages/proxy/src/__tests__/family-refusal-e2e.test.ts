@@ -750,3 +750,73 @@ describe("scenario 6: a refusal the evidence cannot classify", () => {
 		}
 	});
 });
+
+describe("scenario 7: a full family known from usage, before any refusal", () => {
+	// The second measured case (2026-11-13T12:07:24.338Z): the Fable session
+	// mapped to gooddata-ai fails over while gooddata reads Fable 100 % with
+	// overage reported as enabled and spent, and no family block exists.
+	it("never sends the Fable request to gooddata, replays the 429 of gooddata-ai, still serves Opus on gooddata", async () => {
+		const at = Date.parse("2026-11-13T12:07:24.338Z");
+		const aiOutUntil = Date.parse("2026-11-13T16:00:00.229Z");
+		setSystemTime(new Date(at - 10 * 60_000));
+		const gdReading = (): Reading => ({
+			fiveHour: [81, FIVE_HOUR_RESET_GD + 4 * HOUR],
+			weeklyAll: [92, WEEKLY_ALL_RESET_GD],
+			fable: [100, Date.parse("2026-11-15T14:00:00Z")],
+			spend: { enabled: true, percent: 205 },
+		});
+		usageCache.set(GD, usage(gdReading()));
+		usageCache.set(
+			AI,
+			usage({ ...measuredGooddataAi(), fiveHour: [60, aiOutUntil] }),
+		);
+		const aiRefusal = refusal(AI, aiOutUntil, "five_hour");
+		let aiOut = false;
+		const calls = installUpstream(({ account, model }) =>
+			account === AI && aiOut ? toResponse(aiRefusal) : ok200(account, model),
+		);
+		const { ctx, row, writes } = makeCtx(
+			[makeAccount(GD), makeAccount(AI)],
+			paceStrategy(),
+			{ capacityRouting: true },
+		);
+		const session = "user_abc_account_x_session_634d3f22";
+
+		// The session is mapped to gooddata-ai while it is available. gooddata
+		// is held out for this one request so the mapping does not depend on
+		// the capacity rule under test.
+		row(GD).rate_limited_until = at - 5 * 60_000;
+		await send(ctx, makeRequest(FABLE, { session }));
+		expect(calls).toEqual([{ account: AI, model: FABLE }]);
+		row(GD).rate_limited_until = null;
+		const gdWritesBefore = writes.filter((w) => w.id === GD).length;
+
+		// gooddata-ai goes out on its five-hour window.
+		setSystemTime(new Date(at));
+		aiOut = true;
+		row(AI).rate_limited_until = aiOutUntil;
+		usageCache.set(
+			AI,
+			usage({ ...measuredGooddataAi(), fiveHour: [100, aiOutUntil] }),
+		);
+		usageCache.set(GD, usage(gdReading()));
+		logs = [];
+		const before = calls.length;
+		const response = await send(ctx, makeRequest(FABLE, { session }));
+		expect(calls.slice(before).filter((c) => c.account === GD)).toEqual([]);
+		expect(calls.slice(before)).toEqual([{ account: AI, model: FABLE }]);
+		await expectUpstreamRefusal(response, aiRefusal);
+		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
+		expect(row(GD).rate_limited_until).toBeNull();
+		expect(writes.filter((w) => w.id === GD)).toHaveLength(gdWritesBefore);
+
+		const opusBefore = calls.length;
+		const opus = (await send(
+			ctx,
+			makeRequest(OPUS, { session: "user_abc_account_x_session_opus-1" }),
+		)) as Response;
+		expect(opus.status).toBe(200);
+		expect(calls.slice(opusBefore)).toEqual([{ account: GD, model: OPUS }]);
+		expect(row(GD).rate_limited_until).toBeNull();
+	});
+});
