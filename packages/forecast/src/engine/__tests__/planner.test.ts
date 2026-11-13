@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { SimulationResult } from "../model";
 import {
 	compareScores,
 	decidingReason,
@@ -12,7 +13,6 @@ import {
 	planForecast,
 	scorePlan,
 } from "../planner";
-import type { SimulationResult } from "../model";
 import { onDemandPlan, type SimPlan, simulate } from "../simulate";
 import {
 	account,
