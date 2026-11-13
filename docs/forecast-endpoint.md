@@ -273,8 +273,9 @@ for the record.
   as an account out on its weekly limit already did. Before, the unused 5-hour quota of such an account held the
   line above 0 while no work could be served, so no stop and no shortfall were reported (seen live on 2026-11-13:
   the line stood at 100 for three hours of a stop). The rule applies to the projected `day` lines and to the
-  current point; `day.past` follows it from the moment the proxy knows the cooldown began. `stopNow` already
-  counted such an account as out (section 5). `contractVersion` stays 1.
+  current point. `day.past` is drawn from the readings and does not carry a cooldown before the current point;
+  it always ends at the current point, so a running cooldown shows as a step down at `computedAt`. `stopNow`
+  already counted such an account as out (section 5). `contractVersion` stays 1.
 
 - Revision 4, 2026-11-13: wording only; no field added, removed, renamed or retyped. Section 4 and the `prewarm`
   row of section 6 say what a planned opening is when the pre-warm is off (the default): the proxy routes the
