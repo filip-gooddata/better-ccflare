@@ -122,9 +122,6 @@ export function classifyRefusalScope({
 		}
 	}
 
-	if (accountRows.length === 0) {
-		return { scope: "unclassified", detail: "no usage readings" };
-	}
 	// Usage alone may call a refusal family-scoped only when both account-wide
 	// windows were read: a missing weekly_all reading could be the binding one.
 	const missing = [...ACCOUNT_WINDOWS].filter(
@@ -132,6 +129,9 @@ export function classifyRefusalScope({
 			!accountRows.some((window) => window.window === name) &&
 			!hasRoomWithoutReset(usageData, name),
 	);
+	if (missing.length === ACCOUNT_WINDOWS.size) {
+		return { scope: "unclassified", detail: "no usage readings" };
+	}
 	if (missing.length > 0) {
 		return {
 			scope: "unclassified",

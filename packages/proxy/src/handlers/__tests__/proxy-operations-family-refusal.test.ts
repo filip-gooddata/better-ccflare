@@ -322,6 +322,30 @@ describe("proxyWithAccount — family-scoped 429", () => {
 		}
 	});
 
+	it("blocks the family when both account windows are fresh with no reset", async () => {
+		globalThis.fetch = mock(async () => refusal());
+		const ctx = makeContext();
+		const account = makeAccount();
+		const readings = usage();
+		readings.limits[0].resets_at = null as never;
+		readings.limits[1].resets_at = null as never;
+		readings.limits[0].percent = 0;
+		readings.limits[1].percent = 0;
+		usageCache.set(account.id, readings as never);
+
+		const result = await run(ctx, account);
+
+		expect(result).toBeNull();
+		expect(account.rate_limited_until).toBeNull();
+		const markMock = ctx.dbOps.markAccountRateLimited as ReturnType<
+			typeof mock
+		>;
+		expect(markMock.mock.calls.length).toBe(0);
+		expect(getFamilyBlock(account.id, "fable")?.until).toBe(
+			Date.parse(readings.limits[2].resets_at as string),
+		);
+	});
+
 	it("logs one upstream_429 line per 429 while cycling fallback models", async () => {
 		globalThis.fetch = mock(async () => refusal());
 		const ctx = makeContext();

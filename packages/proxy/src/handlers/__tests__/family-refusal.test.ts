@@ -266,6 +266,25 @@ describe("classifyRefusalScope — evidence guards", () => {
 		} as never;
 		expect(classify({ usageData: data }).scope).toBe("family");
 	});
+
+	it("counts both account windows fresh with no reset as room", () => {
+		const data = {
+			limits: [
+				{ kind: "session", percent: 0, resets_at: null },
+				{ kind: "weekly_all", percent: 0, resets_at: null },
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: FABLE_RESET,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never;
+		expect(classify({ usageData: data })).toMatchObject({
+			scope: "family",
+			until: Date.parse(FABLE_RESET),
+		});
+	});
 });
 
 describe("rateLimitHeaderSummary", () => {
