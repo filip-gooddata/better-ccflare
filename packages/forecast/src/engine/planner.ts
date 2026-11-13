@@ -37,25 +37,28 @@ const OPENING_BEAM = 3;
 const MAX_OPENING_COMBOS = 64;
 /** Most live sessions tried as move candidates (largest recent use first): keeps the search bounded. */
 const MAX_MOVE_SESSIONS = 3;
-/** Placement tiers: accounts whose best plans differ by at most this many points on items 1, 2 and 4 share a tier. */
+/** Placement tiers: accounts whose best plans differ by at most this many points on items 1, 3 and 4 share a tier. */
 const TIER_TOLERANCE_POINTS = 0.5;
-/** Placement tiers: and by at most this many minutes of heavy stops (score item 3). */
+/** Placement tiers: and by at most this many minutes of heavy stops (score item 2). */
 const TIER_TOLERANCE_STOP_MIN = 5;
 /**
- * Design amendment A2(b): an opening that leaves score items 1 and 2 equal within the tier tolerance
- * is still chosen when it cuts the heavy stop minutes (item 3) by at least one 5-minute simulation step.
+ * Design amendment 2, B3(b): an opening that leaves score item 1 equal within the tier tolerance is
+ * still chosen when it cuts the heavy stop minutes (item 2) by at least one 5-minute simulation step.
  */
 export const OPEN_MIN_STOP_GAIN_MIN = 5;
 /** Gains below this many points are not named in a placement reason. */
 const REASON_MIN_GAIN_POINTS = 0.05;
 
-/** Leximin score of one plan; shares are of the pool (100 × counted accounts). */
+/**
+ * Score of one plan, compared in the order of design amendment 2 (B2): item1, stopMinutes, item2,
+ * typicalShare. Shares are of the pool (100 × counted accounts).
+ */
 export interface PlanScore {
 	/** Item 1: the smaller of the heavy 5-hour (next 24 h) and heavy weekly (week horizon) low-point shares. */
 	item1: number;
-	/** Item 2: the other one. */
+	/** Item 3: the other low-point share (the field keeps its old name). */
 	item2: number;
-	/** Item 3: minutes of heavy stops in which demand goes unserved. */
+	/** Item 2: minutes of heavy stops in which demand goes unserved. */
 	stopMinutes: number;
 	/** Item 4: the smaller low-point share on the typical lines. */
 	typicalShare: number;
@@ -113,7 +116,7 @@ function heavyRunUnserved(
 	return quantileSorted(sums as unknown as number[], HEAVY_LEVEL / 100);
 }
 
-/** Leximin items 1 to 4 of design 4.7 for one simulated plan. */
+/** Score items 1 to 4 (design 4.7, order of amendment 2 B2) for one simulated plan. */
 export function scorePlan(
 	ctx: EngineContext,
 	result: SimulationResult,
@@ -175,12 +178,15 @@ export function scorePlan(
 	};
 }
 
-/** Leximin order: negative when `a` is the better plan (sorts first), positive when `b` is. */
+/**
+ * Score order (amendment 2, B2): negative when `a` is the better plan (sorts first), positive when `b`
+ * is. Item 1 higher, then fewer heavy stop minutes, then item 3 (`item2`) higher, then the typical share.
+ */
 export function compareScores(a: PlanScore, b: PlanScore): number {
 	if (Math.abs(a.item1 - b.item1) > SCORE_EPS) return b.item1 - a.item1;
-	if (Math.abs(a.item2 - b.item2) > SCORE_EPS) return b.item2 - a.item2;
 	if (Math.abs(a.stopMinutes - b.stopMinutes) > SCORE_EPS)
 		return a.stopMinutes - b.stopMinutes;
+	if (Math.abs(a.item2 - b.item2) > SCORE_EPS) return b.item2 - a.item2;
 	if (Math.abs(a.typicalShare - b.typicalShare) > SCORE_EPS)
 		return b.typicalShare - a.typicalShare;
 	return 0;
@@ -202,10 +208,10 @@ function item1GainPoints(next: PlanScore, base: PlanScore): number {
 }
 
 /**
- * The opening rule (design 4.7, amendment A2): a plan with openings ahead of need, `next`, earns them
- * over the same plan without them, `base`, when (a) score item 1 rises by at least `openMinGainPoints`,
- * or (b) items 1 and 2 are equal within the tier tolerance and the heavy stop minutes fall by at least
- * OPEN_MIN_STOP_GAIN_MIN.
+ * The opening rule (amendment 2, B3): a plan with openings ahead of need, `next`, earns them over the
+ * same plan without them, `base`, when (a) score item 1 rises by at least `openMinGainPoints`, or
+ * (b) item 1 is equal within the tier tolerance and the heavy stop minutes fall by at least
+ * OPEN_MIN_STOP_GAIN_MIN. Items 3 and 4 never earn an opening.
  */
 export function openingEarns(
 	next: PlanScore,
@@ -216,12 +222,34 @@ export function openingEarns(
 	const tol = TIER_TOLERANCE_POINTS / Math.max(1, next.poolPoints);
 	return (
 		Math.abs(next.item1 - base.item1) <= tol &&
-		Math.abs(next.item2 - base.item2) <= tol &&
 		stopGainMinutes(next, base) >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS
 	);
 }
 
-/** Fall of score item 3 (heavy stop minutes) from `base` to `next`. */
+/**
+ * Reason token (amendment 2, B4) naming the first score item, in compareScores order, on which `top`
+ * differs from `next`, and its gain: `low-point+<points>`, `stop-shorter+<minutes>min`,
+ * `weekly-low+<points>` or `five-hour-low+<points>` (item 3), `typical-low+<points>`. Null when the
+ * scores are equal. `top` is expected to sort before `next`.
+ */
+export function decidingReason(top: PlanScore, next: PlanScore): string | null {
+	const pool = top.poolPoints;
+	const points = (gain: number) => (gain * pool).toFixed(1);
+	if (Math.abs(top.item1 - next.item1) > SCORE_EPS)
+		return `low-point+${points(top.item1 - next.item1)}`;
+	if (Math.abs(top.stopMinutes - next.stopMinutes) > SCORE_EPS)
+		return `stop-shorter+${Math.round(stopGainMinutes(top, next))}min`;
+	if (Math.abs(top.item2 - next.item2) > SCORE_EPS) {
+		const name =
+			top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
+		return `${name}+${points(top.item2 - next.item2)}`;
+	}
+	if (Math.abs(top.typicalShare - next.typicalShare) > SCORE_EPS)
+		return `typical-low+${points(top.typicalShare - next.typicalShare)}`;
+	return null;
+}
+
+/** Fall of score item 2 (heavy stop minutes) from `base` to `next`. */
 function stopGainMinutes(next: PlanScore, base: PlanScore): number {
 	return base.stopMinutes - next.stopMinutes;
 }
@@ -466,7 +494,9 @@ function placementOf(
 	else if (gain >= REASON_MIN_GAIN_POINTS)
 		reason = `low-point+${gain.toFixed(1)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
-	else reason = "lexi-order";
+	else
+		reason =
+			decidingReason(top, preferred[tiers[1][0]].score) ?? "no-preference";
 	return {
 		tiers: tiers.map((tier) => tier.map((j) => ctx.accounts[j].accountId)),
 		rule: opens ? "forecast-open" : "forecast-lookahead",
