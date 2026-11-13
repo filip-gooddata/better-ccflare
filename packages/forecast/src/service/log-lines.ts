@@ -1,9 +1,15 @@
 /**
- * The service's two summary log lines (design amendment 3, C2): the end of the transcript
- * backfill, and why there is no forecast. Both are built only from numbers, dates, fixed
- * words and account ids, never from text a transcript or a path could have supplied.
+ * The service's summary log lines: the end of the transcript backfill and why there is no
+ * forecast (design amendment 3, C2), and what an available forecast was computed from
+ * (amendment 4, D2). All are built only from numbers, dates, fixed words and account ids,
+ * never from text a transcript or a path could have supplied.
  */
-import type { EpochMs, ForecastResult, UnavailableDetail } from "../types";
+import type {
+	EpochMs,
+	ForecastInputsDetail,
+	ForecastResult,
+	UnavailableDetail,
+} from "../types";
 
 const HOUR_MS = 3_600_000;
 const BACKFILL_STATUSES = new Set(["done", "already_done", "no_dir"]);
@@ -76,6 +82,107 @@ function describe(result: Extract<ForecastResult, { available: false }>): {
 	);
 	const line = `${head} rule=calibration ${parts.join("; ")}`;
 	return { line, key: line };
+}
+
+/** At most one forecast-inputs line per this span (design amendment 4, D2). */
+export const INPUTS_MIN_SPACING_MS = 10 * 60_000;
+const ACCOUNT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const POOLS = new Set(["workday", "monday", "weekend", "weekdays"]);
+const LIMITS = new Set(["five_hour", "seven_day", "seven_day_fable"]);
+const SOURCES = new Set(["own", "borrowed", "none"]);
+
+function fixed(v: unknown, digits: number): string {
+	return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "?";
+}
+
+function num(v: unknown): string {
+	return typeof v === "number" && Number.isFinite(v) ? String(v) : "?";
+}
+
+function word(v: unknown, allowed: Set<string>): string {
+	return typeof v === "string" && allowed.has(v) ? v : "?";
+}
+
+function accountId(v: unknown): string {
+	return typeof v === "string" && ACCOUNT_ID.test(v) ? v : "?";
+}
+
+function clock(minute: unknown): string {
+	if (typeof minute !== "number" || !Number.isInteger(minute)) return "none";
+	if (minute < 0 || minute >= 1440) return "none";
+	const hh = String(Math.floor(minute / 60)).padStart(2, "0");
+	const mm = String(minute % 60).padStart(2, "0");
+	return `${hh}:${mm}`;
+}
+
+function orNone(v: number | null, digits: number): string {
+	return v === null ? "none" : fixed(v, digits);
+}
+
+/**
+ * One INFO line with what an available forecast was computed from: the day factor, the
+ * recent rate, today's pool, the learned work start and every k. Numbers, fixed words and
+ * account ids only.
+ */
+export function inputsLine(d: ForecastInputsDetail): string {
+	const f = d.dayFactor;
+	const limits = d.limits.map(
+		(l) =>
+			`${accountId(l.accountId)}/${word(l.limit, LIMITS)}=${l.k === null ? "none" : fixed(l.k, 4)} ${word(l.source, SOURCES)} instances=${num(l.instances)} points=${num(l.points)}`,
+	);
+	return [
+		"forecast inputs",
+		`dayFactor a=${fixed(f.a, 3)}`,
+		`clamped=${fixed(f.clamped, 3)}`,
+		`w=${fixed(f.weight, 4)}`,
+		`raw=${fixed(f.raw, 3)}`,
+		`Y=${fixed(f.y, 2)}`,
+		`M=${fixed(f.m, 2)}`,
+		`c=${fixed(f.c, 2)}`,
+		`recentRate=${fixed(d.recentRatePerHour, 2)}/h`,
+		`pool=${word(d.pool.name, POOLS)}:${num(d.pool.days)}`,
+		`median=${orNone(d.pool.medianUnits, 1)}`,
+		`p90=${orNone(d.pool.p90Units, 1)}`,
+		`workStart=${clock(d.workStartMinute)}`,
+		`k: ${limits.join("; ")}`,
+	].join(" ");
+}
+
+/** What a new line must differ in: a rounded to 0.1 and each k rounded to 0.05. */
+function inputsKey(d: ForecastInputsDetail): string {
+	const a = Number.isFinite(d.dayFactor.a)
+		? String(Math.round(d.dayFactor.a * 10))
+		: "?";
+	const ks = d.limits.map(
+		(l) =>
+			`${l.accountId}/${l.limit}=${l.k === null || !Number.isFinite(l.k) ? "none" : Math.round(l.k * 20)}`,
+	);
+	return [a, ...ks].join(" ");
+}
+
+/**
+ * Logs the forecast's inputs at the first available computation, then when a (to 0.1) or a k
+ * (to 0.05) differs from the last line written, at most once per INPUTS_MIN_SPACING_MS: a
+ * change inside the span is written by the first computation after it, with the state then.
+ */
+export function createInputsLog(log: (msg: string) => void): {
+	record(result: ForecastResult, now: EpochMs): void;
+} {
+	let lastKey: string | null = null;
+	let lastAt: EpochMs = 0;
+	return {
+		record(result, now) {
+			if (!result.available || !result.inputs) return;
+			const key = inputsKey(result.inputs);
+			if (lastKey !== null) {
+				if (key === lastKey) return;
+				if (now - lastAt < INPUTS_MIN_SPACING_MS) return;
+			}
+			lastKey = key;
+			lastAt = now;
+			log(inputsLine(result.inputs));
+		},
+	};
 }
 
 /**

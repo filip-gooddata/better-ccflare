@@ -9,6 +9,7 @@ import type {
 	DayFactorDetail,
 	EpochMs,
 	ForecastInput,
+	ForecastInputsDetail,
 } from "../types";
 
 export type DayType = "workday" | "monday" | "weekend";
@@ -116,6 +117,8 @@ export interface EngineContext {
 	calibration: Calibration;
 	scenarios: Scenarios;
 	workStartMinute: number | null;
+	/** What the forecast was computed from, for the service's log (amendment 4, D2). */
+	inputs?: ForecastInputsDetail;
 }
 
 /**

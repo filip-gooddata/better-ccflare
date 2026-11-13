@@ -13,9 +13,12 @@ import type {
 	ForecastEngine,
 	ForecastInput,
 	ForecastResult,
+	InputsLimitDetail,
+	LimitWindow,
 	UnavailableDetail,
 	UnavailableReason,
 } from "../types";
+import { BUCKET_MS } from "../types";
 import {
 	calibrateWithEvidence,
 	type LimitEvidence,
@@ -30,11 +33,19 @@ import {
 	workStartMinute,
 } from "./days";
 import { computeHorizon } from "./horizon";
-import type { DayTable, EngineContext, NoiseMode, NoiseOptions } from "./model";
+import type {
+	DayTable,
+	EngineContext,
+	NoiseMode,
+	NoiseOptions,
+	RecordedDay,
+} from "./model";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
+
+const HOUR_MS = 3_600_000;
 
 /**
  * Kernel noise of the smoothed bootstrap: `noiseMode` wins; else `noise` true or absent is the
@@ -92,6 +103,12 @@ async function prepare(
 
 	const scenarios = await buildScenarios(input, table, horizon, options);
 	await yieldToEventLoop();
+	const workStart = workStartMinute(
+		table,
+		timeZone,
+		input.settings.workStartSharePct,
+	);
+	const pool = poolFor(table, table.today.type);
 	return {
 		input,
 		now: input.now,
@@ -101,12 +118,78 @@ async function prepare(
 		table,
 		calibration,
 		scenarios,
-		workStartMinute: workStartMinute(
-			table,
-			timeZone,
-			input.settings.workStartSharePct,
-		),
+		workStartMinute: workStart,
+		inputs: {
+			dayFactor: scenarios.diagnostics.day,
+			recentRatePerHour:
+				(scenarios.diagnostics.recentRate * HOUR_MS) / BUCKET_MS,
+			pool: {
+				name: poolName(table),
+				days: pool.length,
+				medianUnits: weightedQuantile(pool, 0.5),
+				p90Units: weightedQuantile(pool, 0.9),
+			},
+			workStartMinute: workStart,
+			limits: inputLimits(counted, calibration, evidence),
+		},
 	};
+}
+
+const LIMIT_KEYS: Record<LimitWindow, keyof Calibration> = {
+	five_hour: "fiveHour",
+	seven_day: "weekly",
+	seven_day_fable: "fable",
+};
+
+/** Every counted account's five-hour, weekly and Fable k, its source and its evidence (amendment 4, D2). */
+function inputLimits(
+	counted: AccountLimits[],
+	calibration: Calibration,
+	evidence: LimitEvidence[],
+): InputsLimitDetail[] {
+	const limits: InputsLimitDetail[] = [];
+	for (const a of counted) {
+		for (const limit of Object.keys(LIMIT_KEYS) as LimitWindow[]) {
+			const e = evidence.find(
+				(x) => x.accountId === a.accountId && x.window === limit,
+			);
+			const k = calibration[LIMIT_KEYS[limit]][a.accountId];
+			const has = typeof k === "number" && Number.isFinite(k);
+			limits.push({
+				accountId: a.accountId,
+				limit,
+				k: has ? k : null,
+				source: e && e.ownK !== null ? "own" : has ? "borrowed" : "none",
+				instances: e?.instances ?? 0,
+				points: e?.points ?? 0,
+			});
+		}
+	}
+	return limits;
+}
+
+/** Recency-weighted quantile of the pool's daily units: the smallest total whose cumulative weight reaches q. */
+function weightedQuantile(pool: RecordedDay[], q: number): number | null {
+	const days = pool
+		.filter((d) => d.weight > 0)
+		.sort((x, y) => x.total - y.total);
+	const sum = days.reduce((acc, d) => acc + d.weight, 0);
+	if (!(sum > 0)) return null;
+	let acc = 0;
+	for (const d of days) {
+		acc += d.weight;
+		if (acc >= q * sum * (1 - 1e-12)) return d.total;
+	}
+	return days[days.length - 1]?.total ?? null;
+}
+
+/** Today's pool: its own day type, or "weekdays" when monday and workday pool together. */
+function poolName(
+	table: DayTable,
+): "workday" | "monday" | "weekend" | "weekdays" {
+	const type = table.today.type;
+	const own = table.days.filter((d) => d.type === type).length;
+	return own >= MIN_POOL_DAYS || type === "weekend" ? type : "weekdays";
 }
 
 async function computeForecast(
@@ -121,17 +204,18 @@ async function computeForecast(
 	const response = buildResponse(ctx, result);
 	checkBlock(response.day);
 	checkBlock(response.week);
-	return { available: true, response, plan };
+	return ctx.inputs
+		? { available: true, response, plan, inputs: ctx.inputs }
+		: { available: true, response, plan };
 }
 
 function historyDetail(table: DayTable): UnavailableDetail {
 	const type = table.today.type;
-	const own = table.days.filter((d) => d.type === type).length;
 	return {
 		rule: "history",
 		recordedDays: table.days.length,
 		minRecordedDays: MIN_RECORDED_DAYS,
-		pool: own >= MIN_POOL_DAYS || type === "weekend" ? type : "weekdays",
+		pool: poolName(table),
 		poolDays: poolFor(table, type).length,
 		minPoolDays: MIN_POOL_DAYS,
 	};

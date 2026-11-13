@@ -22,7 +22,11 @@ import type {
 	PrewarmStatus,
 	SessionTrackerLike,
 } from "../types";
-import { backfillLine, createAvailabilityLog } from "./log-lines";
+import {
+	backfillLine,
+	createAvailabilityLog,
+	createInputsLog,
+} from "./log-lines";
 
 /** A kept result older than this many usage poll intervals is stale. */
 export const FORECAST_STALE_POLLS = 3;
@@ -119,6 +123,7 @@ export function createForecastService(
 				timeZone: deps.pace().timeZone,
 			}));
 	const availability = createAvailabilityLog((msg) => logger.info(msg));
+	const inputsLog = createInputsLog((msg) => logger.info(msg));
 
 	const startBackfill = () => {
 		if (backfillStarted) return;
@@ -202,6 +207,7 @@ export function createForecastService(
 			kept = { result, computedAt: now };
 			consumedMoves = new Set();
 			availability.record(result, now);
+			inputsLog.record(result, now);
 		} catch (error) {
 			failures.push(`compute=${message(error)}`);
 		}

@@ -300,8 +300,45 @@ export interface DayFactorDetail {
 	c: number;
 }
 
+/** One counted account's limit as the forecast-inputs log line names it. */
+export interface InputsLimitDetail {
+	accountId: AccountId;
+	limit: LimitWindow;
+	/** The k in use (own or borrowed); null without one. */
+	k: number | null;
+	source: "own" | "borrowed" | "none";
+	instances: number;
+	points: number;
+}
+
+/**
+ * What an available forecast was computed from (design amendment 4, D2).
+ * For the service's log only: never part of the response.
+ */
+export interface ForecastInputsDetail {
+	dayFactor: DayFactorDetail;
+	/** Demand over the last hour, units per hour. */
+	recentRatePerHour: number;
+	/** Today's pool: its own day type, or "weekdays" when monday and workday pool together. */
+	pool: {
+		name: "workday" | "monday" | "weekend" | "weekdays";
+		days: number;
+		/** Recency-weighted median and p90 of the pool's daily units; null for an empty pool. */
+		medianUnits: number | null;
+		p90Units: number | null;
+	};
+	workStartMinute: number | null;
+	limits: InputsLimitDetail[];
+}
+
 export type ForecastResult =
-	| { available: true; response: ForecastResponse; plan: Plan }
+	| {
+			available: true;
+			response: ForecastResponse;
+			plan: Plan;
+			/** What the forecast was computed from; the HTTP response never carries it. */
+			inputs?: ForecastInputsDetail;
+	  }
 	| {
 			available: false;
 			reason: UnavailableReason;
