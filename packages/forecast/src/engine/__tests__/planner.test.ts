@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	compareScores,
 	decidingReason,
+	dueRoutingOpening,
 	OPEN_MIN_STOP_GAIN_MIN,
 	openingBeam,
 	openingEarns,
@@ -228,7 +229,7 @@ describe("planForecast: an early opening for a shorter heavy stop (amendment A2)
 describe("planForecast: pre-warm off, a routing-opening whose time has come", () => {
 	// 10:00 of the 2026-11-12 shape: acct-a's window is 60 % used and resets at 11:00, acct-b is closed.
 	// Opening acct-b now through the next new session moves its reset to 15:00, inside the afternoon.
-	function at10() {
+	function at10(b: { blockedUntil?: number; weekUsed?: number } = {}) {
 		const now = prague(12, 10);
 		const weekReset = prague(13, 20);
 		return makeCtx({
@@ -242,7 +243,12 @@ describe("planForecast: pre-warm off, a routing-opening whose time has come", ()
 					weekUsed: 10,
 					weekReset,
 				}),
-				account({ id: "acct-b", weekUsed: 10, weekReset }),
+				account({
+					id: "acct-b",
+					weekUsed: b.weekUsed ?? 10,
+					weekReset,
+					blockedUntil: b.blockedUntil,
+				}),
 			],
 			kW: { "acct-a": 0.05, "acct-b": 0.05 },
 			rate: (m, w) => {
@@ -265,6 +271,29 @@ describe("planForecast: pre-warm off, a routing-opening whose time has come", ()
 		expect(plan.placement?.tiers[0]).toEqual(["acct-b"]);
 		expect(plan.placement?.tiers.flat().sort()).toEqual(["acct-a", "acct-b"]);
 	}, 30_000);
+
+	test("only an account that can take work now is a due routing-opening, and only with pre-warm off", () => {
+		const plan = (ctx: ReturnType<typeof at10>) => ({
+			...onDemandPlan(ctx),
+			openAt: [null, ctx.now],
+		});
+		const free = at10();
+		expect(dueRoutingOpening(free, plan(free))).toBe(1);
+		const later = at10();
+		expect(
+			dueRoutingOpening(later, {
+				...plan(later),
+				openAt: [null, later.now + MIN],
+			}),
+		).toBe(-1);
+		const blocked = at10({ blockedUntil: prague(12, 10, 30) });
+		expect(dueRoutingOpening(blocked, plan(blocked))).toBe(-1);
+		const weeklyOut = at10({ weekUsed: 100 });
+		expect(dueRoutingOpening(weeklyOut, plan(weeklyOut))).toBe(-1);
+		const prewarm = at10();
+		prewarm.input.settings.prewarm = true;
+		expect(dueRoutingOpening(prewarm, plan(prewarm))).toBe(-1);
+	});
 });
 
 describe("score order and opening rule (amendment 2)", () => {

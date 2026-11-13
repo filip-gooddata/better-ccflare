@@ -472,15 +472,16 @@ function tiersOf(scored: { score: PlanScore; j: number }[]): number[][] {
 }
 
 /**
- * Closed account whose planned routing-opening has come (pre-warm off), earliest planned first; -1
- * when none. The next new session carries it out: the advice sends new sessions there until the
- * window is open, and the next computation sees it open (design 4.5).
+ * Closed account that can take work and whose planned routing-opening has come (pre-warm off),
+ * earliest planned first; -1 when none. The next new session carries it out: the advice sends new
+ * sessions there until the window is open, and the next computation sees it open (design 4.5).
  */
-function dueRoutingOpening(ctx: EngineContext, plan: SimPlan): number {
+export function dueRoutingOpening(ctx: EngineContext, plan: SimPlan): number {
 	if (ctx.input.settings.prewarm) return -1;
 	let due = -1;
 	plan.openAt.forEach((at, j) => {
 		if (at == null || at > ctx.now || isOpenNow(ctx, j)) return;
+		if (!canTakeWorkNow(ctx, j)) return;
 		const dueAt = plan.openAt[due];
 		if (due < 0 || (dueAt != null && at < dueAt)) due = j;
 	});
