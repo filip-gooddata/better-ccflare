@@ -333,6 +333,15 @@ describe("score order and opening rule (amendment 2)", () => {
 		).toBe("typical-low+1.2");
 		expect(decidingReason(score({}), score({}))).toBeNull();
 	});
+
+	test("B4: a gain too small for one decimal keeps one significant digit instead of +0.0", () => {
+		expect(decidingReason(score({ item1: 0.4 + 0.004 / 200 }), score({}))).toBe(
+			"low-point+0.004",
+		);
+		expect(
+			decidingReason(score({ typicalShare: 0.5 + 0.03 / 200 }), score({})),
+		).toBe("typical-low+0.03");
+	});
 });
 
 describe("planForecast: quota about to reset", () => {

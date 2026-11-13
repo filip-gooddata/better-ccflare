@@ -234,7 +234,13 @@ export function openingEarns(
  */
 export function decidingReason(top: PlanScore, next: PlanScore): string | null {
 	const pool = top.poolPoints;
-	const points = (gain: number) => (gain * pool).toFixed(1);
+	// One decimal, or one significant digit for a gain that would show as 0.0.
+	const points = (gain: number) => {
+		const value = gain * pool;
+		return Math.abs(value) >= REASON_MIN_GAIN_POINTS
+			? value.toFixed(1)
+			: String(Number(value.toPrecision(1)));
+	};
 	if (Math.abs(top.item1 - next.item1) > SCORE_EPS)
 		return `low-point+${points(top.item1 - next.item1)}`;
 	if (Math.abs(top.stopMinutes - next.stopMinutes) > SCORE_EPS)
