@@ -20,3 +20,25 @@ The code is pure TypeScript with no IO outside the history and service parts; te
 
   The only URLs in the package are Wikipedia and paper links in doc comments under `src/`.
 - **Lockfile:** `bun install` added only the `packages/forecast` workspace entry and `simple-statistics@8.0.0` with that same integrity hash.
+
+## Service
+
+`src/service/` joins the parts at run time. `createForecastService(deps)` keeps the last computation and serves it; nothing is computed on a request.
+
+- **When it computes.** `notifyUsagePoll()` is called from every successful usage snapshot. It waits `FORECAST_POLL_SETTLE_MS` (5 s) for the burst of snapshots to settle, and two computations start at least `FORECAST_MIN_SPACING_MS` (30 s) apart. Only one runs at a time; snapshots during a run queue exactly one follow-up. `runOnce()` computes now, or joins the run in progress.
+- **One cycle.** Sync the proxy's demand buckets (a failure is logged and the cycle goes on). After the first successful sync, when `transcriptsDir` is set, start the transcript backfill once in the background; its failure is logged by error name only. Then load pooled and per-account history, limit readings, current limits (`loadLimits`) and live sessions; run the engine (a throw becomes the `"error"` shape); keep the result; tick the pre-warm scheduler. Failures are logged once per cycle and never reach the caller.
+- **Fresh or stale.** A kept result is fresh for `FORECAST_STALE_POLLS` (3) usage poll intervals. A stale or missing result is served as the `"error"` shape and gives no advice.
+- **Advisor.** `advisor` is the `ForecastAdvisor` for session-pace. Placement and moves come from a fresh plan while `enabled` and `routing` are on (read live per call); a move that was applied is not offered again until the next plan. `cacheTtlMs` reads the session tracker. No method throws.
+- **Provider.** `provider` is the `/api/forecast` provider and never throws. It always adds `prewarm` from the scheduler's status, or empty lists when there is no scheduler.
+- **Pre-warm scheduler.** The service ticks, reads and stops it. The scheduler's `forecast()` and `limits()` read the service (`forecastView()`, `limits()`), so build the scheduler first with lazy getters over a variable the service is assigned to:
+
+  ```ts
+  let service: ForecastService | null = null;
+  const scheduler = createPrewarmScheduler({
+  	...,
+  	forecast: () => service?.forecastView() ?? null,
+  	limits: () => service?.limits() ?? [],
+  });
+  service = createForecastService({ ..., scheduler });
+  ```
+- **Stop.** `stop()` clears the service's timers, stops the scheduler and awaits the running computation; later notifications do nothing. Pass unref'd timers so none keeps the process alive.

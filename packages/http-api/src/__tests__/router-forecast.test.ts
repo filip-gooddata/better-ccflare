@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, it } from "bun:test";
 import "@better-ccflare/core";
-import type { Config } from "@better-ccflare/config";
+import { type Config, resolveForecastSettings } from "@better-ccflare/config";
 import {
 	BunSqlAdapter,
 	type DatabaseOperations,
@@ -9,7 +9,6 @@ import {
 	runMigrations,
 } from "@better-ccflare/database";
 import {
-	DEFAULT_FAN_LEVELS,
 	type ForecastResponse,
 	type ForecastSettings,
 	validateForecastResponse,
@@ -20,24 +19,15 @@ import { AuthService } from "../services/auth-service";
 import type { APIContext } from "../types";
 
 const SETTINGS: ForecastSettings = {
+	...resolveForecastSettings({
+		env: {},
+		file: {},
+		home: "/home/tester",
+		warn: () => {},
+	}),
 	enabled: true,
 	routing: true,
 	prewarm: false,
-	prewarmTest: null,
-	claudePath: null,
-	prewarmModel: "haiku",
-	prewarmMaxPerDay: 4,
-	simulatedDays: 400,
-	timeShiftMin: 30,
-	transcriptsDir: "/home/tester/.claude/projects",
-	fanLevels: [...DEFAULT_FAN_LEVELS],
-	minStopPoints: 1,
-	moveMinGainPoints: 2,
-	openMinGainPoints: 1,
-	historyHalfLifeDays: 14,
-	historyLookbackDays: 56,
-	recentTauMin: 45,
-	sessionTurnoverMin: 60,
 };
 
 const KEPT: ForecastResponse = {
@@ -189,7 +179,7 @@ describe("APIRouter — GET /api/forecast", () => {
 		expect(validateForecastResponse(body)).toEqual([]);
 	});
 
-	it("keeps the last pre-warm diagnostics when the provider later throws", async () => {
+	it("holds no state: a fallback after a good response carries empty pre-warm lists", async () => {
 		const prewarm = {
 			enabled: true,
 			planned: [{ accountId: "acct-a", openAt: 1794490000000 }],
@@ -202,12 +192,12 @@ describe("APIRouter — GET /api/forecast", () => {
 				return { ...KEPT, prewarm };
 			},
 		});
-		await get(router, "/api/forecast");
+		const good = await (await get(router, "/api/forecast")).json();
+		expect(good.prewarm).toEqual(prewarm);
 		fail = true;
 		const body = await (await get(router, "/api/forecast")).json();
 		expect(body.reason).toBe("error");
-		// lists from the last response, enabled from the current setting
-		expect(body.prewarm).toEqual({ ...prewarm, enabled: false });
+		expect(body.prewarm).toEqual({ enabled: false, planned: [], last: [] });
 		expect(validateForecastResponse(body)).toEqual([]);
 	});
 
