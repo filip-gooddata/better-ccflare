@@ -9,6 +9,7 @@
 import type { Dirent } from "node:fs";
 import { open, readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { localDayKey } from "../time";
 import type {
 	DemandStore,
 	EpochMs,
@@ -49,6 +50,8 @@ export interface TranscriptBackfillDeps {
 	/** Start of the earliest proxy-recorded bucket, or null when the proxy has recorded nothing. */
 	earliestProxyBucket: () => Promise<EpochMs | null>;
 	now: () => EpochMs;
+	/** Zone of the local days counted in demandDays (default UTC). */
+	timeZone?: string;
 	log?: TranscriptBackfillLog;
 	/** Longest stretch of synchronous work before yielding to the event loop. */
 	sliceBudgetMs?: number;
@@ -100,6 +103,10 @@ export type BackfillResult =
 			/** Only buckets strictly before this bucket start were stored. */
 			cutover: EpochMs;
 			cutoverSource: CutoverSource;
+			/** Local days with stored demand (units above zero), and the first and last of them. */
+			demandDays: number;
+			firstDemandDay: string | null;
+			lastDemandDay: string | null;
 	  } & BackfillCounts);
 
 interface Response {
@@ -493,5 +500,20 @@ export async function runTranscriptBackfill(
 		});
 	}
 	log?.info("forecast transcript backfill: done", countsRecord(counts));
-	return { status: "done", cutover, cutoverSource, ...counts };
+	const days = [
+		...new Set(
+			rows
+				.filter((r) => r.units > 0)
+				.map((r) => localDayKey(r.start, deps.timeZone ?? "UTC")),
+		),
+	].sort();
+	return {
+		status: "done",
+		cutover,
+		cutoverSource,
+		...counts,
+		demandDays: days.length,
+		firstDemandDay: days[0] ?? null,
+		lastDemandDay: days.at(-1) ?? null,
+	};
 }

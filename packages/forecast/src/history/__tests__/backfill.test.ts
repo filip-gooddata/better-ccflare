@@ -800,3 +800,40 @@ describe("event loop", () => {
 		expect(Math.min(...gaps)).toBeLessThan(60);
 	}, 60_000);
 });
+
+describe("days with demand (amendment 3, C2)", () => {
+	test("counts the local days of the stored demand and names the first and last", async () => {
+		const early: LineSpec = {
+			at: T0 - 2 * 86_400_000 + 10_000,
+			messageId: "msg_early",
+			requestId: "req_early",
+		};
+		// 11:00 UTC is already the next day at UTC+14
+		const late: LineSpec = {
+			at: T0 + 3 * 3_600_000,
+			messageId: "msg_late",
+			requestId: "req_late",
+		};
+		await writeJsonl("proj-a/s1.jsonl", [
+			assistantLine(early),
+			assistantLine(late),
+		]);
+		const result = await runTranscriptBackfill(
+			deps(new FakeStore(), { timeZone: "Pacific/Kiritimati" }),
+		);
+		expect(result.status).toBe("done");
+		if (result.status !== "done") return;
+		expect(result.demandDays).toBe(2);
+		expect(result.firstDemandDay).toBe("2026-10-03");
+		expect(result.lastDemandDay).toBe("2026-10-06");
+	});
+
+	test("without stored demand: no days, no first or last", async () => {
+		await writeJsonl("proj-a/s1.jsonl", [userLine(T0)]);
+		const result = await runTranscriptBackfill(deps(new FakeStore()));
+		if (result.status !== "done") throw new Error(result.status);
+		expect(result.demandDays).toBe(0);
+		expect(result.firstDemandDay).toBeNull();
+		expect(result.lastDemandDay).toBeNull();
+	});
+});

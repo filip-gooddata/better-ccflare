@@ -913,3 +913,203 @@ describe("forecast service: queued work", () => {
 		expect(h.backfills).toEqual(["/tmp/transcripts"]);
 	});
 });
+
+describe("forecast service: log lines (amendment 3, C2)", () => {
+	const HOUR = 3_600_000;
+	const ID = "28f69dec-2e46-4b18-9557-dcdc132fc385";
+
+	function noForecast(
+		now: EpochMs,
+		detail: Extract<ForecastResult, { available: false }>["detail"],
+	): ForecastResult {
+		return {
+			available: false,
+			reason: "insufficient_history",
+			response: unavailableResponse(now, "insufficient_history", [ID]),
+			plan: null,
+			detail,
+		};
+	}
+
+	function calibrationDetail(points: number, units: number) {
+		return {
+			rule: "calibration" as const,
+			limits: [
+				{
+					accountId: ID,
+					limit: "five_hour" as const,
+					instances: points > 0 ? 1 : 0,
+					points,
+					minPoints: 5,
+					units,
+					k: "none" as const,
+				},
+				{
+					accountId: ID,
+					limit: "seven_day" as const,
+					instances: 1,
+					points: 12,
+					minPoints: 5,
+					units: 40.25,
+					k: "own" as const,
+				},
+			],
+		};
+	}
+
+	const unavailableLines = (h: Harness) =>
+		h.infos.filter((m) => m.startsWith("forecast unavailable"));
+
+	async function cycle(h: Harness, ms: number) {
+		await h.time.advance(ms);
+		await h.service.runOnce();
+	}
+
+	it("names the calibration rule and its numbers per account and limit", async () => {
+		const h = harness();
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(0, 3.5));
+		await h.service.runOnce();
+		expect(unavailableLines(h)).toEqual([
+			`forecast unavailable reason=insufficient_history rule=calibration ${ID}/five_hour: instances=0 points=0/5 units=3.5 k=none; ${ID}/seven_day: instances=1 points=12/5 units=40.3 k=own`,
+		]);
+	});
+
+	it("names the history rule: recorded days and the pool of today against their minimums", async () => {
+		const h = harness();
+		h.engine.result = (i) =>
+			noForecast(i.now, {
+				rule: "history",
+				recordedDays: 3,
+				minRecordedDays: 5,
+				pool: "workday",
+				poolDays: 2,
+				minPoolDays: 3,
+			});
+		await h.service.runOnce();
+		expect(unavailableLines(h)).toEqual([
+			"forecast unavailable reason=insufficient_history rule=history recordedDays=3/5 pool=workday:2/3",
+		]);
+	});
+
+	it("names no_counted_account, and a reason without a rule", async () => {
+		const h = harness();
+		h.engine.result = (i) => noForecast(i.now, { rule: "no_counted_account" });
+		await h.service.runOnce();
+		h.engine.failWith = new Error("boom");
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(unavailableLines(h)).toEqual([
+			"forecast unavailable reason=insufficient_history rule=no_counted_account",
+			"forecast unavailable reason=error",
+		]);
+	});
+
+	it("is not repeated on every poll: again when the rule or a deciding number changes, else once an hour", async () => {
+		const h = harness();
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(2, 3.5));
+		await h.service.runOnce();
+		// demand keeps arriving: the unit sum grows on every poll, nothing decides differently
+		for (let i = 1; i <= 10; i++) {
+			const units = 3.5 + i;
+			h.engine.result = (inp) =>
+				noForecast(inp.now, calibrationDetail(2, units));
+			await cycle(h, FORECAST_MIN_SPACING_MS);
+		}
+		expect(unavailableLines(h).length).toBe(1);
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(3, 20));
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(unavailableLines(h).length).toBe(2);
+		await cycle(h, HOUR);
+		expect(unavailableLines(h).length).toBe(3);
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(unavailableLines(h).length).toBe(3);
+	});
+
+	it("says once when the forecast is available again, and nothing while it stays available", async () => {
+		const h = harness();
+		const availableLines = () =>
+			h.infos.filter((m) => m.startsWith("forecast available"));
+		await h.service.runOnce();
+		expect(availableLines()).toEqual([]);
+		h.engine.result = (i) => noForecast(i.now, { rule: "no_counted_account" });
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		h.engine.result = (i) => available(i.now);
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(availableLines()).toEqual(["forecast available again"]);
+		h.engine.result = (i) => noForecast(i.now, { rule: "no_counted_account" });
+		await cycle(h, FORECAST_MIN_SPACING_MS);
+		expect(unavailableLines(h).length).toBe(2);
+	});
+
+	it("the response of the provider carries no detail", async () => {
+		const h = harness();
+		h.engine.result = (i) => noForecast(i.now, calibrationDetail(0, 3.5));
+		await h.service.runOnce();
+		const json = JSON.stringify(serve(h));
+		expect(json).not.toContain("calibration");
+		expect(json).not.toContain("detail");
+	});
+
+	it("ends the backfill with one line of counts, dates, cut-over, status and run time", async () => {
+		const time = new FakeTime();
+		const h = harness({
+			time,
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			backfill: async () => {
+				time.now += 1234;
+				return {
+					status: "done",
+					files: 1416,
+					unreadable: 2,
+					lines: 90000,
+					malformed: 3,
+					skipped: 400,
+					deduped: 5000,
+					unkeyed: 1,
+					afterCutover: 70,
+					responses: 61302,
+					rows: 2743,
+					cleared: 0,
+					cutover: Date.UTC(2026, 10, 11, 7, 35),
+					cutoverSource: "proxy",
+					demandDays: 36,
+					firstDemandDay: "2026-10-06",
+					lastDemandDay: "2026-11-10",
+				};
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		const lines = h.infos.filter((m) =>
+			m.startsWith("forecast backfill finished"),
+		);
+		expect(lines).toEqual([
+			"forecast backfill finished status=done files=1416 unreadable=2 lines=90000 stored=61302 skipped: noUsage=400 duplicate=5000 afterCutover=70 malformed=3 unkeyed=1 rows=2743 cleared=0 days=36 first=2026-10-06 last=2026-11-10 cutover=2026-11-11T07:35:00.000Z ms=1234",
+		]);
+	});
+
+	it("no path-like text reaches the backfill line, whatever the backfill returns", async () => {
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			backfill: async () => ({
+				status: "/Users/someone/.claude/projects/p/session-1.jsonl",
+				files: "/Users/someone/.claude/projects",
+				lines: Number.NaN,
+				responses: 4,
+				firstDemandDay: "../../etc/session-2.jsonl",
+				lastDemandDay: "2026-11-10 /x",
+				cutover: "/tmp/x",
+				extra: "/Users/someone/secret.jsonl",
+			}),
+		});
+		await h.service.runOnce();
+		await flush();
+		const line = h.infos.find((m) =>
+			m.startsWith("forecast backfill finished"),
+		);
+		expect(line).toBe(
+			"forecast backfill finished status=unknown files=? unreadable=? lines=? stored=4 skipped: noUsage=? duplicate=? afterCutover=? malformed=? unkeyed=? rows=? cleared=? days=? first=none last=none cutover=none ms=0",
+		);
+		expect(h.infos.join("\n")).not.toMatch(/[\\/]|jsonl|session|Users/);
+	});
+});

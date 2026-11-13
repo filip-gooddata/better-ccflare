@@ -43,6 +43,8 @@ const LIMITS: { window: LimitWindow; key: keyof Calibration }[] = [
 ];
 
 interface Evidence {
+	/** Window instances inside the lookback with at least two readings. */
+	instances: number;
 	points: number;
 	weightedPoints: number;
 	weightedUnits: number;
@@ -115,6 +117,27 @@ export function calibrate(
 	input: ForecastInput,
 	counted: AccountLimits[],
 ): Calibration {
+	return calibrateWithEvidence(input, counted).calibration;
+}
+
+/** What one account's limit gave the calibration: the numbers its own-k rule compares. */
+export interface LimitEvidence {
+	accountId: AccountId;
+	window: LimitWindow;
+	instances: number;
+	/** Summed rise, unweighted (against MIN_CALIBRATION_POINTS). */
+	points: number;
+	/** Recency-weighted unit sum (must exceed MIN_CALIBRATION_UNITS). */
+	units: number;
+	/** The account's own k, or null when it borrows one or has none. */
+	ownK: number | null;
+}
+
+/** `calibrate` plus the evidence per counted account and limit, for saying why there is no k. */
+export function calibrateWithEvidence(
+	input: ForecastInput,
+	counted: AccountLimits[],
+): { calibration: Calibration; evidence: LimitEvidence[] } {
 	const ids = new Set(counted.map((a) => a.accountId));
 	const halfLife = input.settings.historyHalfLifeDays;
 	const since = input.now - input.settings.historyLookbackDays * DAY_MS;
@@ -149,7 +172,12 @@ export function calibrate(
 		const first = list[0] as LimitReading;
 		const own = buckets.get(first.accountId) ?? [];
 		const fable = first.window === "seven_day_fable";
-		const e: Evidence = { points: 0, weightedPoints: 0, weightedUnits: 0 };
+		const e: Evidence = {
+			instances: 0,
+			points: 0,
+			weightedPoints: 0,
+			weightedUnits: 0,
+		};
 		let runStart = 0;
 		for (let i = 1; i <= list.length; i++) {
 			const prev = list[i - 1] as LimitReading;
@@ -161,6 +189,7 @@ export function calibrate(
 			const delta = Math.max(0, prev.usedPct - head.usedPct);
 			const units = unitsBetween(own, head.at, prev.at, fable);
 			const w = recencyWeight((input.now - prev.at) / DAY_MS, halfLife);
+			e.instances++;
 			e.points += delta;
 			e.weightedPoints += w * delta;
 			e.weightedUnits += w * units;
@@ -169,10 +198,22 @@ export function calibrate(
 	}
 
 	const result: Calibration = { fiveHour: {}, weekly: {}, fable: {} };
+	const report: LimitEvidence[] = [];
 	for (const { window, key } of LIMITS) {
 		const own = new Map<AccountId, number | null>();
-		for (const a of counted)
-			own.set(a.accountId, ownK(evidence.get(`${a.accountId}\u0000${window}`)));
+		for (const a of counted) {
+			const e = evidence.get(`${a.accountId}\u0000${window}`);
+			const k = ownK(e);
+			own.set(a.accountId, k);
+			report.push({
+				accountId: a.accountId,
+				window,
+				instances: e?.instances ?? 0,
+				points: e?.points ?? 0,
+				units: e?.weightedUnits ?? 0,
+				ownK: k,
+			});
+		}
 		for (const a of counted) {
 			let k = own.get(a.accountId) ?? null;
 			if (k === null) {
@@ -184,5 +225,5 @@ export function calibrate(
 			else if (k !== null) result[key][a.accountId] = k;
 		}
 	}
-	return result;
+	return { calibration: result, evidence: report };
 }

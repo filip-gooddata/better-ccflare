@@ -251,6 +251,37 @@ export interface Plan {
 
 export type UnavailableReason = "insufficient_history" | "error" | "disabled";
 
+/** One counted account's limit in the calibration rule, as the unavailable log line names it. */
+export interface CalibrationLimitDetail {
+	accountId: AccountId;
+	limit: "five_hour" | "seven_day";
+	instances: number;
+	/** Summed rise against minPoints (MIN_CALIBRATION_POINTS). */
+	points: number;
+	minPoints: number;
+	/** Recency-weighted unit sum; an own k needs it positive. */
+	units: number;
+	/** An own k, one borrowed from another counted account, or none. */
+	k: "own" | "borrowed" | "none";
+}
+
+/**
+ * Which availability rule (design 4.2, 4.3) answered insufficient_history, with its numbers.
+ * For the service's log only: never part of the response.
+ */
+export type UnavailableDetail =
+	| { rule: "no_counted_account" }
+	| {
+			rule: "history";
+			recordedDays: number;
+			minRecordedDays: number;
+			/** Today's pool: its own day type, or "weekdays" when monday and workday pool together. */
+			pool: "workday" | "monday" | "weekend" | "weekdays";
+			poolDays: number;
+			minPoolDays: number;
+	  }
+	| { rule: "calibration"; limits: CalibrationLimitDetail[] };
+
 export type ForecastResult =
 	| { available: true; response: ForecastResponse; plan: Plan }
 	| {
@@ -258,6 +289,8 @@ export type ForecastResult =
 			reason: UnavailableReason;
 			response: ForecastResponse;
 			plan: null;
+			/** Set with insufficient_history; the HTTP response never carries it. */
+			detail?: UnavailableDetail;
 	  };
 
 export interface ForecastEngine {

@@ -7,16 +7,30 @@
 import type {
 	AccountId,
 	AccountLimits,
+	Calibration,
+	CalibrationLimitDetail,
 	ForecastBlock,
 	ForecastEngine,
 	ForecastInput,
 	ForecastResult,
+	UnavailableDetail,
 	UnavailableReason,
 } from "../types";
-import { calibrate } from "./calibration";
-import { buildDayTable, historyAvailable, workStartMinute } from "./days";
+import {
+	calibrateWithEvidence,
+	type LimitEvidence,
+	MIN_CALIBRATION_POINTS,
+} from "./calibration";
+import {
+	buildDayTable,
+	historyAvailable,
+	MIN_POOL_DAYS,
+	MIN_RECORDED_DAYS,
+	poolFor,
+	workStartMinute,
+} from "./days";
 import { computeHorizon } from "./horizon";
-import type { EngineContext, NoiseMode, NoiseOptions } from "./model";
+import type { DayTable, EngineContext, NoiseMode, NoiseOptions } from "./model";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
@@ -52,16 +66,26 @@ export async function prepareEngineContext(
 	input: ForecastInput,
 	options: NoiseOptions,
 ): Promise<EngineContext | "insufficient_history"> {
+	const prepared = await prepare(input, options);
+	return "rule" in prepared ? "insufficient_history" : prepared;
+}
+
+/** The context, or the rule that answered insufficient_history with its numbers. */
+async function prepare(
+	input: ForecastInput,
+	options: NoiseOptions,
+): Promise<EngineContext | UnavailableDetail> {
 	checkInput(input);
 	const counted = input.accounts.filter((a) => a.counted);
-	if (counted.length === 0) return "insufficient_history";
+	if (counted.length === 0) return { rule: "no_counted_account" };
 
 	const table = buildDayTable(input);
-	if (!historyAvailable(table)) return "insufficient_history";
+	if (!historyAvailable(table)) return historyDetail(table);
 	await yieldToEventLoop();
 
-	const calibration = calibrate(input, counted);
-	if (!calibrated(calibration, counted)) return "insufficient_history";
+	const { calibration, evidence } = calibrateWithEvidence(input, counted);
+	if (!calibrated(calibration, counted))
+		return calibrationDetail(calibration, evidence);
 	const timeZone = input.pace.timeZone;
 	const horizon = computeHorizon(input.now, counted, timeZone);
 	await yieldToEventLoop();
@@ -89,8 +113,8 @@ async function computeForecast(
 	input: ForecastInput,
 	noiseMode: NoiseMode,
 ): Promise<ForecastResult> {
-	const ctx = await prepareEngineContext(input, { noiseMode });
-	if (ctx === "insufficient_history") return unavailable(input, ctx);
+	const ctx = await prepare(input, { noiseMode });
+	if ("rule" in ctx) return unavailable(input, "insufficient_history", ctx);
 	const { plan, result } = await planForecast(ctx);
 	await yieldToEventLoop();
 
@@ -98,6 +122,46 @@ async function computeForecast(
 	checkBlock(response.day);
 	checkBlock(response.week);
 	return { available: true, response, plan };
+}
+
+function historyDetail(table: DayTable): UnavailableDetail {
+	const type = table.today.type;
+	const own = table.days.filter((d) => d.type === type).length;
+	return {
+		rule: "history",
+		recordedDays: table.days.length,
+		minRecordedDays: MIN_RECORDED_DAYS,
+		pool: own >= MIN_POOL_DAYS || type === "weekend" ? type : "weekdays",
+		poolDays: poolFor(table, type).length,
+		minPoolDays: MIN_POOL_DAYS,
+	};
+}
+
+function calibrationDetail(
+	calibration: Calibration,
+	evidence: LimitEvidence[],
+): UnavailableDetail {
+	const limits: CalibrationLimitDetail[] = [];
+	for (const e of evidence) {
+		if (e.window === "seven_day_fable") continue;
+		const ks =
+			e.window === "five_hour" ? calibration.fiveHour : calibration.weekly;
+		limits.push({
+			accountId: e.accountId,
+			limit: e.window,
+			instances: e.instances,
+			points: e.points,
+			minPoints: MIN_CALIBRATION_POINTS,
+			units: e.units,
+			k:
+				e.ownK !== null
+					? "own"
+					: Number.isFinite(ks[e.accountId])
+						? "borrowed"
+						: "none",
+		});
+	}
+	return { rule: "calibration", limits };
 }
 
 function calibrated(
@@ -149,12 +213,14 @@ function checkBlock(block: ForecastBlock | null): void {
 function unavailable(
 	input: ForecastInput,
 	reason: UnavailableReason,
+	detail?: UnavailableDetail,
 ): ForecastResult {
 	return {
 		available: false,
 		reason,
 		response: unavailableResponse(safeNow(input), reason, safeAccounts(input)),
 		plan: null,
+		...(detail ? { detail } : {}),
 	};
 }
 

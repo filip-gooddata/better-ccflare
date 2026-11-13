@@ -15,9 +15,13 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    recency-weighted profile by day type.
 2. **Availability** (`days.ts` `historyAvailable`, plus the checks in `engine.ts`). There is no forecast
    with fewer than 5 recorded days, with fewer than 3 days in today's pool, with no counted account, or
-   when a counted account lacks a 5-hour or weekly k.
+   when a counted account lacks a 5-hour or weekly k. The result then carries `detail`: the rule that
+   answered and its numbers, which the service logs (`service/log-lines.ts`); the response never has it.
 3. **Calibration** (`calibration.ts`). A ratio-of-sums estimator gives points per demand unit for each
-   account and limit, over the window instances of the usage readings.
+   account and limit, over the window instances of the usage readings. A window instance is a run of
+   consecutive readings whose reset time lies within `RESET_TIME_TOLERANCE_MS` (60 s) of the run's first
+   reading and whose level never falls: the upstream sends one window's reset time with sub-second
+   jitter, and a fall inside a window means its counter was reset.
 4. **Scenarios** (`scenarios.ts`). A smoothed bootstrap resamples whole recorded days, weighted by recency.
    It adds kernel noise on scale by the shrunk (variance-preserving) smoothed bootstrap of Silverman and
    Young (1987), "The bootstrap: to smooth or not to smooth?", Biometrika 74(3), 469–479 (also Silverman

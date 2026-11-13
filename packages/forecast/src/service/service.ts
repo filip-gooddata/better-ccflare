@@ -22,6 +22,7 @@ import type {
 	PrewarmStatus,
 	SessionTrackerLike,
 } from "../types";
+import { backfillLine, createAvailabilityLog } from "./log-lines";
 
 /** A kept result older than this many usage poll intervals is stale. */
 export const FORECAST_STALE_POLLS = 3;
@@ -115,7 +116,9 @@ export function createForecastService(
 				transcriptsDir,
 				earliestProxyBucket: () => earliestProxyBucket({ db }),
 				now: () => clock.now(),
+				timeZone: deps.pace().timeZone,
 			}));
+	const availability = createAvailabilityLog((msg) => logger.info(msg));
 
 	const startBackfill = () => {
 		if (backfillStarted) return;
@@ -123,15 +126,12 @@ export function createForecastService(
 		if (!dir) return;
 		backfillStarted = true;
 		logger.info("forecast backfill started");
+		const startedAt = clock.now();
 		void Promise.resolve()
 			.then(() => backfill(dir))
 			.then(
 				(result) => {
-					const status =
-						result && typeof result === "object" && "status" in result
-							? String((result as { status: unknown }).status)
-							: "done";
-					logger.info(`forecast backfill finished status=${status}`);
+					logger.info(backfillLine(result, clock.now() - startedAt));
 				},
 				(error: unknown) => {
 					// The error's name only: a message could carry a transcript path.
@@ -201,6 +201,7 @@ export function createForecastService(
 			}
 			kept = { result, computedAt: now };
 			consumedMoves = new Set();
+			availability.record(result, now);
 		} catch (error) {
 			failures.push(`compute=${message(error)}`);
 		}
