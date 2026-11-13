@@ -359,7 +359,7 @@ describe("collectLimitBlockedAccounts", () => {
 		]);
 	});
 
-	it("follows the family filter's own overage rule, not the extra-usage switch", () => {
+	it("does not count overage reported enabled as family capacity", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -368,7 +368,26 @@ describe("collectLimitBlockedAccounts", () => {
 				spend: { enabled: true, percent: 100 },
 			}),
 		);
-		// Overage "available" by resolveOverageStatus: the filter keeps it.
+		// Spend at its limit, and the extra-usage switch off: no capacity.
+		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
+		]);
+		setUseExtraUsage(true);
+		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
+		]);
+	});
+
+	it("keeps the family with the extra-usage switch on and extra usage left", () => {
+		const a = makeAccount("a");
+		usageCache.set(
+			"a",
+			usage({
+				family: [{ percent: 100, resetAt: NOW + 10 * HOUR }],
+				spend: { enabled: true, percent: 40 },
+			}),
+		);
+		setUseExtraUsage(true);
 		expect(collect([a], { capacityRouting: true })).toEqual([]);
 	});
 
@@ -382,8 +401,8 @@ describe("collectLimitBlockedAccounts", () => {
 
 	it("prefers exhausted telemetry rows over a reactive mark's guess", () => {
 		const a = makeAccount("a");
-		// Overage unknown (no spend block): the telemetry check fails open,
-		// the reactive mark excludes, and the rows still carry the real reset.
+		// No spend block: no extra usage, so telemetry and the reactive mark
+		// both exclude, and the rows carry the real reset.
 		usageCache.set(
 			"a",
 			usage({

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { setUseExtraUsage } from "@better-ccflare/core";
 import {
 	clearFamilyExhaustionCache,
 	createModelFamilyExhaustedResponse,
@@ -41,9 +42,8 @@ describe("isAccountExhaustedForModel", () => {
 			...extra,
 		}) as never;
 
-	// Exclusion-expecting fixtures carry an explicit unavailable-overage signal;
-	// without one the tri-state resolver reports "unknown" and correctly fails open
-	// (see the dedicated overage tri-state block below).
+	// Exclusion-expecting fixtures carry an explicit unavailable-overage signal
+	// (see the dedicated extra-usage block below).
 	const overageOff = { spend: { enabled: false } };
 
 	it("reports exhausted when the matching family's weekly_scoped cap is >=100% with a future reset", () => {
@@ -148,50 +148,93 @@ describe("isAccountExhaustedForModel", () => {
 
 	// ── v3 S4: overage tri-state — only `unavailable` may exclude ──────────────
 
-	describe("overage tri-state (fail-open unless explicitly unavailable)", () => {
-		it("stays exhausted (excluded) when extra_usage.is_enabled is explicitly false and no spend block exists", () => {
-			const data = scopedLimits(100, "Fable", futureReset, {
-				extra_usage: {
-					is_enabled: false,
-					monthly_limit: null,
-					used_credits: null,
-					utilization: null,
-				},
-			});
+	// Paid overage is not capacity: it keeps a 100% family available only when
+	// the "use extra usage" switch is on AND the account has extra usage left
+	// (hasExtraUsageCapacity), the rule the account-level windows use.
+	describe("extra usage (switch AND remaining capacity, else exhausted)", () => {
+		afterEach(() => {
+			setUseExtraUsage(false);
+		});
+
+		const legacy = (
+			is_enabled: boolean,
+			utilization: number | null = null,
+		) => ({
+			extra_usage: {
+				is_enabled,
+				monthly_limit: null,
+				used_credits: null,
+				utilization,
+			},
+		});
+
+		it("stays exhausted when extra_usage.is_enabled is explicitly false and no spend block exists", () => {
+			setUseExtraUsage(true);
+			const data = scopedLimits(100, "Fable", futureReset, legacy(false));
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
 			).toBe(true);
 		});
 
-		it("fails open (NOT excluded) when extra_usage.is_enabled is true (overage available)", () => {
+		it("stays exhausted when overage is reported enabled but the use-extra-usage switch is off", () => {
+			for (const extra of [legacy(true), { spend: { enabled: true } }]) {
+				const data = scopedLimits(100, "Fable", futureReset, extra);
+				expect(
+					isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+				).toBe(true);
+			}
+		});
+
+		it("stays exhausted when spend.enabled is true but spend is at or over its limit, switch on", () => {
+			setUseExtraUsage(true);
+			for (const percent of [100, 205]) {
+				const data = scopedLimits(100, "Fable", futureReset, {
+					spend: { enabled: true, percent },
+				});
+				expect(
+					isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+				).toBe(true);
+			}
+		});
+
+		it("stays exhausted when legacy extra usage is enabled but used up, switch on", () => {
+			setUseExtraUsage(true);
+			const data = scopedLimits(100, "Fable", futureReset, legacy(true, 100));
+			expect(
+				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+			).toBe(true);
+		});
+
+		it("keeps the family available with the switch on and extra usage left (spend under its limit)", () => {
+			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, {
-				extra_usage: {
-					is_enabled: true,
-					monthly_limit: null,
-					used_credits: null,
-					utilization: null,
-				},
+				spend: { enabled: true, percent: 40 },
 			});
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
 			).toBe(false);
 		});
 
-		it("fails open (NOT excluded) when extra_usage is missing entirely and no spend block exists (unknown, not disabled)", () => {
-			const data = scopedLimits(100, "Fable", futureReset);
+		it("keeps the family available with the switch on and legacy extra_usage enabled", () => {
+			setUseExtraUsage(true);
+			const data = scopedLimits(100, "Fable", futureReset, legacy(true));
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
 			).toBe(false);
 		});
 
+		it("stays exhausted when no overage signal exists at all (no extra usage known)", () => {
+			setUseExtraUsage(true);
+			const data = scopedLimits(100, "Fable", futureReset);
+			expect(
+				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+			).toBe(true);
+		});
+
 		it("newer spend.enabled=true takes precedence over legacy extra_usage.is_enabled=false", () => {
+			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, {
-				extra_usage: {
-					is_enabled: false,
-					monthly_limit: null,
-					used_credits: null,
-					utilization: null,
-				},
+				...legacy(false),
 				spend: { enabled: true },
 			});
 			expect(
@@ -200,27 +243,14 @@ describe("isAccountExhaustedForModel", () => {
 		});
 
 		it("newer spend.enabled=false takes precedence over legacy extra_usage.is_enabled=true", () => {
+			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, {
-				extra_usage: {
-					is_enabled: true,
-					monthly_limit: null,
-					used_credits: null,
-					utilization: null,
-				},
+				...legacy(true),
 				spend: { enabled: false },
 			});
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
 			).toBe(true);
-		});
-
-		it("fails open when spend block is present but its enabled field is missing (contradictory/unknown signal)", () => {
-			const data = scopedLimits(100, "Fable", futureReset, {
-				spend: { disabled_reason: null },
-			});
-			expect(
-				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
-			).toBe(false);
 		});
 	});
 

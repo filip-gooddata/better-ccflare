@@ -2,6 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, unlinkSync } from "node:fs";
 import type { DatabaseOperations } from "@better-ccflare/database";
 import { DatabaseFactory } from "@better-ccflare/database";
+import {
+	blockFamily,
+	clearFamilyBlocksForAccount,
+	getFamilyBlock,
+	getFamilyBlocksForAccount,
+} from "@better-ccflare/proxy";
 import { createAccountForceResetRateLimitHandler } from "../accounts";
 
 // Conventional test pattern (mirrors account-remove-handler.test.ts). Requires
@@ -124,5 +130,20 @@ describe("createAccountForceResetRateLimitHandler", () => {
 				["uuid-3"],
 			);
 		expect(untouched?.rate_limited_until).not.toBeNull();
+	});
+
+	it("lifts the targeted account's family blocks and leaves other accounts' blocks", async () => {
+		await insertRow("uuid-4", "delta");
+		const until = Date.now() + 24 * 60 * 60 * 1000;
+		blockFamily("uuid-4", "fable", until, "header");
+		blockFamily("uuid-4", "opus", until, "usage");
+		blockFamily("uuid-5", "fable", until, "header");
+
+		const response = await handler(makeRequest(), "uuid-4");
+		expect(response.ok).toBe(true);
+
+		expect(getFamilyBlocksForAccount("uuid-4")).toEqual([]);
+		expect(getFamilyBlock("uuid-5", "fable")?.until).toBe(until);
+		clearFamilyBlocksForAccount("uuid-5");
 	});
 });

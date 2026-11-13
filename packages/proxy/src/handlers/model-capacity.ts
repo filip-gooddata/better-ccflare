@@ -1,5 +1,8 @@
-import { getModelFamily } from "@better-ccflare/core";
-import type { AnyUsageData } from "@better-ccflare/providers";
+import { getModelFamily, isUseExtraUsageEnabled } from "@better-ccflare/core";
+import {
+	type AnyUsageData,
+	hasExtraUsageCapacity,
+} from "@better-ccflare/providers";
 import { collectWindows } from "./usage-throttling";
 
 export interface ModelExhaustionResult {
@@ -74,10 +77,13 @@ function countRawScopedFamilyRows(
  * given model's family is fully exhausted: EVERY weekly_scoped row for that
  * family is at percent >= 100 with a reset still in the future (a single
  * non-exhausted row — e.g. a distinct surface — means the family still has
- * usable capacity), AND overage/pay-as-you-go billing is CONFIRMED
- * unavailable (see {@link resolveOverageStatus}: "available" means upstream
- * still serves past 100% via overage, and "unknown" — missing/contradictory
- * billing signals — must fail open rather than assume disabled).
+ * usable capacity), AND extra usage may not carry the request past the cap.
+ * Paid overage is not capacity: it keeps the family available only when the
+ * process-wide "use extra usage" switch is on AND the account has extra usage
+ * left (hasExtraUsageCapacity: enabled and under its spend limit) — the same
+ * rule the account-level five-hour/weekly gating uses. An overage merely
+ * reported as enabled, with the switch off or the spend limit reached, does
+ * not keep the family available.
  *
  * Fails open (returns {exhausted:false}) whenever the family can't be
  * confidently attributed: unknown request-model family, a scoped row whose
@@ -115,12 +121,10 @@ export function isAccountExhaustedForModel(
 		return { exhausted: false, resetAt: null };
 	}
 
-	// Only a CONFIRMED-unavailable overage signal may exclude: "available"
-	// means upstream will still serve past 100% via overage, and "unknown"
-	// (missing/contradictory spend + extra_usage signals) must fail open —
-	// a false exclusion removes a working account, a false pass costs one
-	// reactive 429 round-trip.
-	if (resolveOverageStatus(usageData) !== "unavailable") {
+	if (
+		isUseExtraUsageEnabled() &&
+		hasExtraUsageCapacity(usageData, "anthropic")
+	) {
 		return { exhausted: false, resetAt: null };
 	}
 
@@ -153,12 +157,16 @@ const DEFAULT_NEGATIVE_CACHE_TTL_MS = 5 * 60 * 1000;
  * account selector, never stored in the negative cache). Only a
  * telemetry_confirmed mark may claim "weekly capacity exhausted" in a
  * user-facing response — a purely reactive mark, or a cooldown-masked one,
- * uses wording that doesn't assert weekly exhaustion.
+ * uses wording that doesn't assert weekly exhaustion. "family_blocked" is
+ * never stored in the negative cache either: the account selector reports it
+ * for a standing family block (see Family blocks below), an upstream refusal
+ * of the family on that account that lasts until the family's limit resets.
  */
 export type FamilyExhaustionOrigin =
 	| "telemetry_confirmed"
 	| "recent_upstream_rejection"
-	| "cooldown_masked";
+	| "cooldown_masked"
+	| "family_blocked";
 
 interface ExhaustionEntry {
 	until: number;
@@ -425,8 +433,11 @@ export function createModelFamilyExhaustedResponse(
 			: info.origin === "cooldown_masked"
 				? `An account with available ${info.family} capacity is temporarily in a rate-limit cooldown (not capacity-exhausted).` +
 					(resetIso ? ` Retry after ${resetIso}.` : "")
-				: `All available accounts are temporarily unavailable for the ${info.family} model family (capacity exhausted or recently rejected upstream).` +
-					(resetIso ? ` Retry after ${resetIso}.` : "");
+				: info.origin === "family_blocked"
+					? `Upstream refused the ${info.family} model family on every available account until its limit resets.` +
+						(resetIso ? ` Earliest reset at ${resetIso}.` : "")
+					: `All available accounts are temporarily unavailable for the ${info.family} model family (capacity exhausted or recently rejected upstream).` +
+						(resetIso ? ` Retry after ${resetIso}.` : "");
 
 	return new Response(
 		JSON.stringify({
