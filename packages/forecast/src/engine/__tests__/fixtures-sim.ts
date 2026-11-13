@@ -50,6 +50,7 @@ export function settings(
 		historyLookbackDays: 56,
 		recentTauMin: 45,
 		sessionTurnoverMin: 60,
+		workStartSharePct: 5,
 		...over,
 	};
 }
@@ -186,6 +187,7 @@ export function makeCtx(spec: CtxSpec): EngineContext {
 			fable,
 			diagnostics: {
 				noise: false,
+				noiseMode: "off",
 				bandwidths: {},
 				dayFactor: 1,
 				recentRate: 0,

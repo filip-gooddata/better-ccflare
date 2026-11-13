@@ -16,25 +16,27 @@ import type {
 import { calibrate } from "./calibration";
 import { buildDayTable, historyAvailable, workStartMinute } from "./days";
 import { computeHorizon } from "./horizon";
-import type { EngineContext } from "./model";
+import type { EngineContext, NoiseMode, NoiseOptions } from "./model";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
-import { buildScenarios } from "./scenarios";
+import { buildScenarios, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
 
-export interface ForecastEngineOptions {
-	/** Kernel noise of the smoothed bootstrap; off gives plain resampling (for measurement). */
-	noise?: boolean;
-}
+/**
+ * Kernel noise of the smoothed bootstrap: `noiseMode` wins; else `noise` true or absent is the
+ * shrunk kernel (the service's only mode), false is plain resampling. `unshrunk` and `off`
+ * exist for measurement.
+ */
+export type ForecastEngineOptions = NoiseOptions;
 
 export function createForecastEngine(
 	options: ForecastEngineOptions = {},
 ): ForecastEngine {
-	const noise = options.noise ?? true;
+	const noiseMode = resolveNoiseMode(options);
 	return {
 		async compute(input: ForecastInput): Promise<ForecastResult> {
 			try {
-				return await computeForecast(input, noise);
+				return await computeForecast(input, noiseMode);
 			} catch {
 				return unavailable(input, "error");
 			}
@@ -48,7 +50,7 @@ export function createForecastEngine(
  */
 export async function prepareEngineContext(
 	input: ForecastInput,
-	options: { noise: boolean },
+	options: NoiseOptions,
 ): Promise<EngineContext | "insufficient_history"> {
 	checkInput(input);
 	const counted = input.accounts.filter((a) => a.counted);
@@ -75,15 +77,19 @@ export async function prepareEngineContext(
 		table,
 		calibration,
 		scenarios,
-		workStartMinute: workStartMinute(table, timeZone),
+		workStartMinute: workStartMinute(
+			table,
+			timeZone,
+			input.settings.workStartSharePct,
+		),
 	};
 }
 
 async function computeForecast(
 	input: ForecastInput,
-	noise: boolean,
+	noiseMode: NoiseMode,
 ): Promise<ForecastResult> {
-	const ctx = await prepareEngineContext(input, { noise });
+	const ctx = await prepareEngineContext(input, { noiseMode });
 	if (ctx === "insufficient_history") return unavailable(input, ctx);
 	const { plan, result } = await planForecast(ctx);
 	await yieldToEventLoop();
