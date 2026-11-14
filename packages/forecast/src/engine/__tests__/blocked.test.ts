@@ -30,8 +30,8 @@ describe("a refusal cooldown counts 0 in the 5-hour pool until it ends (spec sec
 		const { traces } = await simulate(ctx, onDemandPlan(ctx));
 		expect(traces[0].day[0]).toBe(60);
 		expect(traces[0].week[0]).toBe(200);
-		expect(pooledLeftNow(ctx.accounts, "day", now)).toBe(60);
-		expect(pooledLeftNow(ctx.accounts, "week", now)).toBe(200);
+		expect(pooledLeftNow(ctx.accounts, "day", now, ctx.calibration)).toBe(60);
+		expect(pooledLeftNow(ctx.accounts, "week", now, ctx.calibration)).toBe(200);
 	});
 
 	test("its 5-hour window resetting while it is blocked leaves it at 0", async () => {
@@ -134,7 +134,7 @@ describe("a refusal cooldown counts 0 in the 5-hour pool until it ends (spec sec
 		expect([t.day[bA], t.day[bA + 1]]).toEqual([0, 100]);
 		const wB = indexAt(axis.times, now + 6 * HOUR);
 		expect([t.day[wB], t.day[wB + 1]]).toEqual([100, 200]);
-		expect(pooledLeftNow(ctx.accounts, "day", now)).toBe(0);
+		expect(pooledLeftNow(ctx.accounts, "day", now, ctx.calibration)).toBe(0);
 	});
 
 	test("a cooldown already over by now changes nothing", async () => {
@@ -150,7 +150,7 @@ describe("a refusal cooldown counts 0 in the 5-hour pool until it ends (spec sec
 		const ctx = makeCtx({ now, days: 1, accounts, rate: () => 0 });
 		const { traces } = await simulate(ctx, onDemandPlan(ctx));
 		expect(traces[0].day[0]).toBe(130);
-		expect(pooledLeftNow(ctx.accounts, "day", now)).toBe(130);
+		expect(pooledLeftNow(ctx.accounts, "day", now, ctx.calibration)).toBe(130);
 		const plain = buildSampleAxis(
 			makeCtx({
 				now,

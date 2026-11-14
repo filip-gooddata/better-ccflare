@@ -5,6 +5,7 @@
 import { localDayStart, localWeekStart } from "../time";
 import type {
 	AccountLimits,
+	Calibration,
 	EpochMs,
 	Interval,
 	LimitReading,
@@ -53,8 +54,26 @@ function clampPct(value: number): number {
 }
 
 /**
- * One account's share of the pooled quota left (spec section 3). Day: no open
- * window counts 100, a used-up weekly limit counts 0. Week: 100 minus weekly use.
+ * Five-hour points per weekly point of an account, k5 / kW from the calibration (own or
+ * borrowed): what one weekly point left is worth on the day line. Null when kW is not a finite
+ * positive number (the engine's gate rules that out); the day line then has no weekly cap.
+ */
+export function capRatio(
+	calibration: Pick<Calibration, "fiveHour" | "weekly">,
+	id: string,
+): number | null {
+	const k5 = calibration.fiveHour[id];
+	const kW = calibration.weekly[id];
+	if (k5 === undefined || kW === undefined) return null;
+	if (!Number.isFinite(k5) || !Number.isFinite(kW) || !(kW > 0)) return null;
+	return k5 / kW;
+}
+
+/**
+ * One account's share of the pooled quota left (spec section 3). Day: the lower of its
+ * five-hour quota left (100 with no open window) and its weekly quota left times `ratio`
+ * (five-hour points per weekly point; no cap when null); a used-up weekly limit counts 0.
+ * Week: 100 minus weekly use.
  */
 export function accountLeft(
 	quantity: Quantity,
@@ -62,19 +81,38 @@ export function accountLeft(
 	weekly: Limit | undefined,
 	t: EpochMs,
 	before = false,
+	ratio: number | null = null,
 ): number {
-	if (quantity === "week") {
-		if (weekly === undefined || resetPassed(weekly, t, before)) return 100;
-		return clampPct(100 - weekly.usedPct);
-	}
+	const weeklyLeft =
+		weekly === undefined || resetPassed(weekly, t, before)
+			? 100
+			: clampPct(100 - weekly.usedPct);
+	if (quantity === "week") return weeklyLeft;
 	if (full(weekly, t, before)) return 0;
-	if (
+	const fiveLeft =
 		fiveHour === undefined ||
 		fiveHour.resetsAt === null ||
 		resetPassed(fiveHour, t, before)
-	)
-		return 100;
-	return clampPct(100 - fiveHour.usedPct);
+			? 100
+			: clampPct(100 - fiveHour.usedPct);
+	return ratio === null ? fiveLeft : Math.min(fiveLeft, weeklyLeft * ratio);
+}
+
+/**
+ * Whether the weekly cap lowers an account's day share at `now`: the account counts (no
+ * running cooldown, weekly limit not used up) and its weekly quota left in five-hour points is
+ * below its five-hour quota left.
+ */
+export function capBinds(
+	a: AccountLimits,
+	now: EpochMs,
+	ratio: number | null,
+): boolean {
+	if (ratio === null) return false;
+	if (a.blockedUntil !== null && a.blockedUntil > now) return false;
+	if (full(a.weekly, now)) return false;
+	const capped = accountLeft("day", a.fiveHour, a.weekly, now, false, ratio);
+	return capped < accountLeft("day", a.fiveHour, a.weekly, now);
 }
 
 /** Out by its usage limits (the refusal cooldown is not in the readings). */
@@ -91,18 +129,21 @@ function limitsOut(
 
 /**
  * Pooled quota left of the counted accounts as last read. Day: an account in a
- * running refusal cooldown counts 0 (spec section 3).
+ * running refusal cooldown counts 0, the others are capped by their weekly quota
+ * left (spec section 3).
  */
 export function pooledLeftNow(
 	accounts: AccountLimits[],
 	quantity: Quantity,
 	now: EpochMs,
+	calibration: Pick<Calibration, "fiveHour" | "weekly">,
 ): number {
 	let sum = 0;
 	for (const a of accounts) {
 		if (quantity === "day" && a.blockedUntil !== null && a.blockedUntil > now)
 			continue;
-		sum += accountLeft(quantity, a.fiveHour, a.weekly, now);
+		const ratio = capRatio(calibration, a.accountId);
+		sum += accountLeft(quantity, a.fiveHour, a.weekly, now, false, ratio);
 	}
 	return sum;
 }
@@ -190,7 +231,8 @@ function replay(
 		for (const id of ids) {
 			const five = state.get(`${id}|five_hour`);
 			const weekly = state.get(`${id}|seven_day`);
-			left += accountLeft(quantity, five, weekly, t, before);
+			const ratio = capRatio(ctx.calibration, id);
+			left += accountLeft(quantity, five, weekly, t, before, ratio);
 			out.push(limitsOut(quantity, five, weekly, t, before));
 		}
 		return { left, out };
@@ -235,7 +277,12 @@ interface Entry {
  * WEEK_PAST_SPACING_MS besides jumps and its first and last entry.
  */
 export function pastSeries(ctx: EngineContext, quantity: Quantity): Series {
-	const nowValue = pooledLeftNow(ctx.accounts, quantity, ctx.now);
+	const nowValue = pooledLeftNow(
+		ctx.accounts,
+		quantity,
+		ctx.now,
+		ctx.calibration,
+	);
 	const events = replay(ctx, quantity, pastFrom(ctx, quantity));
 	if (events === null) return { times: [ctx.now], values: [nowValue] };
 	const entries: Entry[] = [

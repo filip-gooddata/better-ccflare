@@ -9,10 +9,12 @@ import type {
 	AccountLimits,
 	Calibration,
 	CalibrationLimitDetail,
+	EpochMs,
 	ForecastBlock,
 	ForecastEngine,
 	ForecastInput,
 	ForecastResult,
+	InputsCapDetail,
 	InputsLimitDetail,
 	LimitWindow,
 	UnavailableDetail,
@@ -40,6 +42,7 @@ import type {
 	NoiseOptions,
 	RecordedDay,
 } from "./model";
+import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
@@ -130,7 +133,8 @@ async function prepare(
 				p90Units: weightedQuantile(pool, 0.9),
 			},
 			workStartMinute: workStart,
-			limits: inputLimits(counted, calibration, evidence),
+			limits: inputLimits(counted, calibration, evidence, input.now),
+			caps: counted.map((a) => inputCap(a, calibration, input.now)),
 		},
 	};
 }
@@ -146,7 +150,10 @@ function inputLimits(
 	counted: AccountLimits[],
 	calibration: Calibration,
 	evidence: LimitEvidence[],
+	now: EpochMs,
 ): InputsLimitDetail[] {
+	const ago = (at: EpochMs | null | undefined) =>
+		at === null || at === undefined ? null : (now - at) / HOUR_MS;
 	const limits: InputsLimitDetail[] = [];
 	for (const a of counted) {
 		for (const limit of Object.keys(LIMIT_KEYS) as LimitWindow[]) {
@@ -162,10 +169,22 @@ function inputLimits(
 				source: e && e.ownK !== null ? "own" : has ? "borrowed" : "none",
 				instances: e?.instances ?? 0,
 				points: e?.points ?? 0,
+				oldestHoursAgo: ago(e?.oldestAt),
+				newestHoursAgo: ago(e?.newestAt),
 			});
 		}
 	}
 	return limits;
+}
+
+/** An account's weekly cap on the day line at the computation: r = k5 / kW and whether it binds. */
+function inputCap(
+	a: AccountLimits,
+	calibration: Calibration,
+	now: EpochMs,
+): InputsCapDetail {
+	const ratio = capRatio(calibration, a.accountId);
+	return { accountId: a.accountId, ratio, binds: capBinds(a, now, ratio) };
 }
 
 /** Recency-weighted quantile of the pool's daily units: the smallest total whose cumulative weight reaches q. */

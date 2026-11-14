@@ -1073,15 +1073,18 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 					source: "own",
 					instances: 4,
 					points: 30,
+					oldestHoursAgo: 200,
+					newestHoursAgo: 0.5,
 				},
 			],
+			caps: [{ accountId: ID, ratio: 6, binds: true }],
 		};
 		h.engine.result = (i) => ({ ...available(i.now), inputs });
 		await h.service.runOnce();
 		for (let i = 1; i <= 5; i++) await cycle(h, FORECAST_MIN_SPACING_MS);
 		const lines = h.infos.filter((m) => m.startsWith("forecast inputs"));
 		expect(lines).toEqual([
-			`forecast inputs dayFactor a=1.200 clamped=1.400 w=0.5000 raw=1.400 Y=30.00 M=10.00 c=20.00 recentRate=6.00/h pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30`,
+			`forecast inputs dayFactor a=1.200 clamped=1.400 w=0.5000 raw=1.400 Y=30.00 M=10.00 c=20.00 recentRate=6.00/h pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30 oldestH=200.0 newestH=0.5 cap: ${ID} r=6.00 binds=yes`,
 		]);
 		const json = JSON.stringify(serve(h));
 		expect(json).not.toContain("dayFactor");

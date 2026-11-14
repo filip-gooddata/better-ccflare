@@ -41,6 +41,8 @@ function detail(
 				source: "own",
 				instances: 6,
 				points: 41,
+				oldestHoursAgo: 312.46,
+				newestHoursAgo: 0.25,
 			},
 			{
 				accountId: A,
@@ -49,6 +51,8 @@ function detail(
 				source: "own",
 				instances: 3,
 				points: 12.5,
+				oldestHoursAgo: 160.04,
+				newestHoursAgo: 1.5,
 			},
 			{
 				accountId: A,
@@ -57,6 +61,8 @@ function detail(
 				source: "none",
 				instances: 0,
 				points: 0,
+				oldestHoursAgo: null,
+				newestHoursAgo: null,
 			},
 			{
 				accountId: B,
@@ -65,7 +71,13 @@ function detail(
 				source: "borrowed",
 				instances: 0,
 				points: 0,
+				oldestHoursAgo: null,
+				newestHoursAgo: null,
 			},
+		],
+		caps: [
+			{ accountId: A, ratio: 13.21609, binds: false },
+			{ accountId: B, ratio: null, binds: false },
 		],
 		...over,
 	};
@@ -94,10 +106,11 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		expect(inputsLine(detail())).toBe(
 			"forecast inputs dayFactor a=1.079 clamped=4.000 w=0.0264 raw=4.651 Y=107.25 M=0.67 c=25.52" +
 				" recentRate=12.35/h pool=workday:23 median=98.0 p90=152.0 workStart=08:05" +
-				` k: ${A}/five_hour=1.9877 own instances=6 points=41;` +
-				` ${A}/seven_day=0.1504 own instances=3 points=12.5;` +
-				` ${A}/seven_day_fable=none none instances=0 points=0;` +
-				` ${B}/five_hour=1.9877 borrowed instances=0 points=0`,
+				` k: ${A}/five_hour=1.9877 own instances=6 points=41 oldestH=312.5 newestH=0.3;` +
+				` ${A}/seven_day=0.1504 own instances=3 points=12.5 oldestH=160.0 newestH=1.5;` +
+				` ${A}/seven_day_fable=none none instances=0 points=0 oldestH=none newestH=none;` +
+				` ${B}/five_hour=1.9877 borrowed instances=0 points=0 oldestH=none newestH=none` +
+				` cap: ${A} r=13.22 binds=no; ${B} r=none binds=no`,
 		);
 	});
 
@@ -113,6 +126,8 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 					source: "own",
 					instances: 1,
 					points: Number.POSITIVE_INFINITY,
+					oldestHoursAgo: Number.NaN,
+					newestHoursAgo: 2,
 				},
 			],
 		});
@@ -120,7 +135,9 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		expect(line).toContain(
 			"pool=weekend:4 median=none p90=none workStart=none",
 		);
-		expect(line).toContain("k: ?/five_hour=? own instances=1 points=?");
+		expect(line).toContain(
+			"k: ?/five_hour=? own instances=1 points=? oldestH=? newestH=2.0",
+		);
 		expect(line).not.toContain("Filip");
 		expect(line).not.toContain("/Users");
 		// every token is a fixed word, a number, an id or "?"
@@ -187,6 +204,46 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		log.record(available(reordered), first + MIN);
 		log.record(available(reordered), first + 10 * MIN);
 		log.record(available(reordered), first + 3 * INPUTS_MIN_SPACING_MS);
+		expect(lines.length).toBe(1);
+	});
+
+	it("prints the weekly cap per account: r and whether it binds now", () => {
+		const line = inputsLine(
+			detail({
+				caps: [
+					{ accountId: A, ratio: 5.96508, binds: true },
+					{ accountId: "Filip /Users/x", ratio: Number.NaN, binds: false },
+				],
+			}),
+		);
+		expect(line).toEndWith(` cap: ${A} r=5.97 binds=yes; ? r=? binds=no`);
+	});
+
+	it("writes no new line when only r, whether the cap binds, or the reading ages move", () => {
+		const lines: string[] = [];
+		const log = createInputsLog((m) => lines.push(m));
+		const first = 1_000_000;
+		const d = detail();
+		log.record(available(d), first);
+		expect(lines.length).toBe(1);
+		const moved: ForecastInputsDetail = {
+			...d,
+			caps: [
+				{ accountId: A, ratio: 12.4, binds: true },
+				{ accountId: B, ratio: 6.1, binds: true },
+			],
+			limits: d.limits.map((l) =>
+				l.oldestHoursAgo === null || l.newestHoursAgo === null
+					? l
+					: {
+							...l,
+							oldestHoursAgo: l.oldestHoursAgo + 5,
+							newestHoursAgo: l.newestHoursAgo + 5,
+						},
+			),
+		};
+		log.record(available(moved), first + 3 * INPUTS_MIN_SPACING_MS);
+		log.record(available(moved), first + 9 * INPUTS_MIN_SPACING_MS);
 		expect(lines.length).toBe(1);
 	});
 });

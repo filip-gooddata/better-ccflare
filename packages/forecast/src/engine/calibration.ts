@@ -48,6 +48,9 @@ interface Evidence {
 	points: number;
 	weightedPoints: number;
 	weightedUnits: number;
+	/** First reading of the oldest and last reading of the newest counted instance. */
+	oldestAt: EpochMs | null;
+	newestAt: EpochMs | null;
 }
 
 /** Demand of sorted buckets inside [from, to), each bucket counted by its proportional overlap. */
@@ -131,6 +134,9 @@ export interface LimitEvidence {
 	units: number;
 	/** The account's own k, or null when it borrows one or has none. */
 	ownK: number | null;
+	/** First reading of the oldest and last reading of the newest counted instance. */
+	oldestAt: EpochMs | null;
+	newestAt: EpochMs | null;
 }
 
 /** `calibrate` plus the evidence per counted account and limit, for saying why there is no k. */
@@ -177,6 +183,8 @@ export function calibrateWithEvidence(
 			points: 0,
 			weightedPoints: 0,
 			weightedUnits: 0,
+			oldestAt: null,
+			newestAt: null,
 		};
 		let runStart = 0;
 		for (let i = 1; i <= list.length; i++) {
@@ -193,6 +201,8 @@ export function calibrateWithEvidence(
 			e.points += delta;
 			e.weightedPoints += w * delta;
 			e.weightedUnits += w * units;
+			if (e.oldestAt === null || head.at < e.oldestAt) e.oldestAt = head.at;
+			if (e.newestAt === null || prev.at > e.newestAt) e.newestAt = prev.at;
 		}
 		evidence.set(key, e);
 	}
@@ -212,6 +222,8 @@ export function calibrateWithEvidence(
 				points: e?.points ?? 0,
 				units: e?.weightedUnits ?? 0,
 				ownK: k,
+				oldestAt: e?.oldestAt ?? null,
+				newestAt: e?.newestAt ?? null,
 			});
 		}
 		for (const a of counted) {
