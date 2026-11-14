@@ -3204,7 +3204,10 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
-				attemptedModels.push(requestedModel);
+				// The list's first entry is the model the primary attempt sent
+				// upstream (a mapping may rename the client's model to another
+				// family), so the family check compares upstream models only.
+				attemptedModels.push(splitModelRouting(modelList[0]).model);
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(
