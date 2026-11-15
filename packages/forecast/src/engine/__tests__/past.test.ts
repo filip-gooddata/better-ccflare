@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LimitReading, LimitWindow } from "../../types";
-import { pastSeries, pastStops } from "../past";
+import { capRatio, pastSeries, pastStops } from "../past";
 import {
 	account,
 	HOUR,
@@ -202,6 +202,43 @@ describe("day.past: the weekly cap (spec section 3)", () => {
 		expect(pastSeries(ctx, "day")).toEqual({
 			times: [MIDNIGHT, at(11), at(11), NOW],
 			values: [40, 40, 100, 100],
+		});
+	});
+
+	test("capRatio: k5 / kW, null without a finite positive kW", () => {
+		const cal = (k5: number, kW: number) => ({
+			fiveHour: { a: k5 },
+			weekly: { a: kW },
+		});
+		expect(capRatio(cal(1.8, 0.3), "a")).toBeCloseTo(6, 12);
+		expect(capRatio(cal(1.8, 0), "a")).toBeNull();
+		expect(capRatio(cal(1.8, -0.1), "a")).toBeNull();
+		expect(capRatio(cal(1.8, Number.NaN), "a")).toBeNull();
+		expect(capRatio(cal(1.8, Number.POSITIVE_INFINITY), "a")).toBeNull();
+		expect(capRatio(cal(Number.NaN, 0.3), "a")).toBeNull();
+		expect(capRatio(cal(1.8, 0.3), "b")).toBeNull();
+	});
+
+	test("a weekly reset while the five-hour window is open lifts the cap to the five-hour left", () => {
+		const readings = [
+			reading("acct-a", "seven_day", MIDNIGHT - 10 * MIN, 95, at(11)),
+			reading("acct-a", "five_hour", at(9), 30, at(14)),
+		];
+		const ctx = makeCtx({
+			readings,
+			accounts: [
+				account("acct-a", {
+					fiveHour: { usedPct: 30, resetsAt: at(14) },
+					weekly: { usedPct: 0, resetsAt: at(11) + 7 * 24 * HOUR },
+				}),
+			],
+			calibration,
+		});
+		// From the first five-hour reading: 5 weekly points × 4 = 20 until 11:00, then the
+		// window's 70 left.
+		expect(pastSeries(ctx, "day")).toEqual({
+			times: [at(9), at(11), at(11), NOW],
+			values: [20, 20, 70, 70],
 		});
 	});
 
