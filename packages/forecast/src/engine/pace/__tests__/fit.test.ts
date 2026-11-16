@@ -192,6 +192,19 @@ describe("fitPaceModel", () => {
 			expect(below?.feature as string).toMatch(/^R:/);
 			expect(below?.units as number).toBeGreaterThanOrEqual(2);
 			expect(below?.units as number).toBeLessThan(10);
+			// one entry per hour cell (band x day type x origin hour) that would switch on
+			const cells = state.belowFloor.filter((b) => b.band === "0-1h");
+			expect(cells.length).toBeGreaterThan(1);
+			const keys = cells.map((c) => `${c.dayType}/${c.hour}`);
+			expect(new Set(keys).size).toBe(keys.length);
+			for (const c of cells) {
+				expect(["workday", "monday", "weekend"]).toContain(c.dayType);
+				expect(Number.isInteger(c.hour) && c.hour >= 0 && c.hour < 24).toBe(
+					true,
+				);
+				expect(c.feature).toBe(below?.feature as string);
+				expect(c.units).toBe(below?.units as number);
+			}
 			// 8-16h: candidates with a gain in every unit but sign-flip p about 0.5 fail BH
 			expect(state.belowFloor.find((b) => b.band === "8-16h")).toBeUndefined();
 		},

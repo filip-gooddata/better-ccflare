@@ -189,7 +189,7 @@ describe("forecast service with the real engine on the 2026-11-12 replay, pre-wa
 		});
 		const held = w.service.advisor.placeNewSession(w.clock.at);
 		expect(held?.rule).toBe("forecast-lookahead");
-		expect(held?.reason).toBe("low-point+17.6");
+		expect(held?.reason).toBe("low-point+17.1");
 		expect(held?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 
 		// 08:30, no hold gains the gate: the idle acct-b heads the tiers (amendment 5, E1).

@@ -59,8 +59,20 @@ function detail(
 			cellsEstablished: 5,
 			cellsTotal: 216,
 			belowFloor: [
-				{ band: "1-2d", feature: "W:wk-1", units: 7 },
-				{ band: "4-7d", feature: "C:day-7", units: 9 },
+				{
+					band: "1-2d",
+					dayType: "workday",
+					hour: 9,
+					feature: "W:wk-1",
+					units: 7,
+				},
+				{
+					band: "4-7d",
+					dayType: "weekend",
+					hour: 23,
+					feature: "C:day-7",
+					units: 9,
+				},
 			],
 		},
 		pool: { name: "workday", days: 23, medianUnits: 98.04, p90Units: 151.96 },
@@ -149,7 +161,7 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 			"forecast inputs e4=fitted fitAge=12 days=84 weeks=12 cells=5/216" +
 				" e4m 0-1h=2.00 1-2h=1.50 2-4h=1.25 4-8h=1.00 8-16h=1.00 16h-1d=1.00 1-2d=1.00 2-4d=1.00 4-7d=0.70" +
 				" e4f 0-1h:R:len30m:end0=7.90x/b0.52/lambda0.10/clip 2-4h:C:day-0=1.20x/b-0.31/lambda0.00" +
-				" e4floor count=2 1-2d:W:wk-1:7 4-7d:C:day-7:9" +
+				" e4floor count=2 1-2d:workday:9:W:wk-1:7 4-7d:weekend:23:C:day-7:9" +
 				" pool=workday:23 median=98.0 p90=152.0 workStart=08:05" +
 				` k: ${A}/five_hour=1.9877 own instances=6 points=41 oldestH=312.5 newestH=0.3;` +
 				` ${A}/seven_day=0.1504 own instances=3 points=12.5 oldestH=160.0 newestH=1.5;` +
@@ -178,6 +190,8 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 	it("lists every cell below the floor after their count", () => {
 		const many = Array.from({ length: 15 }, (_, i) => ({
 			band: "1-2d",
+			dayType: "monday",
+			hour: i,
 			feature: `C:day-${i}`,
 			units: i,
 		}));
@@ -189,9 +203,11 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 			},
 			NOW,
 		);
-		expect(line).toContain("e4floor count=15 1-2d:C:day-0:0 ");
-		expect(line).toContain(" 1-2d:C:day-11:11 1-2d:C:day-12:12 ");
-		expect(line).toContain(" 1-2d:C:day-14:14 pool=");
+		expect(line).toContain("e4floor count=15 1-2d:monday:0:C:day-0:0 ");
+		expect(line).toContain(
+			" 1-2d:monday:11:C:day-11:11 1-2d:monday:12:C:day-12:12 ",
+		);
+		expect(line).toContain(" 1-2d:monday:14:C:day-14:14 pool=");
 		expect(line).not.toContain("more=");
 	});
 
@@ -252,7 +268,13 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 				cellsEstablished: 5,
 				cellsTotal: 216,
 				belowFloor: [
-					{ band: "1-2d", feature: "/Users/x y", units: Number.NaN },
+					{
+						band: "1-2d",
+						dayType: "x y" as "workday",
+						hour: Number.NaN,
+						feature: "/Users/x y",
+						units: Number.NaN,
+					},
 				],
 			},
 		});
@@ -261,7 +283,7 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 			"e4=fitted fitAge=? days=? weeks=12 cells=5/216 e4m ?=? 1-2h=1.50",
 		);
 		expect(line).toContain("e4f ?:?=?x/b?/lambda?/clip 2-4h:");
-		expect(line).toContain("e4floor count=1 1-2d:?:? pool=");
+		expect(line).toContain("e4floor count=1 1-2d:?:?:?:? pool=");
 		expect(line).toContain(
 			"pool=weekend:4 median=none p90=none workStart=none",
 		);
