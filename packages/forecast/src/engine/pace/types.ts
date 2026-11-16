@@ -56,10 +56,19 @@ export interface PaceFitState {
 	cellsTotal: number;
 	/**
 	 * Bands without a selection whose best candidate passed every screening test but the evidence
-	 * floor (BH at q and positive out-of-fold R^2, with fewer independent units than the floor).
-	 * It would be screened in once enough units accrue with the same result; that is not a promise.
+	 * floor (BH at q and positive out-of-fold R^2, with fewer independent units than the floor),
+	 * one entry per hour cell of the band that passes the per-cell gate (positive out-of-fold
+	 * R^2) with that candidate: the cells that would switch on by themselves once enough units
+	 * accrue with the same result; that is not a promise.
 	 */
-	belowFloor: { band: string; feature: string; units: number }[];
+	belowFloor: {
+		band: string;
+		feature: string;
+		units: number;
+		/** The hour cell: target day type and origin hour (local). */
+		dayType: PaceDayTypeName;
+		hour: number;
+	}[];
 	/** Slot means (288 local five-minute slots) per served day type, from the complete days before the fit. */
 	baseline: Record<PaceDayTypeName, number[]>;
 	/** Per band in PACE_BANDS order: the pooled selection and its established hour cells. */

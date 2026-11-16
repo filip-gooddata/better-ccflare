@@ -94,6 +94,7 @@ const LIMITS = new Set(["five_hour", "seven_day", "seven_day_fable"]);
 const SOURCES = new Set(["own", "borrowed", "none"]);
 const PACE_STATUSES = new Set(["fitted", "unfitted", "off"]);
 const BAND_IDS = new Set(PACE_BANDS.map((b) => b.id));
+const DAY_TYPE_IDS = new Set(["workday", "monday", "weekend"]);
 const FEATURE_ID = /^[A-Za-z0-9:_.+-]{1,64}$/;
 
 function fixed(v: unknown, digits: number): string {
@@ -132,7 +133,8 @@ function featureId(v: unknown): string {
  * Today's pace (E4, requirement 11): status, the fit's age in minutes and the days, ISO weeks
  * and established cells it saw; the multiplier per band now; the selected feature per band
  * with today's ratio to its baseline, its coefficient, its ridge lambda and whether it was
- * clipped to its training range; the cells below the evidence floor with their units.
+ * clipped to its training range; the cells below the evidence floor (band, day type, origin
+ * hour, feature) with their units.
  */
 function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 	const model = d.paceModel;
@@ -145,7 +147,8 @@ function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 		);
 	const below = model?.belowFloor ?? [];
 	const listed = below.map(
-		(c) => `${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
+		(c) =>
+			`${word(c.band, BAND_IDS)}:${word(c.dayType, DAY_TYPE_IDS)}:${num(c.hour)}:${featureId(c.feature)}:${num(c.units)}`,
 	);
 	return [
 		`e4=${word(d.pace.status, PACE_STATUSES)}`,

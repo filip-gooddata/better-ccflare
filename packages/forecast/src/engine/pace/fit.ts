@@ -198,7 +198,7 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 		const res = fitBand(cal, ctx, grammar, R, folds, finalSums, floor);
 		bands.push(res.fit);
 		cellsEstablished += res.fit.cells.length;
-		if (res.below) belowFloor.push(res.below);
+		belowFloor.push(...res.below);
 	}
 
 	const days = cal.days.filter(
@@ -258,7 +258,7 @@ function fitBand(
 	folds: Fold[],
 	finalSums: SpanSums,
 	floor: number,
-): { fit: PaceBandFit; below: PaceFitState["belowFloor"][number] | null } {
+): { fit: PaceBandFit; below: PaceFitState["belowFloor"] } {
 	const id = (PACE_BANDS[R.band] as { id: string }).id;
 	const inWeek = (d: number, wk: number) =>
 		(cal.days[d] as { week: number }).week === wk;
@@ -451,8 +451,9 @@ function fitBand(
 	}
 
 	// hour cells: band x target day type x origin hour, kernel weights
-	const cells: PaceCellFit[] = [];
-	if (sel.length) {
+	const hourCellFits = (sel: number[]): PaceCellFit[] => {
+		const cells: PaceCellFit[] = [];
+		if (!sel.length) return cells;
 		const long = sel.some((v) => (grammar[v] as PaceCandidate).long);
 		const hourCells = new Map<number, CellRows>();
 		for (let q = 0; q < R.n; q++)
@@ -527,25 +528,31 @@ function fitBand(
 				rows: tr.length,
 			});
 		}
-	}
+		return cells;
+	};
+	const cells = hourCellFits(sel);
 
 	const step = steps[0];
 	const feature =
 		sel.length && cells.length
 			? (grammar[sel[0] as number] as PaceCandidate)
 			: null;
-	let below: PaceFitState["belowFloor"][number] | null = null;
+	const below: PaceFitState["belowFloor"] = [];
 	if (!feature) {
 		// Passed every screening test but the evidence floor: BH and positive out-of-fold R^2.
+		// Listed per hour cell that would pass the same per-cell gate once selected.
 		const cand = stats
 			.filter((s) => s.bh && s.r2 > 0 && s.nUnits < floor)
 			.sort((a, b) => a.p - b.p || b.r2 - a.r2)[0];
 		if (cand)
-			below = {
-				band: id,
-				feature: (grammar[cand.cand] as PaceCandidate).id,
-				units: cand.nUnits,
-			};
+			for (const c of hourCellFits([cand.cand]))
+				below.push({
+					band: id,
+					feature: (grammar[cand.cand] as PaceCandidate).id,
+					units: cand.nUnits,
+					dayType: c.dayType,
+					hour: c.hour,
+				});
 	}
 	return {
 		fit: {
