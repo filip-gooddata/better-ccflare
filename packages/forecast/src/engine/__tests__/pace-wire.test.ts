@@ -5,7 +5,11 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ForecastInput } from "../../types";
-import { createForecastEngine, currentPace, prepareEngineContext } from "../engine";
+import {
+	createForecastEngine,
+	currentPace,
+	prepareEngineContext,
+} from "../engine";
 import {
 	type PaceFitState,
 	type PaceNow,

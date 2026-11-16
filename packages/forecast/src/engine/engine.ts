@@ -43,12 +43,7 @@ import type {
 	PlanLowPoints,
 	RecordedDay,
 } from "./model";
-import {
-	applyPace,
-	buildPaceSeries,
-	type PaceNow,
-	plainPace,
-} from "./pace";
+import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
@@ -159,13 +154,7 @@ async function prepare(
 	await yieldToEventLoop();
 
 	const pace = currentPace(input);
-	const scenarios = await buildScenarios(
-		input,
-		table,
-		horizon,
-		options,
-		pace,
-	);
+	const scenarios = await buildScenarios(input, table, horizon, options, pace);
 	await yieldToEventLoop();
 	const workStart = workStartMinute(
 		table,

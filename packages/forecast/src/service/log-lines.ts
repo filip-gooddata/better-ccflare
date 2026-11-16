@@ -136,10 +136,7 @@ function featureId(v: unknown): string {
  * with today's ratio to its baseline, its coefficient, its ridge lambda and whether it was
  * clipped to its training range; the cells below the evidence floor with their units.
  */
-function paceFields(
-	d: ForecastInputsDetail,
-	now: EpochMs,
-): string[] {
+function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 	const model = d.paceModel;
 	const bands = d.pace.bands;
 	const selected = bands
@@ -152,7 +149,8 @@ function paceFields(
 	const listed = below
 		.slice(0, BELOW_FLOOR_LISTED)
 		.map(
-			(c) => `${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
+			(c) =>
+				`${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
 		);
 	const more = below.length - listed.length;
 	return [

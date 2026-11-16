@@ -173,7 +173,6 @@ describe("scaleBandwidth", () => {
 	});
 });
 
-
 describe("buildScenarios", () => {
 	function setup(now: EpochMs, over: Partial<ForecastSettings> = {}) {
 		const input = makeInput(now, over);
@@ -195,7 +194,13 @@ describe("buildScenarios", () => {
 
 	test("shape, bucket 0 holds now, diagnostics", async () => {
 		const { input, table, horizon } = setup(NOW, { simulatedDays: 20 });
-		const sc = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		expect(sc.start).toBe(Math.floor(NOW / BUCKET_MS) * BUCKET_MS);
 		expect(sc.bucketCount).toBe(
 			Math.floor((horizon.simEnd - 1 - sc.start) / BUCKET_MS) + 1,
@@ -227,7 +232,13 @@ describe("buildScenarios", () => {
 			simulatedDays: 60,
 			recentTauMin: 0.001,
 		});
-		const sc = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			PLAIN,
+		);
 		expect(sc.diagnostics.noise).toBe(false);
 		const todayStart = localDayStart(NOW, TZ);
 		const checks: [string, number, RecordedDay[]][] = [
@@ -433,8 +444,20 @@ describe("buildScenarios", () => {
 			recentTauMin: 0.001,
 			timeShiftMin: 0,
 		});
-		const off = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
-		const on = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
+		const off = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			PLAIN,
+		);
+		const on = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		const [b0, b1] = dateRange(
 			off.start,
 			"2026-11-13",
@@ -457,8 +480,20 @@ describe("buildScenarios", () => {
 			simulatedDays: 40,
 			recentTauMin: 0.001,
 		});
-		const a = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
-		const b = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
+		const a = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
+		const b = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		expect(b.units).toEqual(a.units);
 		expect(b.fable).toEqual(a.fable);
 		// same day, an hour later: the same draws for later dates
@@ -466,9 +501,15 @@ describe("buildScenarios", () => {
 			simulatedDays: 40,
 			recentTauMin: 0.001,
 		});
-		const c = await buildScenarios(later.input, later.table, later.horizon, {
-			noise: true,
-		}, PLAIN);
+		const c = await buildScenarios(
+			later.input,
+			later.table,
+			later.horizon,
+			{
+				noise: true,
+			},
+			PLAIN,
+		);
 		const fri = addLocalDays(localDayStart(NOW, TZ), 1, TZ);
 		const ia = (fri - a.start) / BUCKET_MS;
 		const ic = (fri - c.start) / BUCKET_MS;
@@ -480,10 +521,15 @@ describe("buildScenarios", () => {
 			...table,
 			today: { ...table.today, key: "2026-11-13" },
 		};
-		const d = await buildScenarios(input, other, horizon, { noise: true }, PLAIN);
+		const d = await buildScenarios(
+			input,
+			other,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		expect(d.units).not.toEqual(a.units);
 	});
-
 
 	test("a longer horizon leaves the draws of the shared dates unchanged", async () => {
 		const input = makeInput(NOW, { simulatedDays: 30, recentTauMin: 0.001 });
@@ -509,9 +555,15 @@ describe("buildScenarios", () => {
 			days: table.days.filter((d) => d.type !== "weekend"),
 		};
 		expect(poolFor(noWeekends, "weekend")).toEqual([]);
-		const sc = await buildScenarios(input, noWeekends, horizon, {
-			noise: false,
-		}, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			noWeekends,
+			horizon,
+			{
+				noise: false,
+			},
+			PLAIN,
+		);
 		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
 		const [b0] = dateRange(sc.start, "2026-11-14", sat);
 		for (const u of sc.units) {
@@ -540,9 +592,15 @@ describe("buildScenarios", () => {
 		expect(weekends.length).toBe(8);
 		for (const d of weekends) expect(d.total).toBe(0);
 		const horizon = computeHorizon(NOW, input.accounts, TZ);
-		const sc = await buildScenarios(weekdaysOnly, table, horizon, {
-			noise: true,
-		}, PLAIN);
+		const sc = await buildScenarios(
+			weekdaysOnly,
+			table,
+			horizon,
+			{
+				noise: true,
+			},
+			PLAIN,
+		);
 		expect(sc.diagnostics.bandwidths["2026-11-14"]).toBe(0);
 		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
 		const [b0, b1] = dateRange(sc.start, "2026-11-14", sat);
@@ -574,7 +632,13 @@ describe("buildScenarios", () => {
 			};
 		});
 		const handmade: DayTable = { days, today: table.today };
-		const sc = await buildScenarios(input, handmade, horizon, { noise: true }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			handmade,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		expect(sc.diagnostics.bandwidths["2026-11-13"]).toBe(0);
 		const fri = addLocalDays(todayStart, 1, TZ);
 		const [b0] = dateRange(sc.start, "2026-11-13", fri);
@@ -603,7 +667,13 @@ describe("buildScenarios", () => {
 			simulatedDays: 20,
 			recentTauMin: 0.001,
 		});
-		const sc = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			PLAIN,
+		);
 		const sun = addLocalDays(localDayStart(now, TZ), 2, TZ);
 		const [b0, b1] = dateRange(sc.start, "2026-03-29", sun);
 		expect(b1 - b0).toBe(276);
@@ -635,7 +705,13 @@ describe("buildScenarios", () => {
 		};
 		setImmediate(tick);
 		const t0 = performance.now();
-		const sc = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
 		const wall = performance.now() - t0;
 		running = false;
 		console.log(
@@ -739,7 +815,13 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 			};
 		});
 		const handmade: DayTable = { days: pool, today: table.today };
-		const sc = await buildScenarios(input, handmade, horizon, { noiseMode }, PLAIN);
+		const sc = await buildScenarios(
+			input,
+			handmade,
+			horizon,
+			{ noiseMode },
+			PLAIN,
+		);
 		expect(sc.diagnostics.noiseMode).toBe(noiseMode);
 		expect(sc.diagnostics.noise).toBe(noiseMode !== "off");
 		const fri = addLocalDays(todayStart, 1, TZ);

@@ -4,12 +4,7 @@
  * scaled by today's pace (E4) at its distance ahead of now.
  */
 import { interquartileRange, sampleStandardDeviation } from "simple-statistics";
-import {
-	addLocalDays,
-	localDayKey,
-	localDayStart,
-	localParts,
-} from "../time";
+import { addLocalDays, localDayKey, localDayStart, localParts } from "../time";
 import type { ForecastInput } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, poolFor } from "./days";

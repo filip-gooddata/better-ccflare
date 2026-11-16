@@ -1,13 +1,13 @@
 /** The forecast-inputs log line (design amendment 4, D2): content, change rule, 10-minute bound. */
 import { describe, expect, it } from "bun:test";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
+import { type PaceNow, plainPace } from "../../engine/pace";
 import type {
 	ForecastInputsDetail,
 	ForecastResponse,
 	ForecastResult,
 	Plan,
 } from "../../types";
-import { type PaceNow, plainPace } from "../../engine/pace";
 import {
 	createInputsLog,
 	INPUTS_MIN_SPACING_MS,
@@ -116,7 +116,11 @@ function detail(
 }
 
 /** The detail with the first band's multiplier and the first k replaced. */
-function withM(m: number, k = 1.98766, fittedAt = NOW - 12.4 * MIN): ForecastInputsDetail {
+function withM(
+	m: number,
+	k = 1.98766,
+	fittedAt = NOW - 12.4 * MIN,
+): ForecastInputsDetail {
 	const d = detail();
 	return {
 		...d,
@@ -179,7 +183,10 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		}));
 		const d = detail();
 		const line = inputsLine(
-			{ ...d, paceModel: d.paceModel ? { ...d.paceModel, belowFloor: many } : null },
+			{
+				...d,
+				paceModel: d.paceModel ? { ...d.paceModel, belowFloor: many } : null,
+			},
 			NOW,
 		);
 		expect(line).toContain("e4floor count=15 1-2d:C:day-0:0 ");
@@ -200,9 +207,9 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 			` ${B}/five_hour=1.9877 borrowed instances=0 points=0 oldestH=none newestH=none` +
 				` cap: ${A} r=13.22 binds=no; ${B} r=none binds=no lowPoint=59.9 lowPointOnDemand=-13.8`,
 		);
-		expect(inputsLine({ ...detail(), lowPoint: Number.NaN }, NOW)).not.toContain(
-			"lowPoint",
-		);
+		expect(
+			inputsLine({ ...detail(), lowPoint: Number.NaN }, NOW),
+		).not.toContain("lowPoint");
 	});
 
 	it("prints nothing but numbers, fixed words and account ids", () => {
@@ -243,7 +250,9 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 				weeks: 12,
 				cellsEstablished: 5,
 				cellsTotal: 216,
-				belowFloor: [{ band: "1-2d", feature: "/Users/x y", units: Number.NaN }],
+				belowFloor: [
+					{ band: "1-2d", feature: "/Users/x y", units: Number.NaN },
+				],
 			},
 		});
 		const line = inputsLine(d, NOW);
@@ -332,8 +341,14 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 	it("is written when the pace status changes", () => {
 		const lines: string[] = [];
 		const log = createInputsLog((m) => lines.push(m));
-		log.record(available(detail({ pace: plainPace("unfitted"), paceModel: null })), NOW);
-		log.record(available(detail({ pace: plainPace("off"), paceModel: null })), NOW + 11 * MIN);
+		log.record(
+			available(detail({ pace: plainPace("unfitted"), paceModel: null })),
+			NOW,
+		);
+		log.record(
+			available(detail({ pace: plainPace("off"), paceModel: null })),
+			NOW + 11 * MIN,
+		);
 		expect(lines.length).toBe(2);
 		expect(lines[1]).toStartWith("forecast inputs e4=off ");
 	});
