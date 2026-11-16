@@ -94,6 +94,9 @@ describe("UsageCollector - cache write split", () => {
 
 	afterAll(() => {
 		collector.dispose();
+		// The factory is a process-wide singleton: later test files must not
+		// inherit this connection after its file is deleted.
+		DatabaseFactory.reset();
 		if (existsSync(TEST_DB_PATH)) unlinkSync(TEST_DB_PATH);
 	});
 
