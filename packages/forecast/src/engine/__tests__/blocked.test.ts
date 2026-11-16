@@ -199,6 +199,7 @@ describe("day.past ends at the current point", () => {
 			fiveHour: { usedPct: 30, resetsAt: NOW + 2 * HOUR },
 			weekly: { usedPct: 10, resetsAt: NOW + 100 * HOUR },
 			blockedUntil: NOW + 5 * HOUR,
+			blockedSince: null,
 		});
 		const b = responseAccount("acct-b", {
 			fiveHour: { usedPct: 40, resetsAt: NOW + 3 * HOUR },
@@ -222,5 +223,62 @@ describe("day.past ends at the current point", () => {
 		const past = pastSeries(ctx, "day");
 		expect(past.times.at(-1)).toBe(NOW);
 		expect(past.values.at(-1)).toBe(60);
+	});
+});
+
+describe("day.past carries a running cooldown from blockedSince", () => {
+	test("the blocked account counts 0 from blockedSince, as a jump, through a reading at now", () => {
+		const since = NOW - HOUR;
+		const a = responseAccount("acct-a", {
+			fiveHour: { usedPct: 30, resetsAt: NOW + 2 * HOUR },
+			weekly: { usedPct: 10, resetsAt: NOW + 100 * HOUR },
+			blockedUntil: NOW + 5 * HOUR,
+			blockedSince: since,
+		});
+		const b = responseAccount("acct-b", {
+			fiveHour: { usedPct: 40, resetsAt: NOW + 3 * HOUR },
+			weekly: { usedPct: 10, resetsAt: NOW + 100 * HOUR },
+			blockedUntil: null,
+			blockedSince: null,
+		});
+		const readings: LimitReading[] = [];
+		for (const at of [NOW - 2 * HOUR, NOW]) {
+			readings.push(
+				{
+					accountId: "acct-a",
+					window: "five_hour",
+					at,
+					usedPct: 30,
+					resetsAt: NOW + 2 * HOUR,
+				},
+				{
+					accountId: "acct-a",
+					window: "seven_day",
+					at,
+					usedPct: 10,
+					resetsAt: NOW + 100 * HOUR,
+				},
+				{
+					accountId: "acct-b",
+					window: "five_hour",
+					at,
+					usedPct: 40,
+					resetsAt: NOW + 3 * HOUR,
+				},
+				{
+					accountId: "acct-b",
+					window: "seven_day",
+					at,
+					usedPct: 10,
+					resetsAt: NOW + 100 * HOUR,
+				},
+			);
+		}
+		const past = pastSeries(
+			makeResponseCtx({ accounts: [a, b], readings }),
+			"day",
+		);
+		expect(past.times).toEqual([NOW - 2 * HOUR, since, since, NOW]);
+		expect(past.values).toEqual([130, 130, 60, 60]);
 	});
 });

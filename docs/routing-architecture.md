@@ -378,6 +378,7 @@ Only `session-pace` takes advice, only when `routing` is on, and only for reques
   `session-pace move session=<tag> from=<name> to=<name> rule=forecast-move reason=<reason> gain=<points> cost=<points>`.
 - The model-family (Fable) guard stays hard. The all-limited rule is unchanged and decides as before when every account is out.
 - A standing Fable [family block](#family-blocks) reaches the forecast as the account's Fable limit used up (100%) until the block lifts, with or without a usage reading; the account's `blockedUntil` stays empty, because a family refusal writes no account cooldown, so the forecast still counts the account as open for other models.
+- An account in a refusal cooldown running now counts 0 and out from the cooldown's start in `day.past`, `stopNow.start` and `pastStops`. The start is the first refusal of that cooldown the proxy has seen since it started; after a restart it is the latest refusal stored for the account. A cooldown that has ended is not recorded, so it appears in none of the three.
 
 **Fallback**: when `routing` is off, the forecast is disabled, the result is stale or missing, the engine failed, or the advisor fails, session-pace gets no advice and routes exactly as pace.3 did.
 

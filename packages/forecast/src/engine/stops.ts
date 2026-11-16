@@ -14,6 +14,7 @@ import {
 	accountLeft,
 	capRatio,
 	comesBackAt,
+	cooldownSince,
 	outSince,
 	type Quantity,
 } from "./past";
@@ -160,10 +161,10 @@ interface CurrentStop {
 
 /**
  * The stop running now (spec section 5), a fact from the accounts as last read:
- * every counted account out. `start` = when the last one went out per the
- * readings (an account whose going out the readings do not show, such as a
- * refusal cooldown, counts from its last read, the latest time it is known
- * out); `end` = the earliest moment one comes back.
+ * every counted account out. `start` = when the last one went out: per account
+ * the earlier of the start of its out run in the readings and (day) the start of
+ * its running refusal cooldown; with neither known, its last read, the latest
+ * time it is known out. `end` = the earliest moment one comes back.
  */
 function currentStop(
 	ctx: EngineContext,
@@ -176,9 +177,16 @@ function currentStop(
 		if (at === null) return null;
 		back.push(at);
 	}
-	const outAt = ctx.accounts.map(
-		(a, i) => outSince(ctx, i, quantity) ?? Math.min(a.readAt, ctx.now),
-	);
+	const outAt = ctx.accounts.map((a, i) => {
+		const limits = outSince(ctx, i, quantity);
+		const cooldown = quantity === "day" ? cooldownSince(a, ctx.now) : null;
+		if (limits === null && cooldown === null)
+			return Math.min(a.readAt, ctx.now);
+		return Math.min(
+			limits ?? Number.POSITIVE_INFINITY,
+			cooldown ?? Number.POSITIVE_INFINITY,
+		);
+	});
 	let last = 0;
 	outAt.forEach((at, i) => {
 		if (at > outAt[last]) last = i;

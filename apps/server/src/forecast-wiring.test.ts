@@ -58,6 +58,7 @@ import {
 import { createUnservedApiGuard } from "./api-guard";
 import {
 	awaitForecastStop,
+	type CooldownStarts,
 	createForecastWiring,
 	type ForecastRunnerContext,
 	type ForecastWiring,
@@ -125,11 +126,16 @@ async function insertClaude(
 	dbOps: DatabaseOperations,
 	id: string,
 	name: string,
-	over: { paused?: number; requiresReauth?: number; cooldown?: number } = {},
+	over: {
+		paused?: number;
+		requiresReauth?: number;
+		cooldown?: number;
+		stamp?: number;
+	} = {},
 ): Promise<void> {
 	await dbOps.getAdapter().run(
-		`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, paused, requires_reauth, rate_limited_until)
-			 VALUES (?, ?, 'anthropic', ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at, paused, requires_reauth, rate_limited_until, rate_limited_at)
+			 VALUES (?, ?, 'anthropic', ?, ?, ?, ?, ?, ?, ?)`,
 		[
 			id,
 			name,
@@ -139,6 +145,7 @@ async function insertClaude(
 			over.paused ?? 0,
 			over.requiresReauth ?? 0,
 			over.cooldown ?? null,
+			over.stamp ?? null,
 		],
 	);
 }
@@ -627,6 +634,139 @@ describe("loadClaudeLimits", () => {
 				expect(l.fable).toEqual({ usedPct: 7, resetsAt: NOW + DAY });
 				expect(l.blockedUntil).toBeNull();
 			}
+		});
+	});
+
+	describe("blockedSince", () => {
+		const noUsage = { get: () => null };
+
+		async function sinceAt(
+			dbOps: DatabaseOperations,
+			now: EpochMs,
+			starts: CooldownStarts,
+		): Promise<EpochMs | null | undefined> {
+			const limits = await loadClaudeLimits(
+				dbOps,
+				noUsage,
+				now,
+				() => null,
+				starts,
+			);
+			return limits.find((l) => l.accountId === "a")?.blockedSince;
+		}
+
+		async function refuse(
+			dbOps: DatabaseOperations,
+			until: number | null,
+			stamp: number | null,
+		): Promise<void> {
+			await dbOps
+				.getAdapter()
+				.run(
+					"UPDATE accounts SET rate_limited_until = ?, rate_limited_at = ? WHERE id = ?",
+					[until, stamp, "a"],
+				);
+		}
+
+		it("is the refusal stamp while the cooldown runs", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			expect(await sinceAt(dbOps, NOW, new Map())).toBe(NOW - 10 * MIN);
+		});
+
+		it("keeps the first stamp when a later refusal extends the cooldown", async () => {
+			const dbOps = tempDb();
+			const starts: CooldownStarts = new Map();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			expect(await sinceAt(dbOps, NOW, starts)).toBe(NOW - 10 * MIN);
+			await refuse(dbOps, NOW + 2 * HOUR, NOW + 5 * MIN);
+			expect(await sinceAt(dbOps, NOW + 10 * MIN, starts)).toBe(NOW - 10 * MIN);
+		});
+
+		it("forgets the cooldown once it clears, so the next one starts from its own stamp", async () => {
+			const dbOps = tempDb();
+			const starts: CooldownStarts = new Map();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			expect(await sinceAt(dbOps, NOW, starts)).toBe(NOW - 10 * MIN);
+			await refuse(dbOps, null, NOW - 10 * MIN);
+			expect(await sinceAt(dbOps, NOW + 5 * MIN, starts)).toBeNull();
+			expect(starts.has("a")).toBe(false);
+			await refuse(dbOps, NOW + 3 * HOUR, NOW + 20 * MIN);
+			expect(await sinceAt(dbOps, NOW + 30 * MIN, starts)).toBe(NOW + 20 * MIN);
+		});
+
+		it("forgets a cooldown that has run out although its end lingers", async () => {
+			const dbOps = tempDb();
+			const starts: CooldownStarts = new Map();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			expect(await sinceAt(dbOps, NOW, starts)).toBe(NOW - 10 * MIN);
+			expect(await sinceAt(dbOps, NOW + 2 * HOUR, starts)).toBeNull();
+			expect(starts.has("a")).toBe(false);
+			await refuse(dbOps, NOW + 4 * HOUR, NOW + 3 * HOUR);
+			expect(await sinceAt(dbOps, NOW + 3 * HOUR + MIN, starts)).toBe(
+				NOW + 3 * HOUR,
+			);
+		});
+
+		it("treats a stamp after the remembered cooldown end as a new cooldown", async () => {
+			const dbOps = tempDb();
+			const starts: CooldownStarts = new Map();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			expect(await sinceAt(dbOps, NOW, starts)).toBe(NOW - 10 * MIN);
+			// The first cooldown ended and a second began between two loads.
+			await refuse(dbOps, NOW + 3 * HOUR, NOW + 2 * HOUR);
+			expect(await sinceAt(dbOps, NOW + 2 * HOUR + MIN, starts)).toBe(
+				NOW + 2 * HOUR,
+			);
+		});
+
+		it("is null without a stamp or with a stamp after now", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha", { cooldown: NOW + HOUR });
+			expect(await sinceAt(dbOps, NOW, new Map())).toBeNull();
+			await refuse(dbOps, NOW + HOUR, NOW + MIN);
+			expect(await sinceAt(dbOps, NOW, new Map())).toBeNull();
+		});
+
+		it("is null when the cooldown is over although the stamp lingers", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW - MIN,
+				stamp: NOW - HOUR,
+			});
+			expect(await sinceAt(dbOps, NOW, new Map())).toBeNull();
+			await refuse(dbOps, null, NOW - HOUR);
+			expect(await sinceAt(dbOps, NOW, new Map())).toBeNull();
+		});
+
+		it("falls back to the stored stamp after a fresh start", async () => {
+			const dbOps = tempDb();
+			const before: CooldownStarts = new Map();
+			await insertClaude(dbOps, "a", "alpha", {
+				cooldown: NOW + HOUR,
+				stamp: NOW - 10 * MIN,
+			});
+			await sinceAt(dbOps, NOW, before);
+			await refuse(dbOps, NOW + 2 * HOUR, NOW + 5 * MIN);
+			// A restarted proxy starts with empty memory.
+			expect(await sinceAt(dbOps, NOW + 10 * MIN, new Map())).toBe(
+				NOW + 5 * MIN,
+			);
 		});
 	});
 });

@@ -14,6 +14,7 @@ function account(weeklyReset: number | null): AccountLimits {
 		weekly: { usedPct: 10, resetsAt: weeklyReset },
 		fable: null,
 		blockedUntil: null,
+		blockedSince: null,
 		readAt: 0,
 	};
 }

@@ -58,6 +58,7 @@ export function limits(
 		weekly: { usedPct: 10, resetsAt: readAt + 3 * 24 * H },
 		fable: null,
 		blockedUntil: null,
+		blockedSince: null,
 		readAt,
 		...over,
 	};
