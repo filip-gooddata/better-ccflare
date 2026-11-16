@@ -192,6 +192,12 @@ export interface RequestData {
 		inputTokens?: number;
 		cacheReadInputTokens?: number;
 		cacheCreationInputTokens?: number;
+		/**
+		 * The 5-minute / 1-hour split of cacheCreationInputTokens as upstream
+		 * reported it; null or absent when it reported none. 0 is a reported 0.
+		 */
+		cacheCreation5mInputTokens?: number | null;
+		cacheCreation1hInputTokens?: number | null;
 		outputTokens?: number;
 		tokensPerSecond?: number;
 		/**
@@ -207,6 +213,11 @@ export interface RequestData {
 		 */
 		completionTier?: string;
 	};
+}
+
+/** A reported split count, keeping a reported 0; anything else is unknown (NULL). */
+function splitTokens(value: number | null | undefined): number | null {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 export class RequestRepository extends BaseRepository<RequestData> {
@@ -242,9 +253,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				stream_terminal_state, client_session_id,
 				gateway_hint_request_class, gateway_hint_agent_type,
 				gateway_hint_prev_tool_durations, gateway_hint_compaction,
-				gateway_hint_context_compacted, provider_served, completion_tier
+				gateway_hint_context_compacted, provider_served, completion_tier,
+				cache_creation_5m_input_tokens, cache_creation_1h_input_tokens
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 				timestamp = EXCLUDED.timestamp,
 				method = EXCLUDED.method,
@@ -294,6 +306,10 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				-- so a later save without it cannot blank out what the main path
 				-- recorded.
 				client_session_id = COALESCE(EXCLUDED.client_session_id, requests.client_session_id),
+				-- The cache write split is reported once, with the usage the main
+				-- path saves; a re-save without it (error paths) must not blank it.
+				cache_creation_5m_input_tokens = COALESCE(EXCLUDED.cache_creation_5m_input_tokens, requests.cache_creation_5m_input_tokens),
+				cache_creation_1h_input_tokens = COALESCE(EXCLUDED.cache_creation_1h_input_tokens, requests.cache_creation_1h_input_tokens),
 				-- Same preserve-first reasoning as client_session_id: these are
 				-- extracted once from the request headers at start and a re-save
 				-- (error paths, updateUsage-adjacent saves) never carries them, so
@@ -351,6 +367,8 @@ export class RequestRepository extends BaseRepository<RequestData> {
 				data.gatewayHintContextCompacted || null,
 				usage?.providerServed || null,
 				usage?.completionTier || null,
+				splitTokens(usage?.cacheCreation5mInputTokens),
+				splitTokens(usage?.cacheCreation1hInputTokens),
 			],
 		);
 	}

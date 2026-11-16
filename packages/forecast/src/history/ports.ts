@@ -31,6 +31,11 @@ export interface ClaudeRequestUsageRow {
 	outputTokens: number;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
+	/** Raw client session id: only hashed into a session key, never stored or logged. */
+	clientSessionId: string | null;
+	/** Null when upstream did not report the 5-minute / 1-hour split. */
+	cacheWrite5mTokens: number | null;
+	cacheWrite1hTokens: number | null;
 }
 
 export interface UsageSnapshotDbRow {

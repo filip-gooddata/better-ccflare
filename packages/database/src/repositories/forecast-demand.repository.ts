@@ -1,7 +1,5 @@
-import { convertPlaceholders } from "../adapters/bun-sql-adapter";
+import { type Statement, writeAtomically } from "./atomic-write";
 import { BaseRepository } from "./base.repository";
-
-type Statement = [sql: string, values: unknown[]];
 
 /** One row of `forecast_demand`: demand of one account and source in one bucket. */
 export interface ForecastDemandRow {
@@ -31,6 +29,11 @@ export interface ClaudeOAuthRequestUsage {
 	outputTokens: number;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
+	/** requests.client_session_id; held only in memory while hashing to a session key. */
+	clientSessionId: string | null;
+	/** NULL when upstream did not report the 5-minute / 1-hour split. */
+	cacheWrite5mTokens: number | null;
+	cacheWrite1hTokens: number | null;
 }
 
 interface DemandDbRow {
@@ -57,6 +60,9 @@ interface UsageDbRow {
 	output_tokens: number;
 	cache_read_tokens: number;
 	cache_write_tokens: number;
+	client_session_id: string | null;
+	cache_write_5m_tokens: number | null;
+	cache_write_1h_tokens: number | null;
 }
 
 const UPSERT_SQL = `INSERT INTO forecast_demand
@@ -79,7 +85,10 @@ const CLAUDE_OAUTH_USAGE_SQL = `SELECT r.timestamp AS timestamp,
 		COALESCE(r.input_tokens, 0) AS input_tokens,
 		COALESCE(r.output_tokens, 0) AS output_tokens,
 		COALESCE(r.cache_read_input_tokens, 0) AS cache_read_tokens,
-		COALESCE(r.cache_creation_input_tokens, 0) AS cache_write_tokens
+		COALESCE(r.cache_creation_input_tokens, 0) AS cache_write_tokens,
+		r.client_session_id AS client_session_id,
+		r.cache_creation_5m_input_tokens AS cache_write_5m_tokens,
+		r.cache_creation_1h_input_tokens AS cache_write_1h_tokens
 	FROM requests r
 	JOIN accounts a ON a.id = r.account_used
 	WHERE r.timestamp >= ? AND r.timestamp < ?
@@ -91,6 +100,10 @@ const CLAUDE_OAUTH_USAGE_SQL = `SELECT r.timestamp AS timestamp,
 			+ COALESCE(r.cache_read_input_tokens, 0)
 			+ COALESCE(r.cache_creation_input_tokens, 0) > 0
 	ORDER BY r.timestamp, r.id`;
+
+function nullableNumber(value: number | null): number | null {
+	return value == null ? null : Number(value);
+}
 
 function toRow(row: DemandDbRow): ForecastDemandRow {
 	return {
@@ -143,26 +156,8 @@ export class ForecastDemandRepository extends BaseRepository<ForecastDemandRow> 
 		]);
 	}
 
-	/**
-	 * Run the statements in one transaction. BunSqlAdapter.transaction does not
-	 * bind statements to the transaction, so each dialect's own API is used.
-	 */
-	private async writeAtomically(statements: Statement[]): Promise<void> {
-		if (this.adapter.isSQLite) {
-			const db = this.adapter.getSQLiteDb();
-			db.transaction(() => {
-				for (const [sql, values] of statements) {
-					db.prepare(sql).run(...(values as [number]));
-				}
-			})();
-			return;
-		}
-		await this.adapter.getSQL().begin(async (tx) => {
-			for (const [sql, values] of statements) {
-				// biome-ignore lint/suspicious/noExplicitAny: Bun.SQL accepts various binding types
-				await tx.unsafe(convertPlaceholders(sql), values as any[]);
-			}
-		});
+	private writeAtomically(statements: Statement[]): Promise<void> {
+		return writeAtomically(this.adapter, statements);
 	}
 
 	/** Buckets in [from, to) summed over accounts and sources, ascending, empty ones omitted. */
@@ -251,6 +246,9 @@ export class ForecastDemandRepository extends BaseRepository<ForecastDemandRow> 
 			outputTokens: Number(row.output_tokens),
 			cacheReadTokens: Number(row.cache_read_tokens),
 			cacheWriteTokens: Number(row.cache_write_tokens),
+			clientSessionId: row.client_session_id ?? null,
+			cacheWrite5mTokens: nullableNumber(row.cache_write_5m_tokens),
+			cacheWrite1hTokens: nullableNumber(row.cache_write_1h_tokens),
 		}));
 	}
 }

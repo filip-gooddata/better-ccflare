@@ -136,6 +136,8 @@ export async function ensureSchemaPg(adapter: BunSqlAdapter): Promise<void> {
 			input_tokens INTEGER DEFAULT 0,
 			cache_read_input_tokens INTEGER DEFAULT 0,
 			cache_creation_input_tokens INTEGER DEFAULT 0,
+			cache_creation_5m_input_tokens INTEGER,
+			cache_creation_1h_input_tokens INTEGER,
 			output_tokens INTEGER DEFAULT 0,
 			agent_used TEXT,
 			api_key_id TEXT,
@@ -442,6 +444,43 @@ export async function createForecastTablesPg(
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)
+	`);
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS forecast_usage_tokens (
+			bucket_start BIGINT NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL,
+			family TEXT NOT NULL,
+			request_count BIGINT NOT NULL DEFAULT 0,
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_5m_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_1h_tokens BIGINT NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_start, account_id, source, family)
+		)
+	`);
+	await adapter.unsafe(`
+		CREATE TABLE IF NOT EXISTS forecast_session_requests (
+			source TEXT NOT NULL,
+			session_key TEXT NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			at BIGINT NOT NULL,
+			seq INTEGER NOT NULL DEFAULT 0,
+			family TEXT NOT NULL,
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_write_5m_tokens BIGINT,
+			cache_write_1h_tokens BIGINT,
+			PRIMARY KEY (source, session_key, at, seq)
+		)
+	`);
+	await adapter.unsafe(`
+		CREATE INDEX IF NOT EXISTS idx_forecast_session_requests_at
+		ON forecast_session_requests (source, at)
 	`);
 }
 
@@ -1521,6 +1560,18 @@ export async function runMigrationsPg(adapter: BunSqlAdapter): Promise<void> {
 			table: "requests",
 			column: "completion_tier",
 			definition: "ALTER TABLE requests ADD COLUMN completion_tier TEXT",
+		},
+		{
+			table: "requests",
+			column: "cache_creation_5m_input_tokens",
+			definition:
+				"ALTER TABLE requests ADD COLUMN cache_creation_5m_input_tokens INTEGER",
+		},
+		{
+			table: "requests",
+			column: "cache_creation_1h_input_tokens",
+			definition:
+				"ALTER TABLE requests ADD COLUMN cache_creation_1h_input_tokens INTEGER",
 		},
 		{
 			table: "request_payloads",

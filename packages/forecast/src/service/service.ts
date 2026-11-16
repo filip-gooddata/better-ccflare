@@ -2,6 +2,7 @@ import { unavailableResponse } from "../engine/response";
 import { runTranscriptBackfill } from "../history/backfill";
 import type { ForecastDb } from "../history/ports";
 import { earliestProxyBucket, syncProxyDemand } from "../history/proxy-demand";
+import { usageDetailCutoff } from "../history/proxy-usage-detail";
 import { loadReadings } from "../history/readings";
 import {
 	type PrewarmForecastView,
@@ -163,6 +164,13 @@ export function createForecastService(
 			startBackfill();
 		} catch (error) {
 			failures.push(`sync=${message(error)}`);
+		}
+		try {
+			await db.pruneUsageDetail(
+				usageDetailCutoff(now, deps.settings().historyLookbackDays),
+			);
+		} catch (error) {
+			failures.push(`prune=${message(error)}`);
 		}
 		try {
 			const settings = deps.settings();

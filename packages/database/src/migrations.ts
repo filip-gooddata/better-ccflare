@@ -199,6 +199,8 @@ export function ensureSchema(db: Database): void {
 			input_tokens INTEGER DEFAULT 0,
 			cache_read_input_tokens INTEGER DEFAULT 0,
 			cache_creation_input_tokens INTEGER DEFAULT 0,
+			cache_creation_5m_input_tokens INTEGER,
+			cache_creation_1h_input_tokens INTEGER,
 			output_tokens INTEGER DEFAULT 0,
 			agent_used TEXT,
 			project TEXT,
@@ -533,6 +535,10 @@ function createSearchProvidersTable(db: Database): void {
  * row per 5-minute bucket, account and source ("proxy" rows are recomputed
  * from `requests`, "transcript" rows come from the one-time backfill with
  * account_id ''); `forecast_meta` holds markers such as a finished backfill.
+ * `forecast_usage_tokens` keeps token sums per bucket, account, source and
+ * model family; `forecast_session_requests` one row per request of a session,
+ * in time order, under an opaque salted key. Both hold usage metadata only
+ * and are pruned to the forecast history window.
  */
 function createForecastTables(db: Database): void {
 	db.run(`
@@ -551,6 +557,43 @@ function createForecastTables(db: Database): void {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS forecast_usage_tokens (
+			bucket_start INTEGER NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL,
+			family TEXT NOT NULL,
+			request_count INTEGER NOT NULL DEFAULT 0,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (bucket_start, account_id, source, family)
+		)
+	`);
+	db.run(`
+		CREATE TABLE IF NOT EXISTS forecast_session_requests (
+			source TEXT NOT NULL,
+			session_key TEXT NOT NULL,
+			account_id TEXT NOT NULL DEFAULT '',
+			at INTEGER NOT NULL,
+			seq INTEGER NOT NULL DEFAULT 0,
+			family TEXT NOT NULL,
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_5m_tokens INTEGER,
+			cache_write_1h_tokens INTEGER,
+			PRIMARY KEY (source, session_key, at, seq)
+		)
+	`);
+	db.run(`
+		CREATE INDEX IF NOT EXISTS idx_forecast_session_requests_at
+		ON forecast_session_requests (source, at)
 	`);
 }
 
@@ -1794,6 +1837,18 @@ export function runMigrations(db: Database, dbPath?: string): void {
 		if (!requestsColumnNames.includes("completion_tier")) {
 			db.prepare("ALTER TABLE requests ADD COLUMN completion_tier TEXT").run();
 			log.info("Added completion_tier column to requests table");
+		}
+
+		// The 5-minute / 1-hour split of cache_creation_input_tokens as upstream
+		// reported it. NULL when the response carried no split.
+		for (const column of [
+			"cache_creation_5m_input_tokens",
+			"cache_creation_1h_input_tokens",
+		]) {
+			if (!requestsColumnNames.includes(column)) {
+				db.prepare(`ALTER TABLE requests ADD COLUMN ${column} INTEGER`).run();
+				log.info(`Added ${column} column to requests table`);
+			}
 		}
 
 		// Add the binary payload column to request_payloads if it doesn't exist.

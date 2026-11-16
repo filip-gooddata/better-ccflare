@@ -80,6 +80,13 @@ export {
 } from "./repositories/search-provider.repository";
 // Re-export repository types
 export type { StatsRepository } from "./repositories/stats.repository";
+export type {
+	SessionRequestRow,
+	UsageDetailSource,
+	UsageModelFamily,
+	UsageTokenRow,
+} from "./repositories/usage-detail.repository";
+export { UsageDetailRepository } from "./repositories/usage-detail.repository";
 export type { WebToolCallListFilters } from "./repositories/web-tool-call.repository";
 export { WebToolCallRepository } from "./repositories/web-tool-call.repository";
 // Re-export retry utilities for external use (from your improvements)

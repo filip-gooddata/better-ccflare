@@ -1,6 +1,7 @@
 import { BUCKET_MS, type EpochMs, type TokenUsage } from "../types";
 import { bucketStart, demandUnits, isFableUsage } from "../units";
 import type { ForecastDemandDbRow, HistoryDeps } from "./ports";
+import { recordProxyUsageDetail } from "./proxy-usage-detail";
 
 /** forecast_meta key set when the first full aggregation of `requests` finished. */
 export const PROXY_SYNC_MARKER = "proxy_demand_first_sync_at";
@@ -15,6 +16,8 @@ export interface ProxySyncResult {
 	firstRun: boolean;
 	requests: number;
 	rows: number;
+	tokenRows: number;
+	sessionRows: number;
 }
 
 /**
@@ -23,6 +26,7 @@ export interface ProxySyncResult {
  * the table holds; later runs the whole buckets from bucketStart(now - 60 min)
  * through the bucket holding `now`, reaching back to 60 minutes before the
  * last finished run when that is earlier (a gap in the runs is caught up).
+ * The same rows rebuild the proxy usage detail of that window.
  */
 export async function syncProxyDemand(
 	{ db }: HistoryDeps,
@@ -69,9 +73,17 @@ export async function syncProxyDemand(
 
 	const rows = [...byBucket.values()];
 	await db.replaceForecastDemand("proxy", from, to, rows);
+	const detail = await recordProxyUsageDetail(db, from, to, usage, now);
 	if (firstRun) await db.setForecastMeta(PROXY_SYNC_MARKER, String(now));
 	await db.setForecastMeta(PROXY_SYNC_LAST, String(now));
-	return { from, to, firstRun, requests: usage.length, rows: rows.length };
+	return {
+		from,
+		to,
+		firstRun,
+		requests: usage.length,
+		rows: rows.length,
+		...detail,
+	};
 }
 
 /** Start of the earliest stored proxy bucket: the transcript backfill's cut-over. */
