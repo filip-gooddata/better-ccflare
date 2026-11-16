@@ -1,8 +1,8 @@
 import {
 	getModelFamily,
-	getModelList,
 	isUsageExhausted,
 	isUseExtraUsageEnabled,
+	mapModelName,
 	splitModelRouting,
 } from "@better-ccflare/core";
 import {
@@ -161,12 +161,11 @@ function familyLimitInForce(
 	now: number,
 ): AccountLimit | null {
 	// Blocks are recorded for the family upstream refused: the family of the
-	// account's mapped primary model when it maps the client's model.
-	const mappedPrimary = getModelList(model, account)?.[0];
+	// model this account actually sends (mapModelName honors "force account
+	// model", which turns mapping off).
 	const upstreamFamily =
-		(mappedPrimary
-			? getModelFamily(splitModelRouting(mappedPrimary).model)
-			: null) ?? family;
+		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
+		family;
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };

@@ -8,6 +8,7 @@ import {
 	isUsageExhausted,
 	logError,
 	type ModelRouting,
+	mapModelName,
 	ProviderError,
 	parseNightWindow,
 	splitModelRouting,
@@ -3204,10 +3205,13 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
-				// The list's first entry is the model the primary attempt sent
-				// upstream (a mapping may rename the client's model to another
-				// family), so the family check compares upstream models only.
-				attemptedModels.push(splitModelRouting(modelList[0]).model);
+				// The primary attempt sent mapModelName's result upstream (a
+				// mapping may rename the client's model to another family, unless
+				// "force account model" turns mapping off), so the family check
+				// compares upstream models only.
+				attemptedModels.push(
+					splitModelRouting(mapModelName(requestedModel, account)).model,
+				);
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(

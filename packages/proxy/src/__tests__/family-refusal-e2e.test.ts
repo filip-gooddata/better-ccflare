@@ -8,13 +8,18 @@ import {
 	setSystemTime,
 	spyOn,
 } from "bun:test";
-import { isAccountAvailable, setUseExtraUsage } from "@better-ccflare/core";
+import {
+	isAccountAvailable,
+	setForceAccountModel,
+	setUseExtraUsage,
+} from "@better-ccflare/core";
 import { SessionPaceStrategy } from "@better-ccflare/load-balancer";
 import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, LoadBalancingStrategy } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
 import {
+	blockFamily,
 	clearFamilyBlocks,
 	clearFamilyExhaustionCache,
 	getFamilyBlock,
@@ -414,6 +419,7 @@ beforeEach(() => {
 afterEach(() => {
 	setSystemTime();
 	setUseExtraUsage(false);
+	setForceAccountModel(false);
 	globalThis.fetch = originalFetch;
 	usageCache.clear();
 	clearFamilyExhaustionCache();
@@ -572,6 +578,34 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		expect(
 			logged(`family_blocked: excluding ${GD} for fable`).length,
 		).toBeGreaterThan(0);
+	});
+
+	it("ignores an Opus-to-Fable mapping that force account model turns off", async () => {
+		usageCache.set(GD, usage(measuredGooddata()));
+		usageCache.set(AI, usage(measuredGooddataAi()));
+		setForceAccountModel(true);
+		blockFamily(GD, "fable", FABLE_RESET_GD, "usage", Date.now());
+		const calls = installUpstream(({ account, model }) =>
+			ok200(account, model),
+		);
+		const { ctx } = makeCtx(
+			[
+				makeAccount(GD, {
+					model_mappings: JSON.stringify({
+						opus: [FABLE, "claude-fable-5-2"],
+					}),
+				}),
+				makeAccount(AI, { rate_limited_until: FIVE_HOUR_RESET_AI }),
+			],
+			paceStrategy(),
+		);
+
+		// Mapping is off, so the request goes upstream as Opus: the Fable block
+		// on gooddata must not exclude it.
+		const opus = (await send(ctx, makeRequest(OPUS))) as Response;
+		expect(opus.status).toBe(200);
+		expect(calls).toEqual([{ account: GD, model: OPUS }]);
+		expect(logged(`family_blocked: excluding ${GD}`)).toEqual([]);
 	});
 
 	it("still benches the account when the model list spans families", async () => {

@@ -1,9 +1,9 @@
 import type { AccountUsageSnapshot } from "@better-ccflare/core";
 import {
 	getModelFamily,
-	getModelList,
 	isAccountAvailable,
 	isUsageExhausted,
+	mapModelName,
 	providerAcceptsClientModel,
 	splitModelRouting,
 } from "@better-ccflare/core";
@@ -469,13 +469,12 @@ function isAccountCapacityExcluded(
 } {
 	const family = getModelFamily(model);
 	// A block is recorded for the family upstream refused, which is the family
-	// of the model this account actually sends: its mapped primary model when
-	// the account maps the client's model, else the client's model.
-	const mappedPrimary = getModelList(model, account)?.[0];
+	// of the model this account actually sends (mapModelName: the mapped
+	// primary model, or the client's model when no mapping applies or
+	// "force account model" turns mapping off).
 	const upstreamFamily =
-		(mappedPrimary
-			? getModelFamily(splitModelRouting(mappedPrimary).model)
-			: null) ?? family;
+		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
+		family;
 	if (!upstreamFamily) return { excluded: false, resetAt: null, origin: null };
 
 	// A standing family block is an observed upstream refusal of this family
