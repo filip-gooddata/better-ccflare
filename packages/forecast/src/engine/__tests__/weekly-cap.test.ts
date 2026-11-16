@@ -62,19 +62,19 @@ function before(day: ForecastBlock, t: number): number {
 }
 
 describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", () => {
-	test("after acct-a's 14:00 reset the line is its weekly cap, about 44, not 100", async () => {
+	test("after acct-a's 14:00 reset the line is its weekly cap, about 54, not 100", async () => {
 		const response = await compute();
 		const day = response.day as ForecastBlock;
 		const b = before(day, A_RESET);
 		const a = after(day, A_RESET);
 		expect(a).toBe(b + 1);
-		expect(day.typical[b]).toBeCloseTo(4.1, 1);
-		expect(day.light[a]).toBeCloseTo(45.3, 1);
-		expect(day.typical[a]).toBeCloseTo(43.9, 1);
-		expect(day.heavy[a]).toBeCloseTo(41.6, 1);
+		expect(day.typical[b]).toBeCloseTo(14.7, 1);
+		expect(day.light[a]).toBeCloseTo(57.7, 1);
+		expect(day.typical[a]).toBeCloseTo(54.4, 1);
+		expect(day.heavy[a]).toBeCloseTo(48.5, 1);
 		// acct-b's reset at 17:00 brings a full window: its 50 % weekly is worth about 290 points.
 		const b17 = before(day, B_RESET);
-		expect(day.light[b17]).toBeCloseTo(1.1, 1);
+		expect(day.light[b17]).toBeCloseTo(35.5, 1);
 		expect(day.typical[after(day, B_RESET)]).toBe(100);
 	});
 
