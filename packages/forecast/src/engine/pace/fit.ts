@@ -243,10 +243,10 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 interface Stat {
 	cand: number;
 	nUnits: number;
-	/** Units whose out-of-fold gain is positive. */
-	nPos: number;
 	r2: number;
 	p: number;
+	/** BH rejection at q within the band's candidates. */
+	bh: boolean;
 	pass: boolean;
 }
 
@@ -355,9 +355,9 @@ function fitBand(
 		return {
 			cand: j,
 			nUnits: d.length,
-			nPos: d.filter((v) => v > 0).length,
 			r2: sse0 > 0 ? 1 - sse1 / sse0 : 0,
 			p: signFlipP(d),
+			bh: false,
 			pass: false,
 		};
 	});
@@ -366,7 +366,8 @@ function fitBand(
 		Q,
 	);
 	stats.forEach((s, i) => {
-		s.pass = rej.has(i) && s.r2 > 0 && s.nUnits >= floor;
+		s.bh = rej.has(i);
+		s.pass = s.bh && s.r2 > 0 && s.nUnits >= floor;
 	});
 
 	// blocked-CV loss of a ridge model on `sel` over the rows valid for `valid` (sandbox model3b.ts cv)
@@ -535,14 +536,9 @@ function fitBand(
 			: null;
 	let below: PaceFitState["belowFloor"][number] | null = null;
 	if (!feature) {
-		// Passed every test but the floor: positive out-of-fold R^2 and a gain in every unit so far.
-		// Below the floor BH cannot pass at m = 101 (p >= 2^-n > q / m), so a perfect sign
-		// pattern is the case where only the unit count stands in the way.
+		// Passed every screening test but the evidence floor: BH and positive out-of-fold R^2.
 		const cand = stats
-			.filter(
-				(s) =>
-					s.r2 > 0 && s.nUnits >= 2 && s.nUnits < floor && s.nPos === s.nUnits,
-			)
+			.filter((s) => s.bh && s.r2 > 0 && s.nUnits < floor)
 			.sort((a, b) => a.p - b.p || b.r2 - a.r2)[0];
 		if (cand)
 			below = {

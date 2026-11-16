@@ -55,10 +55,9 @@ export interface PaceFitState {
 	cellsEstablished: number;
 	cellsTotal: number;
 	/**
-	 * Bands without a selection whose best candidate passed every test but the evidence floor:
-	 * positive out-of-fold R^2 and a gain in every independent unit so far, with fewer units than
-	 * the floor (below it BH cannot pass at m = 101). It would qualify if the next units also gain;
-	 * that is not a promise it will.
+	 * Bands without a selection whose best candidate passed every screening test but the evidence
+	 * floor (BH at q and positive out-of-fold R^2, with fewer independent units than the floor).
+	 * It would be screened in once enough units accrue with the same result; that is not a promise.
 	 */
 	belowFloor: { band: string; feature: string; units: number }[];
 	/** Slot means (288 local five-minute slots) per served day type, from the complete days before the fit. */

@@ -533,13 +533,7 @@
 			"floor": 10,
 			"cellsEstablished": 168,
 			"cellsTotal": 648,
-			"belowFloor": [
-				{ "band": "4-8h", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "8-16h", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "16h-1d", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "2-4d", "feature": "D:lastThu", "units": 5 },
-				{ "band": "4-7d", "feature": "R:len4d:end0", "units": 5 }
-			],
+			"belowFloor": [],
 			"baseline": {
 				"workday": [
 					0.021546666666666665, 0.00103, 0.0002476190476190476,
@@ -3652,14 +3646,7 @@
 			"floor": 10,
 			"cellsEstablished": 168,
 			"cellsTotal": 648,
-			"belowFloor": [
-				{ "band": "4-8h", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "8-16h", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "16h-1d", "feature": "R:len4d:end4d", "units": 5 },
-				{ "band": "1-2d", "feature": "C:day-12", "units": 4 },
-				{ "band": "2-4d", "feature": "D:lastThu", "units": 5 },
-				{ "band": "4-7d", "feature": "R:len4d:end0", "units": 5 }
-			],
+			"belowFloor": [],
 			"baseline": {
 				"workday": [
 					0.021546666666666665, 0.00103, 0.0002476190476190476,
@@ -6769,12 +6756,7 @@
 			"floor": 10,
 			"cellsEstablished": 154,
 			"cellsTotal": 648,
-			"belowFloor": [
-				{ "band": "8-16h", "feature": "D:lastTue", "units": 5 },
-				{ "band": "1-2d", "feature": "C:day-12", "units": 4 },
-				{ "band": "2-4d", "feature": "D:lastThu", "units": 5 },
-				{ "band": "4-7d", "feature": "R:len4d:end0", "units": 5 }
-			],
+			"belowFloor": [],
 			"baseline": {
 				"workday": [
 					0.021271363636363637, 0.0024631818181818184, 0.0017513636363636362,
@@ -9705,12 +9687,7 @@
 			"floor": 10,
 			"cellsEstablished": 154,
 			"cellsTotal": 648,
-			"belowFloor": [
-				{ "band": "8-16h", "feature": "D:lastTue", "units": 5 },
-				{ "band": "1-2d", "feature": "C:day-12", "units": 4 },
-				{ "band": "2-4d", "feature": "D:lastThu", "units": 5 },
-				{ "band": "4-7d", "feature": "R:len4d:end0", "units": 5 }
-			],
+			"belowFloor": [],
 			"baseline": {
 				"workday": [
 					0.021271363636363637, 0.0024631818181818184, 0.0017513636363636362,

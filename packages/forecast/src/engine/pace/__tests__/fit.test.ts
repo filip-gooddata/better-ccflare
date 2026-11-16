@@ -182,9 +182,9 @@ describe("fitPaceModel", () => {
 		LONG,
 	);
 	test(
-		"below the floor: a relation that holds in every unit so far is reported with its units",
+		"below the floor: a candidate passing BH and R^2 but not the floor is reported with its units; one failing BH is not",
 		() => {
-			// 8 days of the planted predictor: every day gains, 8 day units < 10
+			// 8 days of the planted predictor: 8 day units < 10
 			const s = makeSeries(9, plantedLevels(9, 11));
 			const state = fitPaceModel(s, at(8, 0));
 			expect(bandOf(state, "0-1h")).toBeNull();
@@ -192,6 +192,8 @@ describe("fitPaceModel", () => {
 			expect(below?.feature as string).toMatch(/^R:/);
 			expect(below?.units as number).toBeGreaterThanOrEqual(2);
 			expect(below?.units as number).toBeLessThan(10);
+			// 8-16h: candidates with a gain in every unit but sign-flip p about 0.5 fail BH
+			expect(state.belowFloor.find((b) => b.band === "8-16h")).toBeUndefined();
 		},
 		LONG,
 	);
