@@ -1,11 +1,11 @@
-> This is a copy of spec revision 6 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 7 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 6 · 2026-11-13 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 7 · 2026-11-16 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -124,10 +124,21 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 - **`stopNow`** is a fact, not a projection: every counted account is out right now according to the latest
   readings (5-hour utilisation at 100 with a reset still ahead, weekly at 100, or refused by upstream with a
   cooldown running). `start` = when the last account went out, `end` = the earliest moment a counted account comes
-  back. It is reported whether or not work is expected. A stop that has begun is in `stopNow` only, never in the
-  `stops` lists.
+  back. For an account out on a limit, "went out" is the first reading that showed it at 100. For an account
+  refused by upstream it is the start of its running cooldown: the first refusal of that cooldown that the proxy
+  has seen since the proxy itself started. After a restart of the proxy that is the latest refusal on record,
+  which can be later than the first. An account that has been out without a break counts from the start of
+  that unbroken time out, even when the reason changed along the way: out on its 5-hour limit from 12:00,
+  refused from 13:00, its 5-hour reset at 14:00 while the cooldown still runs, it counts from 12:00. When no
+  start is known, the account's last reading is used. `stopNow` is reported whether or
+  not work is expected. A stop that has begun is in `stopNow` only, never in the `stops` lists and never in
+  `pastStops`.
 - **`pastStops`** are the same fact for earlier today (`day`) or this week (`week`): intervals in the recorded
   readings in which every counted account was out. Their start is as exact as the readings (about 90 s).
+  A refusal cooldown is not in the recorded readings. While a cooldown is running, its account counts as out
+  from the cooldown's start, so an ended stop that the cooldown helped to complete is listed. Once the cooldown
+  itself has ended, the proxy keeps no record of it, and a stop that only the cooldown made complete is no
+  longer listed.
 
 ## 6. Fields
 
@@ -139,7 +150,7 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `reason` | `null` when available. Else `insufficient_history` (too few recorded days or too few usage readings to calibrate), `error` (the computation failed, or there is no current result: just after a start before the first computation, or when the last result is older than three usage polls), or `disabled` (switched off; a client that follows discovery never sees it, because the discovery field and the forecast are switched by the same setting). |
 | `accounts` | Ids of the counted accounts. |
 | `levels` | `{ "light": 10, "typical": 50, "heavy": 90 }`: the percentile behind each named level. |
-| `day.past` | `{ times, values }`: pooled 5-hour quota left from local midnight to `computedAt`, one entry per change in the readings, jumps as two entries. Starts later than midnight when the proxy has no earlier readings. |
+| `day.past` | `{ times, values }`: pooled 5-hour quota left from local midnight to `computedAt`, one entry per change in the readings, jumps as two entries. Starts later than midnight when the proxy has no earlier readings. An account in a cooldown that is running at `computedAt` counts 0 from the cooldown's start (a jump on the axis), so a running stop shows from its start; a cooldown that has ended is not in the line. |
 | `day.times` | Time axis of the projection: `computedAt`, then every 5 minutes on the clock, to the end of the local day, plus the exact time of every jump and of every point where a level reaches 0. |
 | `day.light`, `day.typical`, `day.heavy` | Projected pooled 5-hour quota left per level, aligned with `day.times`. |
 | `day.fan` | `{ "p12": [...], "p14": [...], ... }`: the other levels (38 keys by default), aligned with `day.times`. No stops for these. |
@@ -281,6 +292,14 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 7 (PROPOSED, ships with the build that carries it): values only; no field added, removed, renamed
+  or retyped. Section 5: `stopNow.start` for a stop that a refusal cooldown made complete is the cooldown's start
+  (it was the blocked account's last reading, about one poll before `computedAt`, so the stop appeared to begin
+  at the present). `day.past` counts such an account 0 from that start (it stepped down only at `computedAt`).
+  The start is as exact as the first refusal seen since the proxy started. A running stop is never also listed
+  in `pastStops`. A cooldown that has ended is not recorded, so it is in neither `day.past` nor `pastStops`.
+  `contractVersion` stays 1.
 
 - Revision 6, 2026-11-13: values only; no field added, removed, renamed or retyped. Section 3: the `day`
   quantity counts each account at the lower of its 5-hour quota left and its weekly quota left in 5-hour points
