@@ -400,26 +400,25 @@ function validateBlock(
 				stops[level] = list;
 				if (times) checkStopsOnLine(path, list, times, named[level], err);
 			}
-		// light ⊂ typical ⊂ heavy
-		const nest = (
-			inner: (typeof STOP_LEVELS)[number],
-			outer: (typeof STOP_LEVELS)[number],
-		) => {
-			const outerList = stops[outer];
-			stops[inner]?.forEach((s, i) => {
-				if (
-					outerList &&
-					!outerList.some((o) => o.start <= s.start && s.end <= o.end)
-				)
-					err(
-						`${key}.stops.${inner}[${i}]`,
-						`lies outside every ${outer} stop`,
-					);
-			});
-		};
-		nest("light", "typical");
-		nest("typical", "heavy");
 	}
+
+	// Zero runs nest, light ⊂ typical ⊂ heavy; each level lists its own runs as stops.
+	const nest = (
+		inner: (typeof STOP_LEVELS)[number],
+		outer: (typeof STOP_LEVELS)[number],
+	) => {
+		const a = named[inner];
+		const b = named[outer];
+		if (!times || !a || !b) return;
+		for (let i = 0; i < times.length; i++)
+			if (a[i] <= EPSILON && b[i] > EPSILON)
+				err(
+					`${key}.${outer}[${i}]`,
+					`(${b[i]}) is above 0 where ${key}.${inner}[${i}] is 0; zero runs must nest`,
+				);
+	};
+	nest("light", "typical");
+	nest("typical", "heavy");
 
 	let stopNow: Interval | null = null;
 	if (has("stopNow") && block.stopNow !== null) {

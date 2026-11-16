@@ -9,7 +9,6 @@ import type {
 	ForecastBlock,
 	ForecastResponse,
 	ForecastSettings,
-	Interval,
 	Series,
 	UnavailableReason,
 } from "../types";
@@ -286,13 +285,10 @@ function buildBlock(
 		served === null ? null : { ...sim, traces: [sim.traces[served]] };
 	const block = blockLines(ctx, sim, quantity, levels, end, day);
 	const typicalDays = day ?? sim;
-	const light = projectedStops(ctx, sim, quantity, block, LIGHT);
-	const heavy = projectedStops(ctx, sim, quantity, block, HEAVY);
-	const typical = projectedStops(ctx, typicalDays, quantity, block, TYPICAL);
 	const stops = {
-		light,
-		typical: day ? nestedStops(block, typical, light, heavy) : typical,
-		heavy,
+		light: projectedStops(ctx, sim, quantity, block, LIGHT),
+		typical: projectedStops(ctx, typicalDays, quantity, block, TYPICAL),
+		heavy: projectedStops(ctx, sim, quantity, block, HEAVY),
 	};
 	const rounded = block.values.map((line) => line.map(round1));
 	const line = (level: number) => rounded[levels.indexOf(level)];
@@ -313,38 +309,6 @@ function buildBlock(
 		pastStops: pastStops(ctx, quantity),
 		shortfall: shortfall(ctx, typicalDays, quantity, block, stops.typical),
 	};
-}
-
-/**
- * The served day's stops kept nested between the pointwise ones (light ⊂
- * typical ⊂ heavy): a stop of its own only inside a heavy stop, and every zero
- * run of the typical line that holds a light stop. The clamp makes the zero runs
- * nest; the levels filter their runs by different unserved demand.
- */
-function nestedStops(
-	block: LineBlock,
-	own: Interval[],
-	light: Interval[],
-	heavy: Interval[],
-): Interval[] {
-	const inside = (a: Interval, b: Interval) =>
-		b.start <= a.start && a.end <= b.end;
-	const kept = own.filter((s) => heavy.some((h) => inside(s, h)));
-	const line = block.values[block.levels.indexOf(TYPICAL)];
-	for (const stop of light) {
-		if (kept.some((s) => inside(stop, s))) continue;
-		const at = block.times.indexOf(stop.start);
-		let first = at;
-		while (first > 0 && line[first - 1] < ZERO_POINTS) first -= 1;
-		if (first === 0) continue;
-		let after = at;
-		while (after < line.length && line[after] < ZERO_POINTS) after += 1;
-		kept.push({
-			start: block.times[first],
-			end: after < line.length ? block.times[after] : block.end,
-		});
-	}
-	return kept.sort((a, b) => a.start - b.start);
 }
 
 /**
