@@ -84,7 +84,8 @@ describe("2026-11-12 replay through compute()", () => {
 			expect(base.stops.heavy).toEqual([]);
 			expect(base.stops.typical).toEqual([]);
 			expect(Math.min(...base.heavy)).toBeCloseTo(13.8, 1);
-			expect(Math.min(...base.typical)).toBeCloseTo(27.7, 1);
+			// the served day’s own low point (day 230 of 400); 27.7 for the pointwise median
+			expect(Math.min(...base.typical)).toBeCloseTo(32.8, 1);
 		},
 		REPLAY_TIMEOUT_MS,
 	);
@@ -121,7 +122,8 @@ describe("2026-11-12 replay through compute()", () => {
 			expect(score.lowPoint - baseline.score.lowPoint).toBeCloseTo(46.1, 1);
 			expect(day.stops.heavy).toEqual([]);
 			expect(day.stops.typical).toEqual([]);
-			expect(Math.min(...day.typical)).toBeCloseTo(72.9, 1);
+			// the served day’s own low point (day 332 of 400); 72.9 for the pointwise median
+			expect(Math.min(...day.typical)).toBeCloseTo(77, 1);
 
 			// Every opening time searched, the baseline first. Opening at 07:00 is on demand itself; the
 			// old 10:00 opening now scores −3.3 (its heavy stops count below zero).
