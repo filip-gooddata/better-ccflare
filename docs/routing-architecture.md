@@ -346,6 +346,17 @@ The interruption forecast projects how much pooled quota the Claude OAuth accoun
 - Failures are logged once per run and never reach a request. A failed demand sync does not stop the run. An engine failure replaces the kept result with the no-forecast shape, `reason: "error"`. A run that fails before the engine keeps the previous result, which then ages.
 - `GET /api/forecast` only serves the kept result; it never computes.
 
+### Usage-detail backfill from transcripts
+
+Once the transcript demand backfill has finished (whether it just ran or had already run on an earlier start), a second one-time pass fills the usage-detail tables for the past from the same transcripts. It reads usage metadata only, the same lines and the same dedupe as the demand backfill, and writes two kinds of rows, both with source `transcript` and an empty account:
+
+- **Token sums** per 5-minute bucket and model family: request count, input, output, cache-read and cache-write tokens, and the 5-minute and 1-hour cache-write split (summed only over lines that reported it). Only buckets before the demand backfill's cut-over are written, so they cover the same requests as its `forecast_demand` rows.
+- **Session requests**, one row per request, ordered per transcript file, over everything on disk (no cut-over): time, a sequence number for requests of one file with the same timestamp (in line order), model family, input, output, cache-read and cache-write tokens, and the 5-minute and 1-hour cache-write split (empty when the line did not report it). A file appears only as a salted key of its path relative to the transcripts root; no session id, file name, path or text is stored or logged.
+
+Rows older than `historyLookbackDays` are skipped. The history starts with whatever transcripts are on disk at the first start of a build that carries this pass; Claude Code deletes transcripts after 30 days by default (its `cleanupPeriodDays` setting, which the proxy never changes). After every row is stored, the pass records its coverage in `forecast_meta` (`transcript_usage_detail_coverage`: files and lines read, session rows written, and the first and last request time, counts and epoch ms only) and then marks itself done (`transcript_usage_detail_done`), so an interrupted pass reruns on the next start and ends with the same rows; once marked, it reads nothing. It never changes `forecast_demand` or the demand backfill's meta keys. It logs one line of counts: `forecast usage detail backfill finished status=… files=… unreadable=… lines=… malformed=… tokenRows=… requests=… ms=…`.
+
+*Source: `packages/forecast/src/history/usage-detail-backfill.ts`, started from `packages/forecast/src/service/service.ts`.*
+
 ### Fresh and stale
 
 The kept result is **fresh** while it is available and no older than 3 poll intervals (`FORECAST_STALE_POLLS` × `usage_poll_interval_ms`, 4.5 minutes at the default). Past that, or before the first result, the endpoint answers the no-forecast shape with `reason: "error"` and routing gets no advice.
