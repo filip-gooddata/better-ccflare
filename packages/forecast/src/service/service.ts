@@ -1,5 +1,8 @@
 import { unavailableResponse } from "../engine/response";
-import { runTranscriptBackfill } from "../history/backfill";
+import {
+	runTranscriptBackfill,
+	TRANSCRIPT_BACKFILL_META_KEY,
+} from "../history/backfill";
 import type { ForecastDb } from "../history/ports";
 import {
 	earliestProxyBucket,
@@ -73,7 +76,8 @@ export interface ForecastServiceDeps {
 	/** Defaults to runTranscriptBackfill over `store` and `db`. */
 	backfill?(transcriptsDir: string): Promise<unknown>;
 	/**
-	 * Runs after `backfill` succeeds. Defaults to runUsageDetailBackfill over
+	 * Runs once per service: at creation when the `backfill` marker is already
+	 * set, else after `backfill` succeeds. Defaults to runUsageDetailBackfill over
 	 * `db`, with usageDetailMeta(db) as the meta store.
 	 */
 	usageDetailBackfill?(transcriptsDir: string): Promise<unknown>;
@@ -99,7 +103,7 @@ export interface ForecastService {
 	forecastView(): PrewarmForecastView | null;
 	/** Resolves when no computation is running or queued and the scheduler is idle. */
 	idle(): Promise<void>;
-	/** Clears timers, stops the scheduler, awaits the running computation and pre-warm runs in flight; later notifies do nothing. */
+	/** Clears timers, stops the scheduler, awaits the running computation, the usage-detail pass and pre-warm runs in flight; later notifies do nothing. */
 	stop(): Promise<void>;
 }
 
@@ -125,6 +129,7 @@ export function createForecastService(
 	let pendingHandle: unknown = null;
 	let stopped = false;
 	let backfillStarted = false;
+	let usageDetailRun: Promise<void> | null = null;
 	let quietWaiters: (() => void)[] = [];
 
 	const backfill =
@@ -172,22 +177,47 @@ export function createForecastService(
 			)
 			.then((succeeded) => {
 				// Sequential: it reads the cut-over the demand backfill settled on.
-				if (!succeeded) return;
-				const detailStartedAt = clock.now();
-				return usageDetailBackfill(dir).then(
-					(result) => {
-						logger.info(
-							usageDetailBackfillLine(result, clock.now() - detailStartedAt),
-						);
+				if (succeeded) return startUsageDetailBackfill(dir);
+			});
+	};
+
+	/** At most once per service, from creation or from the first cycle; never after stop. */
+	const startUsageDetailBackfill = (dir: string): Promise<void> => {
+		if (usageDetailRun) return usageDetailRun;
+		if (stopped) return Promise.resolve();
+		const startedAt = clock.now();
+		usageDetailRun = Promise.resolve()
+			.then(() => usageDetailBackfill(dir))
+			.then(
+				(result) => {
+					logger.info(usageDetailBackfillLine(result, clock.now() - startedAt));
+				},
+				(error: unknown) => {
+					logger.warn(
+						`forecast usage detail backfill failed error=${errorName(error)}`,
+					);
+				},
+			);
+		return usageDetailRun;
+	};
+
+	// Once the demand backfill's marker is set its cut-over is settled, so the
+	// pass need not wait for a usage snapshot that may never come.
+	const startupDir = deps.settings().transcriptsDir;
+	const startupCheck: Promise<unknown> = startupDir
+		? Promise.resolve()
+				.then(() => store.getMeta(TRANSCRIPT_BACKFILL_META_KEY))
+				.then(
+					(marker) => {
+						if (marker !== null) return startUsageDetailBackfill(startupDir);
 					},
 					(error: unknown) => {
 						logger.warn(
-							`forecast usage detail backfill failed error=${errorName(error)}`,
+							`forecast usage detail backfill check failed error=${errorName(error)}`,
 						);
 					},
-				);
-			});
-	};
+				)
+		: Promise.resolve();
 
 	const fresh = (now: EpochMs) =>
 		kept !== null &&
@@ -442,6 +472,8 @@ export function createForecastService(
 			clearPending();
 			deps.scheduler?.stop();
 			if (running) await running;
+			await startupCheck;
+			if (usageDetailRun) await usageDetailRun;
 			settleQuiet();
 			// pre-warm runs in flight finish and record before the database closes
 			await deps.scheduler?.idle();

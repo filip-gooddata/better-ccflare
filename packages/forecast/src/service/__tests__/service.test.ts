@@ -1840,3 +1840,201 @@ describe("forecast service: F3 start-up and salt", () => {
 		await second.service.stop();
 	});
 });
+
+function markedStore(): FakeDemandStore {
+	const store = new FakeDemandStore([]);
+	store.meta.set(TRANSCRIPT_BACKFILL_META_KEY, '{"rows":2}');
+	return store;
+}
+
+describe("forecast service: usage-detail pass at creation", () => {
+	it("creation alone with the old marker set runs the pass once; a second service on the same store changes nothing", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		await db.setForecastMeta(TRANSCRIPT_BACKFILL_META_KEY, '{"rows":2}');
+		await db.setForecastMeta(
+			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+			String(T0 - 30 * MIN),
+		);
+		await db.upsertForecastDemand([
+			{
+				bucketStart: T0 - 120 * MIN,
+				accountId: "",
+				source: "transcript",
+				units: 12.5,
+				fableUnits: 2,
+				requestCount: 2,
+			},
+		]);
+		const demandBefore = await demandSnapshot(db);
+		const root = transcriptsRoot();
+		const first = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		const line = await untilLogged(first, DETAIL_LINE);
+		expect(line).toContain("status=done files=2 unreadable=0 lines=4");
+		expect(first.engine.inputs).toHaveLength(0);
+		expect(
+			first.infos.some((m) => m.startsWith("forecast backfill started")),
+		).toBe(false);
+		expect(detail.tokens.size).toBeGreaterThan(0);
+		expect(detail.requests.size).toBe(4);
+		expect(await db.getForecastMeta(USAGE_DETAIL_BACKFILL_META_KEY)).not.toBe(
+			null,
+		);
+		expect(await demandSnapshot(db)).toBe(demandBefore);
+		await first.service.stop();
+		expect(first.infos.filter((m) => m.startsWith(DETAIL_LINE))).toHaveLength(
+			1,
+		);
+		const before = await fullSnapshot(db, detail);
+
+		// A transcript that would add rows if anything were read.
+		writeFileSync(
+			join(root, "proj", "three.jsonl"),
+			`${transcriptLine(T0 - 4 * 3_600_000, 9)}\n`,
+		);
+		const second = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		second.service.notifyUsagePoll();
+		await second.time.advance(FORECAST_POLL_SETTLE_MS);
+		expect(second.engine.inputs).toHaveLength(1);
+		expect(await untilLogged(second, DETAIL_LINE)).toContain(
+			"status=already_done files=0 unreadable=0 lines=0",
+		);
+		await second.service.stop();
+		expect(second.infos.filter((m) => m.startsWith(DETAIL_LINE))).toHaveLength(
+			1,
+		);
+		expect(await fullSnapshot(db, detail)).toBe(before);
+	});
+
+	it("creation followed quickly by a cycle runs the pass exactly once", async () => {
+		const gate = new Deferred();
+		const calls: string[] = [];
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			store: markedStore(),
+			usageDetailBackfill: async (dir) => {
+				calls.push(dir);
+				await gate.promise;
+				return { status: "done" };
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(h.backfills).toEqual(["/tmp/transcripts"]);
+		expect(calls).toEqual(["/tmp/transcripts"]);
+		gate.resolve();
+		await flush();
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		await flush();
+		expect(calls).toHaveLength(1);
+		await h.service.stop();
+	});
+
+	it("when the cycle reaches the pass before the marker read settles, the creation path does not run it again", async () => {
+		const metaGate = new Deferred();
+		const store = markedStore();
+		const read = store.getMeta.bind(store);
+		store.getMeta = async (key: string) => {
+			await metaGate.promise;
+			return read(key);
+		};
+		const calls: string[] = [];
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			store,
+			usageDetailBackfill: async (dir) => {
+				calls.push(dir);
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(calls).toHaveLength(1);
+		metaGate.resolve();
+		await flush();
+		expect(calls).toHaveLength(1);
+		await h.service.stop();
+	});
+
+	it("a fresh install (no old marker) does not run the pass at creation", async () => {
+		const h = harness({ settings: { transcriptsDir: "/tmp/transcripts" } });
+		await flush();
+		await flush();
+		expect(h.backfills).toEqual([]);
+		expect(h.usageDetailBackfills).toEqual([]);
+		await h.service.stop();
+		expect(h.usageDetailBackfills).toEqual([]);
+	});
+
+	it("does not run at creation without transcriptsDir", async () => {
+		const h = harness({ store: markedStore() });
+		await flush();
+		expect(h.usageDetailBackfills).toEqual([]);
+		await h.service.stop();
+	});
+
+	it("stop resolves only after an in-flight pass settles", async () => {
+		const gate = new Deferred();
+		let started = false;
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			store: markedStore(),
+			usageDetailBackfill: async () => {
+				started = true;
+				await gate.promise;
+				return { status: "done" };
+			},
+		});
+		await flush();
+		expect(started).toBe(true);
+		let stopped = false;
+		const stopping = h.service.stop().then(() => {
+			stopped = true;
+		});
+		await flush();
+		expect(stopped).toBe(false);
+		gate.resolve();
+		await stopping;
+		expect(stopped).toBe(true);
+		expect(h.infos.some((m) => m.startsWith(DETAIL_LINE))).toBe(true);
+	});
+
+	it("a failing pass is logged by name only, stop resolves, and the next service retries", async () => {
+		const store = markedStore();
+		let calls = 0;
+		const failing = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			store,
+			usageDetailBackfill: async () => {
+				calls++;
+				throw new TypeError("/private/conversation/path secret");
+			},
+		});
+		await flush();
+		await failing.service.stop();
+		expect(calls).toBe(1);
+		expect(failing.warns).toEqual([
+			"forecast usage detail backfill failed error=TypeError",
+		]);
+		const next = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			store,
+		});
+		await flush();
+		await next.service.stop();
+		expect(next.usageDetailBackfills).toEqual(["/tmp/transcripts"]);
+	});
+});
