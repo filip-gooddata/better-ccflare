@@ -199,7 +199,12 @@ export function createForecastService(
 		const now = clock.now();
 		const failures: string[] = [];
 		try {
-			await syncProxyDemand({ db }, now);
+			const synced = await syncProxyDemand({ db }, now);
+			if (synced.detailError !== undefined) {
+				logger.warn(
+					`forecast usage detail sync failed error=${synced.detailError}`,
+				);
+			}
 			startBackfill();
 		} catch (error) {
 			failures.push(`sync=${message(error)}`);

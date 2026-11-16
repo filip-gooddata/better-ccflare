@@ -26,6 +26,13 @@ export const USAGE_DETAIL_BACKFILL_COVERAGE_META_KEY =
 export const USAGE_DETAIL_PROXY_SINCE_META_KEY = "proxy_usage_detail_since";
 
 /**
+ * forecast_meta key: epoch ms, the end of the last proxy usage-detail rebuild
+ * that finished. Absent until one has, so the next sync rebuilds from the
+ * start of the requests table.
+ */
+export const USAGE_DETAIL_PROXY_THROUGH_META_KEY = "proxy_usage_detail_through";
+
+/**
  * Token sums of one (bucket, account, source, family). `accountId` is "" for
  * transcript rows. `cacheWriteTokens` holds every cache write; the two split
  * fields sum only the writes whose request reported the split, so
