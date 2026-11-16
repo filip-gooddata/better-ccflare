@@ -41,6 +41,7 @@ export function settings(
 		recentTauMin: 60,
 		sessionTurnoverMin: 90,
 		workStartSharePct: 5,
+		paceConditioning: true,
 		...over,
 	};
 }

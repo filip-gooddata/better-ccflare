@@ -62,19 +62,19 @@ function before(day: ForecastBlock, t: number): number {
 }
 
 describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", () => {
-	test("after acct-a's 14:00 reset the line is its weekly cap, about 44, not 100", async () => {
+	test("after acct-a's 14:00 reset the line is its weekly cap, about 54, not 100", async () => {
 		const response = await compute();
 		const day = response.day as ForecastBlock;
 		const b = before(day, A_RESET);
 		const a = after(day, A_RESET);
 		expect(a).toBe(b + 1);
-		expect(day.typical[b]).toBeCloseTo(4.1, 1);
-		expect(day.light[a]).toBeCloseTo(45.3, 1);
-		expect(day.typical[a]).toBeCloseTo(43.9, 1);
-		expect(day.heavy[a]).toBeCloseTo(41.6, 1);
+		expect(day.typical[b]).toBeCloseTo(14.7, 1);
+		expect(day.light[a]).toBeCloseTo(57.7, 1);
+		expect(day.typical[a]).toBeCloseTo(54.4, 1);
+		expect(day.heavy[a]).toBeCloseTo(48.5, 1);
 		// acct-b's reset at 17:00 brings a full window: its 50 % weekly is worth about 290 points.
 		const b17 = before(day, B_RESET);
-		expect(day.light[b17]).toBeCloseTo(1.1, 1);
+		expect(day.light[b17]).toBeCloseTo(35.5, 1);
 		expect(day.typical[after(day, B_RESET)]).toBe(100);
 	});
 
@@ -83,18 +83,15 @@ describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", 
 		const minute = (t: number) => Math.floor(t / MIN) * MIN;
 		expect(
 			day.stops.typical.map((s) => [minute(s.start), minute(s.end)]),
-		).toEqual([[prague(13, 14, 43), prague(13, 17)]]);
+		).toEqual([[prague(13, 16, 41), prague(13, 17)]]);
 		expect(
 			day.stops.heavy.map((s) => [minute(s.start), minute(s.end)]),
-		).toEqual([
-			[prague(13, 14, 27), prague(13, 17)],
-			[prague(13, 17, 52), prague(13, 22, 5)],
-		]);
+		).toEqual([[prague(13, 15, 33), prague(13, 17)]]);
 		// Measured without the cap, with this calibration in both the simulation and the
 		// shortfall's points per unit (A.8's 176.6 priced unserved units at the fixture's k5 2).
-		expect(day.shortfall?.points).toBeCloseTo(159.9, 1);
-		expect(day.shortfall?.perAccount["acct-a"]).toBeCloseTo(82, 1);
-		expect(day.shortfall?.perAccount["acct-b"]).toBeCloseTo(77.9, 1);
+		expect(day.shortfall?.points).toBeCloseTo(1.7, 1);
+		expect(day.shortfall?.perAccount["acct-a"]).toBeCloseTo(1.7, 1);
+		expect(day.shortfall?.perAccount["acct-b"]).toBeCloseTo(0, 1);
 	});
 
 	test("the response is valid and the past meets the levels at computedAt", async () => {

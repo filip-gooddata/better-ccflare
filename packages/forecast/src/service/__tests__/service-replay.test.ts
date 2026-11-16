@@ -189,16 +189,18 @@ describe("forecast service with the real engine on the 2026-11-12 replay, pre-wa
 		});
 		const held = w.service.advisor.placeNewSession(w.clock.at);
 		expect(held?.rule).toBe("forecast-lookahead");
-		expect(held?.reason).toBe("low-point+17.6");
+		expect(held?.reason).toBe("low-point+17.1");
 		expect(held?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 
 		// 08:30, no hold gains the gate: the idle acct-b heads the tiers (amendment 5, E1).
 		await w.computeAt(REHOLD_AT, { usedPct: 29, resetsAt: prague(12, 11) });
-		expect(w.service.forecastView()?.plan?.openAt).toEqual({ "acct-b": null });
+		expect(w.service.forecastView()?.plan?.openAt).toEqual({
+			"acct-b": REHOLD_AT,
+		});
 		const due = w.service.advisor.placeNewSession(w.clock.at);
 		expect(due?.rule).toBe("forecast-open");
 		expect(due?.tiers).toEqual([["acct-b"], ["acct-a"]]);
-		expect(due?.reason).toBe("no-preference");
+		expect(due?.reason).toBe("open-ahead+1.1");
 		const later = w.service.provider();
 		expect(later.prewarm?.enabled).toBe(false);
 		expect(validateForecastResponse(later)).toEqual([]);

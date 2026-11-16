@@ -1053,16 +1053,33 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 	it("writes the forecast inputs line after an available computation; the provider's response does not carry them (amendment 4, D2)", async () => {
 		const h = harness();
 		const inputs: ForecastInputsDetail = {
-			dayFactor: {
-				a: 1.2,
-				raw: 1.4,
-				clamped: 1.4,
-				weight: 0.5,
-				y: 30,
-				m: 10,
-				c: 20,
+			pace: {
+				status: "unfitted",
+				fittedAt: null,
+				bands: (
+					[
+						["0-1h", 30],
+						["1-2h", 90],
+						["2-4h", 180],
+						["4-8h", 360],
+						["8-16h", 720],
+						["16h-1d", 1200],
+						["1-2d", 2160],
+						["2-4d", 4320],
+						["4-7d", 7920],
+					] as [string, number][]
+				).map(([band, centreMin]) => ({
+					band,
+					centreMin,
+					m: 1,
+					feature: null,
+					ratio: null,
+					coef: null,
+					clipped: false,
+					lambda: null,
+				})),
 			},
-			recentRatePerHour: 6,
+			paceModel: null,
 			pool: { name: "workday", days: 12, medianUnits: 80, p90Units: 120 },
 			workStartMinute: 480,
 			limits: [
@@ -1084,11 +1101,11 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 		for (let i = 1; i <= 5; i++) await cycle(h, FORECAST_MIN_SPACING_MS);
 		const lines = h.infos.filter((m) => m.startsWith("forecast inputs"));
 		expect(lines).toEqual([
-			`forecast inputs dayFactor a=1.200 clamped=1.400 w=0.5000 raw=1.400 Y=30.00 M=10.00 c=20.00 recentRate=6.00/h pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30 oldestH=200.0 newestH=0.5 cap: ${ID} r=6.00 binds=yes`,
+			`forecast inputs e4=unfitted fitAge=none days=none weeks=none cells=none e4m 0-1h=1.00 1-2h=1.00 2-4h=1.00 4-8h=1.00 8-16h=1.00 16h-1d=1.00 1-2d=1.00 2-4d=1.00 4-7d=1.00 e4f none e4floor count=0 pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30 oldestH=200.0 newestH=0.5 cap: ${ID} r=6.00 binds=yes`,
 		]);
 		const json = JSON.stringify(serve(h));
-		expect(json).not.toContain("dayFactor");
-		expect(json).not.toContain("recentRate");
+		expect(json).not.toContain("paceModel");
+		expect(json).not.toContain("belowFloor");
 		expect(json).not.toContain("medianUnits");
 	});
 
