@@ -9,6 +9,7 @@ import type {
 	ForecastBlock,
 	ForecastResponse,
 	ForecastSettings,
+	Interval,
 	Series,
 	UnavailableReason,
 } from "../types";
@@ -16,6 +17,7 @@ import { FORECAST_CONTRACT_VERSION } from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { pastSeries, pastStops, type Quantity } from "./past";
 import { levelLines, levelOf, quotaQuantile } from "./percentile";
+import { freshDay } from "./served-day";
 import {
 	countsFor,
 	type LineBlock,
@@ -60,9 +62,14 @@ export function unavailableResponse(
 	};
 }
 
+/**
+ * `served`: index of the simulated day drawn as the typical day line; by
+ * default the day picked without a held one.
+ */
 export function buildResponse(
 	ctx: EngineContext,
 	sim: SimulationResult,
+	served: number = freshDay(sim, ctx.horizon.dayEnd),
 ): ForecastResponse {
 	const levels = responseLevels(ctx.input.settings);
 	return {
@@ -72,8 +79,8 @@ export function buildResponse(
 		reason: null,
 		accounts: ctx.accounts.map((a) => a.accountId),
 		levels: namedLevels(),
-		day: buildBlock(ctx, sim, "day", levels),
-		week: buildBlock(ctx, sim, "week", levels),
+		day: buildBlock(ctx, sim, "day", levels, served),
+		week: buildBlock(ctx, sim, "week", levels, null),
 		fable: fable(ctx, sim),
 	};
 }
@@ -141,6 +148,9 @@ function blockIndices(
  * level is interpolated linearly in the step. Linear interpolation of ordered
  * values with one weight keeps them ordered, and 0 is below all of them, so the
  * ordering holds at inserted points.
+ *
+ * With `served` the typical line is that one day (its own zero times), clamped
+ * into [heavy, light] at every point so the level order and stop nesting hold.
  */
 function blockLines(
 	ctx: EngineContext,
@@ -148,22 +158,41 @@ function blockLines(
 	quantity: Quantity,
 	levels: number[],
 	end: EpochMs,
+	served: SimulationResult | null,
 ): LineBlock {
 	const times = sim.axis.times;
 	let lastIndex = 0;
 	while (lastIndex + 1 < times.length && times[lastIndex + 1] <= end)
 		lastIndex++;
-	const series = sim.traces.map((t) => (quantity === "day" ? t.day : t.week));
+	const seriesOf = (r: SimulationResult) =>
+		r.traces.map((t) => (quantity === "day" ? t.day : t.week));
+	const typical = served ? levels.indexOf(TYPICAL) : -1;
+	const simOf = (l: number) => (l === typical && served ? served : sim);
+	const series = seriesOf(sim);
 	const lines = levelLines(series, lastIndex + 1, levels);
-	const need = levels.map((l) => daysAtZeroForLevel(series.length, l));
+	if (served)
+		lines[typical] = levelLines(seriesOf(served), lastIndex + 1, [TYPICAL])[0];
+	const need = levels.map((level, l) =>
+		daysAtZeroForLevel(simOf(l).traces.length, level),
+	);
 
-	const stepCache = new Map<number, { atZero: number; hits: EpochMs[] }>();
-	const stepHits = (j: number) => {
-		const cached = stepCache.get(j);
+	const stepCache = new Map<
+		SimulationResult,
+		Map<number, { atZero: number; hits: EpochMs[] }>
+	>();
+	const stepHits = (j: number, l: number) => {
+		const days = simOf(l);
+		let cache = stepCache.get(days);
+		if (!cache) {
+			cache = new Map();
+			stepCache.set(days, cache);
+		}
+		const cached = cache.get(j);
 		if (cached) return cached;
+		const series = seriesOf(days);
 		let atZero = 0;
 		const hits: EpochMs[] = [];
-		sim.traces.forEach((trace, s) => {
+		days.traces.forEach((trace, s) => {
 			const zeroNow = series[s][j] < ZERO_POINTS;
 			if (!zeroNow) return;
 			if (series[s][j - 1] < ZERO_POINTS) {
@@ -186,13 +215,13 @@ function blockLines(
 		});
 		hits.sort((a, b) => a - b);
 		const entry = { atZero, hits };
-		stepCache.set(j, entry);
+		cache.set(j, entry);
 		return entry;
 	};
 	/** When level l reaches 0 in step j; t[j] when the days give no earlier time. */
 	const zeroTime = (j: number, l: number): EpochMs => {
 		if (lines[l][j - 1] < ZERO_POINTS) return times[j - 1];
-		const { atZero, hits } = stepHits(j);
+		const { atZero, hits } = stepHits(j, l);
 		const k = need[l] - atZero - 1;
 		if (k < 0) return times[j - 1];
 		if (k >= hits.length) return times[j];
@@ -235,6 +264,13 @@ function blockLines(
 		}
 		push(times[b], (l) => lines[l][b]);
 	}
+	if (served) {
+		const light = values[levels.indexOf(LIGHT)];
+		const heavy = values[levels.indexOf(HEAVY)];
+		values[typical] = values[typical].map((v, k) =>
+			Math.min(light[k], Math.max(heavy[k], v)),
+		);
+	}
 	return { times: outTimes, levels, values, end };
 }
 
@@ -243,13 +279,20 @@ function buildBlock(
 	sim: SimulationResult,
 	quantity: Quantity,
 	levels: number[],
+	served: number | null,
 ): ForecastBlock {
 	const end = quantity === "day" ? ctx.horizon.dayEnd : ctx.horizon.weekEnd;
-	const block = blockLines(ctx, sim, quantity, levels, end);
+	const day: SimulationResult | null =
+		served === null ? null : { ...sim, traces: [sim.traces[served]] };
+	const block = blockLines(ctx, sim, quantity, levels, end, day);
+	const typicalDays = day ?? sim;
+	const light = projectedStops(ctx, sim, quantity, block, LIGHT);
+	const heavy = projectedStops(ctx, sim, quantity, block, HEAVY);
+	const typical = projectedStops(ctx, typicalDays, quantity, block, TYPICAL);
 	const stops = {
-		light: projectedStops(ctx, sim, quantity, block, LIGHT),
-		typical: projectedStops(ctx, sim, quantity, block, TYPICAL),
-		heavy: projectedStops(ctx, sim, quantity, block, HEAVY),
+		light,
+		typical: day ? nestedStops(block, typical, light, heavy) : typical,
+		heavy,
 	};
 	const rounded = block.values.map((line) => line.map(round1));
 	const line = (level: number) => rounded[levels.indexOf(level)];
@@ -268,8 +311,40 @@ function buildBlock(
 		stops,
 		stopNow: stopNow(ctx, quantity),
 		pastStops: pastStops(ctx, quantity),
-		shortfall: shortfall(ctx, sim, quantity, block, stops.typical),
+		shortfall: shortfall(ctx, typicalDays, quantity, block, stops.typical),
 	};
+}
+
+/**
+ * The served day's stops kept nested between the pointwise ones (light ⊂
+ * typical ⊂ heavy): a stop of its own only inside a heavy stop, and every zero
+ * run of the typical line that holds a light stop. The clamp makes the zero runs
+ * nest; the levels filter their runs by different unserved demand.
+ */
+function nestedStops(
+	block: LineBlock,
+	own: Interval[],
+	light: Interval[],
+	heavy: Interval[],
+): Interval[] {
+	const inside = (a: Interval, b: Interval) =>
+		b.start <= a.start && a.end <= b.end;
+	const kept = own.filter((s) => heavy.some((h) => inside(s, h)));
+	const line = block.values[block.levels.indexOf(TYPICAL)];
+	for (const stop of light) {
+		if (kept.some((s) => inside(stop, s))) continue;
+		const at = block.times.indexOf(stop.start);
+		let first = at;
+		while (first > 0 && line[first - 1] < ZERO_POINTS) first -= 1;
+		if (first === 0) continue;
+		let after = at;
+		while (after < line.length && line[after] < ZERO_POINTS) after += 1;
+		kept.push({
+			start: block.times[first],
+			end: after < line.length ? block.times[after] : block.end,
+		});
+	}
+	return kept.sort((a, b) => a.start - b.start);
 }
 
 /**

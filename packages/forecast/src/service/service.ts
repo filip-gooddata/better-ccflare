@@ -32,6 +32,7 @@ import type {
 	ForecastSettings,
 	PaceContext,
 	PrewarmStatus,
+	ServedDay,
 	SessionTrackerLike,
 } from "../types";
 import {
@@ -123,6 +124,7 @@ export function createForecastService(
 ): ForecastService {
 	const { clock, timer, logger, store, db } = deps;
 	let kept: { result: ForecastResult; computedAt: EpochMs } | null = null;
+	let heldDay: ServedDay | null = null;
 	let lastLimits: AccountLimits[] = [];
 	let consumedMoves = new Set<string>();
 	let running: Promise<void> | null = null;
@@ -315,6 +317,7 @@ export function createForecastService(
 					accountHistory,
 					readings,
 					sessions,
+					heldDay,
 				});
 			} catch (error) {
 				failures.push(`engine=${message(error)}`);
@@ -326,6 +329,7 @@ export function createForecastService(
 				};
 			}
 			kept = { result, computedAt: now };
+			if (result.available && result.servedDay) heldDay = result.servedDay;
 			consumedMoves = new Set();
 			availability.record(result, now);
 			inputsLog.record(result, now);

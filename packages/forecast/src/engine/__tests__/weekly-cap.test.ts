@@ -68,9 +68,11 @@ describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", 
 		const b = before(day, A_RESET);
 		const a = after(day, A_RESET);
 		expect(a).toBe(b + 1);
-		expect(day.typical[b]).toBeCloseTo(4.1, 1);
+		// typical is the served day (318 of 400), 3.89 here, inside [heavy 1.8, light 5.6]
+		expect(day.typical[b]).toBeCloseTo(3.9, 1);
 		expect(day.light[a]).toBeCloseTo(45.3, 1);
-		expect(day.typical[a]).toBeCloseTo(43.9, 1);
+		// the served day after the jump: 43.63, inside [heavy 41.6, light 45.3]
+		expect(day.typical[a]).toBeCloseTo(43.6, 1);
 		expect(day.heavy[a]).toBeCloseTo(41.6, 1);
 		// acct-b's reset at 17:00 brings a full window: its 50 % weekly is worth about 290 points.
 		const b17 = before(day, B_RESET);
@@ -81,9 +83,11 @@ describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", 
 	test("stops and shortfall are those without the cap", async () => {
 		const day = (await compute()).day as ForecastBlock;
 		const minute = (t: number) => Math.floor(t / MIN) * MIN;
+		// The typical stop and the shortfall are the served day's own: its zero time 14:42
+		// and its unserved demand to 17:00 (120.6 points at k5 1.79).
 		expect(
 			day.stops.typical.map((s) => [minute(s.start), minute(s.end)]),
-		).toEqual([[prague(13, 14, 43), prague(13, 17)]]);
+		).toEqual([[prague(13, 14, 42), prague(13, 17)]]);
 		expect(
 			day.stops.heavy.map((s) => [minute(s.start), minute(s.end)]),
 		).toEqual([
@@ -92,9 +96,9 @@ describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", 
 		]);
 		// Measured without the cap, with this calibration in both the simulation and the
 		// shortfall's points per unit (A.8's 176.6 priced unserved units at the fixture's k5 2).
-		expect(day.shortfall?.points).toBeCloseTo(159.9, 1);
+		expect(day.shortfall?.points).toBeCloseTo(120.6, 1);
 		expect(day.shortfall?.perAccount["acct-a"]).toBeCloseTo(82, 1);
-		expect(day.shortfall?.perAccount["acct-b"]).toBeCloseTo(77.9, 1);
+		expect(day.shortfall?.perAccount["acct-b"]).toBeCloseTo(38.6, 1);
 	});
 
 	test("the response is valid and the past meets the levels at computedAt", async () => {

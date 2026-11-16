@@ -207,12 +207,22 @@ describe("response shape (spec sections 3 to 6) on a real compute", () => {
 					expect(Math.round(v * 10) / 10).toBe(v);
 				}
 			}
+			// Light, the fan and heavy form one ordered chain; the typical line is
+			// one served day, clamped into [heavy, light], not ordered against the fan.
+			const chain = all.filter((l) => l.level !== 50);
+			const b = block as ForecastBlock;
 			for (let i = 0; i < n; i++) {
-				for (let j = 1; j < all.length; j++) {
-					expect(all[j]?.values[i] ?? Number.NaN).toBeLessThanOrEqual(
-						all[j - 1]?.values[i] ?? Number.NaN,
+				for (let j = 1; j < chain.length; j++) {
+					expect(chain[j]?.values[i] ?? Number.NaN).toBeLessThanOrEqual(
+						chain[j - 1]?.values[i] ?? Number.NaN,
 					);
 				}
+				expect(b.typical[i] ?? Number.NaN).toBeLessThanOrEqual(
+					b.light[i] ?? Number.NaN,
+				);
+				expect(b.typical[i] ?? Number.NaN).toBeGreaterThanOrEqual(
+					b.heavy[i] ?? Number.NaN,
+				);
 			}
 		}
 	});

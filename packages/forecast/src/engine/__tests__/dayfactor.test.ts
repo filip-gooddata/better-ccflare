@@ -128,13 +128,13 @@ describe("day factor with an evidence weight (amendment 4)", () => {
 
 		const withNight = await typicalStops(night);
 		const without = await typicalStops(quiet);
-		// the same single stop, both ends pinned (Prague time): 14:50-16:00 with the night,
-		// 15:09-15:55 without
+		// one single stop each, both ends pinned (Prague time), the served day's own (day 88
+		// of 400 in both runs): 14:48-16:00 with the night, 14:59-16:00 without
 		expect(iso(without)).toEqual([
-			["2026-11-12T14:09:00.000Z", "2026-11-12T14:55:00.000Z"],
+			["2026-11-12T13:59:00.000Z", "2026-11-12T15:00:00.000Z"],
 		]);
 		expect(iso(withNight)).toEqual([
-			["2026-11-12T13:50:00.000Z", "2026-11-12T15:00:00.000Z"],
+			["2026-11-12T13:48:00.000Z", "2026-11-12T15:00:00.000Z"],
 		]);
 	});
 

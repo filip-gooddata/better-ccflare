@@ -214,6 +214,14 @@ export interface ForecastInput {
 	/** Recorded readings, ascending: at least since Monday 00:00 local, and as far back as calibration looks. */
 	readings: LimitReading[];
 	sessions: LiveSession[];
+	/** The simulated day the previous poll served as the typical day line; absent or null picks afresh. */
+	heldDay?: ServedDay | null;
+}
+
+/** A simulated day served as the typical day line: its index among the simulated days of a local date. */
+export interface ServedDay {
+	date: string;
+	day: number;
 }
 
 export interface PlacementAdvice {
@@ -361,6 +369,8 @@ export type ForecastResult =
 			plan: Plan;
 			/** What the forecast was computed from; the HTTP response never carries it. */
 			inputs?: ForecastInputsDetail;
+			/** The simulated day served as the typical day line; the HTTP response never carries it. */
+			servedDay?: ServedDay;
 	  }
 	| {
 			available: false;

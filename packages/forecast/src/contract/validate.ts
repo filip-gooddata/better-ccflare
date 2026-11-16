@@ -324,7 +324,8 @@ function validateBlock(
 		: null;
 	const pool = accounts.length > 0 ? 100 * accounts.length : undefined;
 
-	// Every line in percentile order: light, fan below 50, typical, fan above 50, heavy.
+	// The pointwise lines in percentile order: light, the fan, heavy. typical is one
+	// simulated day, ordered only against light and heavy.
 	const lines: { percentile: number; path: string; values: number[] | null }[] =
 		[];
 	const named: Record<string, number[] | null> = {};
@@ -335,7 +336,8 @@ function validateBlock(
 			? validateValues(path, block[name], times.length, err, pool)
 			: null;
 		named[name] = values;
-		lines.push({ percentile: NAMED_LEVELS[name], path, values });
+		if (name !== "typical")
+			lines.push({ percentile: NAMED_LEVELS[name], path, values });
 	}
 	if (has("fan")) {
 		const fan = block.fan;
@@ -359,18 +361,28 @@ function validateBlock(
 			}
 	}
 	lines.sort((a, b) => a.percentile - b.percentile);
-	if (times)
-		for (let l = 1; l < lines.length; l++) {
-			const upper = lines[l - 1];
-			const lower = lines[l];
-			if (!upper.values || !lower.values) continue;
-			for (let i = 0; i < times.length; i++)
-				if (lower.values[i] > upper.values[i] + EPSILON)
-					err(
-						`${lower.path}[${i}]`,
-						`(${lower.values[i]}) is above ${upper.path}[${i}] (${upper.values[i]}); levels must not rise with the percentile`,
-					);
-		}
+	const ordered = (
+		upper: (typeof lines)[number],
+		lower: (typeof lines)[number],
+	) => {
+		if (!times || !upper.values || !lower.values) return;
+		for (let i = 0; i < times.length; i++)
+			if (lower.values[i] > upper.values[i] + EPSILON)
+				err(
+					`${lower.path}[${i}]`,
+					`(${lower.values[i]}) is above ${upper.path}[${i}] (${upper.values[i]}); levels must not rise with the percentile`,
+				);
+	};
+	for (let l = 1; l < lines.length; l++) ordered(lines[l - 1], lines[l]);
+	if (has("typical")) {
+		const line = (name: "light" | "typical" | "heavy") => ({
+			percentile: NAMED_LEVELS[name],
+			path: `${key}.${name}`,
+			values: named[name] ?? null,
+		});
+		if (has("light")) ordered(line("light"), line("typical"));
+		if (has("heavy")) ordered(line("typical"), line("heavy"));
+	}
 
 	const stops: Partial<Record<(typeof STOP_LEVELS)[number], Interval[]>> = {};
 	if (has("stops")) {
