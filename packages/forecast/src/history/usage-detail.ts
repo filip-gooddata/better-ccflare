@@ -1,6 +1,6 @@
 /**
  * Usage detail kept for the calibration learners: token sums per category and
- * model family per bucket, and a log of activity episodes per session.
+ * model family per bucket, and an ordered log of the requests of each session.
  *
  * Usage metadata only. No row holds message text, a session id, a file name,
  * a path or a tool name; sessions appear only as an opaque salted key.
@@ -9,14 +9,21 @@ import type { EpochMs, ModelFamily } from "../types";
 
 export type UsageDetailSource = "transcript" | "proxy";
 
-/** Two requests of one session closer than this belong to one episode. */
-export const EPISODE_GAP_MS = 60_000;
-
 /** forecast_meta key of the per-install salt for session keys. */
 export const SESSION_SALT_META_KEY = "usage_session_salt";
 
 /** forecast_meta key set once the transcript usage-detail pass has finished. */
 export const USAGE_DETAIL_BACKFILL_META_KEY = "transcript_usage_detail_done";
+
+/**
+ * forecast_meta key holding a JSON object of counts and epoch-ms bounds of what
+ * the transcript pass covered: { files, lines, requests, firstAt, lastAt }.
+ */
+export const USAGE_DETAIL_BACKFILL_COVERAGE_META_KEY =
+	"transcript_usage_detail_coverage";
+
+/** forecast_meta key: epoch ms of the first proxy sync that recorded usage detail. */
+export const USAGE_DETAIL_PROXY_SINCE_META_KEY = "proxy_usage_detail_since";
 
 /**
  * Token sums of one (bucket, account, source, family). `accountId` is "" for
@@ -39,27 +46,24 @@ export interface UsageTokenRow {
 }
 
 /**
- * One activity episode of one session: a run of requests whose gaps are all
- * below EPISODE_GAP_MS. `gapBeforeMs` is the time from the previous episode's
- * last request, null for a session's first episode. The `first*` fields
- * describe the episode's first request; the sums cover the whole episode,
- * with the same split rule as UsageTokenRow.
+ * One request of one session, in time order. Learners derive idle gaps,
+ * turnover and cache-class transitions from the sequence. `seq` orders
+ * requests of one session that share the same `at` (0 for the first).
+ * The split fields are null when the source did not report the split.
  */
-export interface SessionEpisodeRow {
+export interface SessionRequestRow {
 	source: UsageDetailSource;
 	sessionKey: string;
 	accountId: string;
-	startedAt: EpochMs;
-	endedAt: EpochMs;
-	gapBeforeMs: number | null;
-	requestCount: number;
-	firstFamily: ModelFamily;
-	firstCacheReadTokens: number;
-	firstCacheWriteTokens: number;
+	at: EpochMs;
+	seq: number;
+	family: ModelFamily;
+	inputTokens: number;
+	outputTokens: number;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
-	cacheWrite5mTokens: number;
-	cacheWrite1hTokens: number;
+	cacheWrite5mTokens: number | null;
+	cacheWrite1hTokens: number | null;
 }
 
 /**
@@ -69,31 +73,33 @@ export interface SessionEpisodeRow {
 export interface UsageDetailDb {
 	/** Insert or replace by (bucketStart, accountId, source, family). */
 	upsertUsageTokens(rows: UsageTokenRow[]): Promise<void>;
-	/** Replace every row of `source` with bucketStart in [from, to) by `rows`. */
+	/** Replace every row of `source` with bucketStart in [from, to) by `rows`, in one transaction. */
 	replaceUsageTokens(
 		source: UsageDetailSource,
 		from: EpochMs,
 		to: EpochMs,
 		rows: UsageTokenRow[],
 	): Promise<void>;
-	/** Insert or replace by (source, sessionKey, startedAt). */
-	upsertSessionEpisodes(rows: SessionEpisodeRow[]): Promise<void>;
-	/** Replace every episode of `source` with startedAt >= from by `rows`. */
-	replaceSessionEpisodesFrom(
-		source: UsageDetailSource,
-		from: EpochMs,
-		rows: SessionEpisodeRow[],
-	): Promise<void>;
-	/** Episodes of `source` with endedAt >= since, ascending by startedAt. */
-	getSessionEpisodesEndingSince(
-		source: UsageDetailSource,
-		since: EpochMs,
-	): Promise<SessionEpisodeRow[]>;
 	getUsageTokens(
 		source: UsageDetailSource,
 		from: EpochMs,
 		to: EpochMs,
 	): Promise<UsageTokenRow[]>;
-	/** Delete token rows with bucketStart < before and episodes with endedAt < before. */
+	/** Insert or replace by (source, sessionKey, at, seq). */
+	upsertSessionRequests(rows: SessionRequestRow[]): Promise<void>;
+	/** Replace every row of `source` with `at` in [from, to) by `rows`, in one transaction. */
+	replaceSessionRequests(
+		source: UsageDetailSource,
+		from: EpochMs,
+		to: EpochMs,
+		rows: SessionRequestRow[],
+	): Promise<void>;
+	/** Rows of `source` with `at` in [from, to), ascending by (sessionKey, at, seq). */
+	getSessionRequests(
+		source: UsageDetailSource,
+		from: EpochMs,
+		to: EpochMs,
+	): Promise<SessionRequestRow[]>;
+	/** Delete token rows with bucketStart < before and session rows with at < before. */
 	pruneUsageDetail(before: EpochMs): Promise<void>;
 }
