@@ -13,6 +13,7 @@ import { BUCKET_MS } from "../../types";
 import { bucketStart } from "../../units";
 import { computeHorizon } from "../horizon";
 import type { EngineContext } from "../model";
+import { plainPace } from "../pace";
 
 export const TZ = "Europe/Prague";
 export const MIN = 60_000;
@@ -51,6 +52,7 @@ export function settings(
 		recentTauMin: 45,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
+		paceConditioning: true,
 		...over,
 	};
 }
@@ -172,9 +174,6 @@ export function makeCtx(spec: CtxSpec): EngineContext {
 				key: "2026-11-12",
 				start: prague(12, 0),
 				type: "workday",
-				unitsSoFar: 0,
-				recentRate: 0,
-				recentFableRate: 0,
 			},
 		},
 		calibration: {
@@ -191,9 +190,7 @@ export function makeCtx(spec: CtxSpec): EngineContext {
 				noise: false,
 				noiseMode: "off",
 				bandwidths: {},
-				dayFactor: 1,
-				day: { a: 1, raw: 1, clamped: 1, weight: 0, y: 0, m: 0, c: 0 },
-				recentRate: 0,
+				pace: plainPace("unfitted"),
 			},
 		},
 		workStartMinute: spec.workStartMinute ?? null,

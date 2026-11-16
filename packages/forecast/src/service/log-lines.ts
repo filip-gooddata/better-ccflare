@@ -1,10 +1,11 @@
 /**
  * The service's summary log lines: the end of the transcript backfill and why there is no
  * forecast (design amendment 3, C2), and what an available forecast was computed from
- * (amendment 4, D2). All are built only from numbers, dates, fixed words and account ids,
+ * (amendment 4, D2; E4 pace). All are built only from numbers, dates, fixed words and ids,
  * never from text a transcript or a path could have supplied.
  */
 import type { PlanLowPoints } from "../engine/model";
+import { PACE_BANDS } from "../engine/pace";
 import type {
 	EpochMs,
 	ForecastInputsDetail,
@@ -91,6 +92,11 @@ const ACCOUNT_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const POOLS = new Set(["workday", "monday", "weekend", "weekdays"]);
 const LIMITS = new Set(["five_hour", "seven_day", "seven_day_fable"]);
 const SOURCES = new Set(["own", "borrowed", "none"]);
+const PACE_STATUSES = new Set(["fitted", "unfitted", "off"]);
+const BAND_IDS = new Set(PACE_BANDS.map((b) => b.id));
+const FEATURE_ID = /^[A-Za-z0-9:_.+-]{1,64}$/;
+/** Cells below the evidence floor listed by name after their count; the rest are counted only. */
+const BELOW_FLOOR_LISTED = 12;
 
 function fixed(v: unknown, digits: number): string {
 	return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "?";
@@ -120,16 +126,62 @@ function orNone(v: number | null, digits: number): string {
 	return v === null ? "none" : fixed(v, digits);
 }
 
+function featureId(v: unknown): string {
+	return typeof v === "string" && FEATURE_ID.test(v) ? v : "?";
+}
+
 /**
- * One INFO line with what an available forecast was computed from: the day factor, the
- * recent rate, today's pool, the learned work start, every k with the hours ago of the
+ * Today's pace (E4, requirement 11): status, the fit's age in minutes and the days, ISO weeks
+ * and established cells it saw; the multiplier per band now; the selected feature per band
+ * with today's ratio to its baseline, its coefficient, its ridge lambda and whether it was
+ * clipped to its training range; the cells below the evidence floor with their units.
+ */
+function paceFields(
+	d: ForecastInputsDetail,
+	now: EpochMs,
+): string[] {
+	const model = d.paceModel;
+	const bands = d.pace.bands;
+	const selected = bands
+		.filter((b) => b.feature !== null)
+		.map(
+			(b) =>
+				`${word(b.band, BAND_IDS)}:${featureId(b.feature)}=${fixed(b.ratio, 2)}x/b${fixed(b.coef, 2)}/lambda${fixed(b.lambda, 2)}${b.clipped ? "/clip" : ""}`,
+		);
+	const below = model?.belowFloor ?? [];
+	const listed = below
+		.slice(0, BELOW_FLOOR_LISTED)
+		.map(
+			(c) => `${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
+		);
+	const more = below.length - listed.length;
+	return [
+		`e4=${word(d.pace.status, PACE_STATUSES)}`,
+		`fitAge=${model ? num(Math.round((now - model.fittedAt) / 60_000)) : "none"}`,
+		`days=${model ? num(model.days) : "none"}`,
+		`weeks=${model ? num(model.weeks) : "none"}`,
+		`cells=${model ? `${num(model.cellsEstablished)}/${num(model.cellsTotal)}` : "none"}`,
+		"e4m",
+		...bands.map((b) => `${word(b.band, BAND_IDS)}=${fixed(b.m, 2)}`),
+		"e4f",
+		...(selected.length > 0 ? selected : ["none"]),
+		"e4floor",
+		`count=${below.length}`,
+		...listed,
+		...(more > 0 ? [`more=${more}`] : []),
+	];
+}
+
+/**
+ * One INFO line with what an available forecast was computed from: today's pace (see
+ * paceFields), today's pool, the learned work start, every k with the hours ago of the
  * oldest and newest reading it counted, and each account's weekly cap on the day line
- * (r = k5 / kW, and whether it binds now). Numbers, fixed words and account ids only.
+ * (r = k5 / kW, and whether it binds now). Numbers, fixed words and ids only.
  */
 export function inputsLine(
 	d: ForecastInputsDetail & Partial<PlanLowPoints>,
+	now: EpochMs,
 ): string {
-	const f = d.dayFactor;
 	const limits = d.limits.map(
 		(l) =>
 			`${accountId(l.accountId)}/${word(l.limit, LIMITS)}=${l.k === null ? "none" : fixed(l.k, 4)} ${word(l.source, SOURCES)} instances=${num(l.instances)} points=${num(l.points)} oldestH=${orNone(l.oldestHoursAgo, 1)} newestH=${orNone(l.newestHoursAgo, 1)}`,
@@ -140,14 +192,7 @@ export function inputsLine(
 	);
 	return [
 		"forecast inputs",
-		`dayFactor a=${fixed(f.a, 3)}`,
-		`clamped=${fixed(f.clamped, 3)}`,
-		`w=${fixed(f.weight, 4)}`,
-		`raw=${fixed(f.raw, 3)}`,
-		`Y=${fixed(f.y, 2)}`,
-		`M=${fixed(f.m, 2)}`,
-		`c=${fixed(f.c, 2)}`,
-		`recentRate=${fixed(d.recentRatePerHour, 2)}/h`,
+		...paceFields(d, now),
 		`pool=${word(d.pool.name, POOLS)}:${num(d.pool.days)}`,
 		`median=${orNone(d.pool.medianUnits, 1)}`,
 		`p90=${orNone(d.pool.p90Units, 1)}`,
@@ -175,16 +220,18 @@ function lowPointFields(d: Partial<PlanLowPoints>): string[] {
 }
 
 /**
- * What a new line must differ in: a rounded to 0.1 and each k rounded to 0.05. The reading
- * ages, r and the cap's binds flag stay out, like the other printed numbers: the ages move at
- * every computation, r follows the keyed k5 and kW, and binds can flip at each computation
- * while an account's two quotas left sit near each other (serving lowers both at the same
- * rate). A line written for another reason carries their current values.
+ * What a new line must differ in: the pace status, the fit (by its fittedAt), each band's
+ * multiplier rounded to 0.05 and each k rounded to 0.05. The fit's age, the features' ratios
+ * and coefficients, the reading ages, r and the cap's binds flag stay out: the ages move at
+ * every computation, ratios and coefficients move with the multipliers they make, r follows
+ * the keyed k5 and kW, and binds can flip at each computation while an account's two quotas
+ * left sit near each other (serving lowers both at the same rate). A line written for another
+ * reason carries their current values.
  */
 function inputsKey(d: ForecastInputsDetail): string {
-	const a = Number.isFinite(d.dayFactor.a)
-		? String(Math.round(d.dayFactor.a * 10))
-		: "?";
+	const ms = d.pace.bands.map((b) =>
+		Number.isFinite(b.m) ? String(Math.round(b.m * 20)) : "?",
+	);
 	const sorted = [...d.limits].sort(
 		(x, y) =>
 			x.accountId.localeCompare(y.accountId) || x.limit.localeCompare(y.limit),
@@ -193,13 +240,19 @@ function inputsKey(d: ForecastInputsDetail): string {
 		(l) =>
 			`${l.accountId}/${l.limit}=${l.k === null || !Number.isFinite(l.k) ? "none" : Math.round(l.k * 20)}`,
 	);
-	return [a, ...ks].join(" ");
+	return [
+		d.pace.status,
+		String(d.paceModel?.fittedAt ?? "none"),
+		...ms,
+		...ks,
+	].join(" ");
 }
 
 /**
- * Logs the forecast's inputs at the first available computation, then when a (to 0.1) or a k
- * (to 0.05) differs from the last line written, at most once per INPUTS_MIN_SPACING_MS: a
- * change inside the span is written by the first computation after it, with the state then.
+ * Logs the forecast's inputs at the first available computation, then when the pace status,
+ * the fit, a band multiplier (to 0.05) or a k (to 0.05) differs from the last line written, at
+ * most once per INPUTS_MIN_SPACING_MS: a change inside the span is written by the first
+ * computation after it, with the state then.
  */
 export function createInputsLog(log: (msg: string) => void): {
 	record(result: ForecastResult, now: EpochMs): void;
@@ -216,7 +269,7 @@ export function createInputsLog(log: (msg: string) => void): {
 			}
 			lastKey = key;
 			lastAt = now;
-			log(inputsLine(result.inputs));
+			log(inputsLine(result.inputs, now));
 		},
 	};
 }

@@ -17,11 +17,9 @@ import { BUCKET_MS } from "../../types";
 import { buildDayTable, poolFor } from "../days";
 import { computeHorizon } from "../horizon";
 import type { DayTable, RecordedDay } from "../model";
+import { type PaceNow, paceMultiplierAt, plainPace } from "../pace";
 import {
 	buildScenarios,
-	DAY_FACTOR_MAX,
-	DAY_FACTOR_MIN,
-	dayFactor,
 	resolveNoiseMode,
 	scaleBandwidth,
 	scaleKernel,
@@ -32,6 +30,8 @@ const TZ = "Europe/Prague";
 // Thursday 2026-11-12 10:00 CET
 const NOW = Date.UTC(2026, 10, 12, 9, 0);
 const DAY = 86_400_000;
+/** The plain lines (m = 1 in every band). */
+const PLAIN = plainPace("unfitted");
 
 function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 	return {
@@ -54,6 +54,7 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
+		paceConditioning: true,
 		...over,
 	};
 }
@@ -172,130 +173,6 @@ describe("scaleBandwidth", () => {
 	});
 });
 
-describe("dayFactor", () => {
-	function flatTable(unitsSoFar: number): {
-		table: DayTable;
-		pool: RecordedDay[];
-	} {
-		const todayStart = localDayStart(NOW, TZ);
-		const pool: RecordedDay[] = [1, 2, 3, 4, 5].map((i) => ({
-			key: `d${i}`,
-			start: addLocalDays(todayStart, -i, TZ),
-			type: "workday",
-			weight: 1 / i,
-			units: new Float64Array(288).fill(0.01),
-			fable: new Float64Array(288),
-			total: 2.88,
-			fableTotal: 0,
-		}));
-		return {
-			pool,
-			table: {
-				days: pool,
-				today: {
-					key: "2026-11-12",
-					start: todayStart,
-					type: "workday",
-					unitsSoFar,
-					recentRate: 0,
-					recentFableRate: 0,
-				},
-			},
-		};
-	}
-
-	test("a = (Y + c) / (M + c), c a quarter of the weighted mean daily total", () => {
-		const { table, pool } = flatTable(2.4);
-		// 10:00: M = 120 buckets × 0.01 = 1.2; c = 0.72
-		expect(dayFactor(table, pool, NOW, TZ)).toBeCloseTo(3.12 / 1.92, 12);
-		// mid-bucket: 10:02:30 → M = 120.5 × 0.01
-		expect(dayFactor(table, pool, NOW + 150_000, TZ)).toBeCloseTo(
-			3.12 / (1.205 + 0.72),
-			12,
-		);
-	});
-
-	test("clamped to the named range", () => {
-		expect(DAY_FACTOR_MIN).toBeLessThan(1);
-		expect(DAY_FACTOR_MAX).toBeGreaterThan(1);
-		const high = flatTable(100);
-		expect(dayFactor(high.table, high.pool, NOW, TZ)).toBe(DAY_FACTOR_MAX);
-		const low = flatTable(0);
-		// 22:00: M = 2.64, a = 0.72 / 3.36 ≈ 0.21 → clamped
-		const late = Date.UTC(2026, 10, 12, 21, 0);
-		expect(dayFactor(low.table, low.pool, late, TZ)).toBe(
-			Math.max(DAY_FACTOR_MIN, 0.72 / 3.36),
-		);
-	});
-
-	test("an empty pool gives 1", () => {
-		const { table } = flatTable(1);
-		expect(dayFactor(table, [], NOW, TZ)).toBe(1);
-	});
-
-	test("a pool whose days are all empty (c = 0) gives 1", () => {
-		const { table, pool } = flatTable(5);
-		const empty = pool.map((d) => ({
-			...d,
-			units: new Float64Array(288),
-			total: 0,
-		}));
-		expect(dayFactor(table, empty, NOW, TZ)).toBe(1);
-	});
-
-	// amendment 4, D1: c = 0.72 for flatTable; M = 0.01 per elapsed 5 minutes, so w = M ÷ c
-	// reaches 1 at 06:00 local (72 buckets).
-	const C_FLAT = 0.72;
-	function weightAt(t: number): number {
-		const m = (localParts(t, TZ).minuteOfDay / 5) * 0.01;
-		return Math.min(1, m / C_FLAT);
-	}
-
-	test("before the pool's day is a quarter done, the clamped factor is weighted by M ÷ c (amendment 4)", () => {
-		// 02:00 local: M = 0.24, w = 1/3; Y = 100 → raw (100.72 / 0.96) clamps to 4
-		const twoAm = Date.UTC(2026, 10, 12, 1, 0);
-		const { table, pool } = flatTable(100);
-		expect(dayFactor(table, pool, twoAm, TZ)).toBeCloseTo(
-			1 + (DAY_FACTOR_MAX - 1) / 3,
-			12,
-		);
-		// quiet: Y = 0 → raw 0.72 / 0.96 = 0.75, inside the range, weighted by 1/3
-		const quiet = flatTable(0);
-		expect(dayFactor(quiet.table, quiet.pool, twoAm, TZ)).toBeCloseTo(
-			1 + (0.75 - 1) / 3,
-			12,
-		);
-	});
-
-	test("once M ≥ c the factor is exactly the clamped ratio, upward and downward (amendment 4)", () => {
-		// 10:00: w = 1 (M = 1.2 ≥ c)
-		expect(weightAt(NOW)).toBe(1);
-		const up = flatTable(2.4);
-		expect(dayFactor(up.table, up.pool, NOW, TZ)).toBeCloseTo(3.12 / 1.92, 12);
-		const quiet = flatTable(0);
-		const a = dayFactor(quiet.table, quiet.pool, NOW, TZ);
-		expect(a).toBeCloseTo(0.72 / 1.92, 12);
-		expect(a).toBeLessThan(1);
-	});
-
-	test("for any Y the factor stays within 1 + (MAX − 1)·w and 1 − (1 − MIN)·w, and is continuous in the time of day (amendment 4)", () => {
-		const dayStart = localDayStart(NOW, TZ);
-		for (const y of [0, 0.05, 0.5, 2.4, 10, 1000]) {
-			const { table, pool } = flatTable(y);
-			let prev: number | null = null;
-			for (let min = 0; min < 1440; min++) {
-				const t = dayStart + min * 60_000;
-				const w = weightAt(t);
-				const a = dayFactor(table, pool, t, TZ);
-				expect(a).toBeLessThanOrEqual(1 + (DAY_FACTOR_MAX - 1) * w + 1e-12);
-				expect(a).toBeGreaterThanOrEqual(1 - (1 - DAY_FACTOR_MIN) * w - 1e-12);
-				// one minute moves w by at most 0.002 / 0.72 and the ratio by a little: no jump
-				if (prev !== null) expect(Math.abs(a - prev)).toBeLessThan(0.02);
-				prev = a;
-			}
-		}
-	});
-});
 
 describe("buildScenarios", () => {
 	function setup(now: EpochMs, over: Partial<ForecastSettings> = {}) {
@@ -318,7 +195,7 @@ describe("buildScenarios", () => {
 
 	test("shape, bucket 0 holds now, diagnostics", async () => {
 		const { input, table, horizon } = setup(NOW, { simulatedDays: 20 });
-		const sc = await buildScenarios(input, table, horizon, { noise: true });
+		const sc = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
 		expect(sc.start).toBe(Math.floor(NOW / BUCKET_MS) * BUCKET_MS);
 		expect(sc.bucketCount).toBe(
 			Math.floor((horizon.simEnd - 1 - sc.start) / BUCKET_MS) + 1,
@@ -327,7 +204,7 @@ describe("buildScenarios", () => {
 		expect(sc.fable.length).toBe(20);
 		for (const u of sc.units) expect(u.length).toBe(sc.bucketCount);
 		expect(sc.diagnostics.noise).toBe(true);
-		expect(sc.diagnostics.recentRate).toBe(table.today.recentRate);
+		expect(sc.diagnostics.pace).toBe(PLAIN);
 		expect(Object.keys(sc.diagnostics.bandwidths).sort()).toEqual([
 			"2026-11-12",
 			"2026-11-13",
@@ -343,12 +220,6 @@ describe("buildScenarios", () => {
 			scaleBandwidth(workPool),
 			12,
 		);
-		expect(sc.diagnostics.dayFactor).toBeCloseTo(
-			dayFactor(table, poolFor(table, "workday"), NOW, TZ),
-			12,
-		);
-		// bucket 0 is 0 minutes ahead: pure last-hour rate
-		expect(sc.units[0]?.[0]).toBeCloseTo(table.today.recentRate, 6);
 	});
 
 	test("noise off: every later-date simulated day is one recorded day of its pool, bucket for bucket", async () => {
@@ -356,7 +227,7 @@ describe("buildScenarios", () => {
 			simulatedDays: 60,
 			recentTauMin: 0.001,
 		});
-		const sc = await buildScenarios(input, table, horizon, { noise: false });
+		const sc = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
 		expect(sc.diagnostics.noise).toBe(false);
 		const todayStart = localDayStart(NOW, TZ);
 		const checks: [string, number, RecordedDay[]][] = [
@@ -391,14 +262,179 @@ describe("buildScenarios", () => {
 		}
 	});
 
+	test("off and unfitted give the plain lines: today too is one recorded day of its pool from now on, with no day factor and no last-hour rate", async () => {
+		// τ = 60: a last-hour blend, were one left, would move today's first hours
+		const { input, table, horizon } = setup(NOW, {
+			simulatedDays: 40,
+			recentTauMin: 60,
+		});
+		const off = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			plainPace("off"),
+		);
+		const unfitted = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			PLAIN,
+		);
+		expect(off.units).toEqual(unfitted.units);
+		expect(off.fable).toEqual(unfitted.fable);
+		const todayStart = localDayStart(NOW, TZ);
+		const [b0, b1] = dateRange(off.start, "2026-11-12", todayStart);
+		const pool = poolFor(table, "workday");
+		const drawn = new Set<string>();
+		for (let s = 0; s < off.units.length; s++) {
+			const u = off.units[s] as Float32Array;
+			const f = off.fable[s] as Float32Array;
+			const match = pool.find((d) => {
+				const du = clockAligned(d, d.units);
+				const df = clockAligned(d, d.fable);
+				for (let j = 0; j < b1; j++) {
+					if (u[j] !== Math.fround(du[j - b0] as number)) return false;
+					if (f[j] !== Math.fround(df[j - b0] as number)) return false;
+				}
+				return true;
+			});
+			expect(match).toBeDefined();
+			drawn.add((match as RecordedDay).key);
+		}
+		expect(drawn.size).toBeGreaterThan(1);
+	});
+
+	test("a burst in the last hour of history leaves the plain lines unchanged: no fixed 60-minute recent window", async () => {
+		const { input, horizon } = setup(NOW, {
+			simulatedDays: 20,
+			recentTauMin: 60,
+		});
+		const burst: ForecastInput = {
+			...input,
+			history: input.history.map((b) =>
+				b.start >= NOW - 3_600_000
+					? { ...b, units: b.units * 50, fableUnits: b.fableUnits * 50 }
+					: b,
+			),
+		};
+		const quiet = await buildScenarios(
+			input,
+			buildDayTable(input),
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
+		const busy = await buildScenarios(
+			burst,
+			buildDayTable(burst),
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
+		expect(busy.units).toEqual(quiet.units);
+		expect(busy.fable).toEqual(quiet.fable);
+	});
+
+	/** The fitted pace with these band multipliers (bands in PACE_BANDS order). */
+	function planted(ms: number[]): PaceNow {
+		return {
+			status: "fitted",
+			fittedAt: NOW - 600_000,
+			bands: PLAIN.bands.map((b, i) => ({ ...b, m: ms[i] as number })),
+		};
+	}
+
+	function quantileAt(sc: { units: Float32Array[] }, j: number, p: number) {
+		const xs = sc.units.map((u) => u[j] as number).sort((x, y) => x - y);
+		return xs[Math.floor(p * (xs.length - 1))] as number;
+	}
+
+	test("a planted pace scales every simulated day by the multiplier at the bucket's minutes ahead, so the light, typical and heavy lines scale", async () => {
+		const { input, table, horizon } = setup(NOW, { simulatedDays: 40 });
+		const pace = planted([2, 1.5, 1.25, 1, 0.8, 0.9, 1.1, 1.3, 0.7]);
+		const plain = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			PLAIN,
+		);
+		const scaled = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: true },
+			pace,
+		);
+		expect(scaled.diagnostics.pace).toBe(pace);
+		// NOW is on a bucket edge: bucket j starts 5j minutes ahead
+		const expected: [number, number][] = [
+			[0, 2],
+			[30, 2],
+			[60, Math.sqrt(2 * 1.5)],
+			[120, paceMultiplierAt(pace, 120)],
+			[600, paceMultiplierAt(pace, 600)],
+			[2880, paceMultiplierAt(pace, 2880)],
+			[8640, 0.7],
+		];
+		for (const [ahead, m] of expected) {
+			const j = ahead / 5;
+			expect(j).toBeLessThan(plain.bucketCount);
+			expect(paceMultiplierAt(pace, ahead)).toBeCloseTo(m, 12);
+			for (let s = 0; s < plain.units.length; s++) {
+				const p = (plain.units[s] as Float32Array)[j] as number;
+				const pf = (plain.fable[s] as Float32Array)[j] as number;
+				expect((scaled.units[s] as Float32Array)[j]).toBeCloseTo(p * m, 6);
+				expect((scaled.fable[s] as Float32Array)[j]).toBeCloseTo(pf * m, 6);
+			}
+			for (const q of [0.1, 0.5, 0.9]) {
+				const base = quantileAt(plain, j, q);
+				expect(base).toBeGreaterThan(0);
+				expect(quantileAt(scaled, j, q)).toBeCloseTo(base * m, 6);
+			}
+		}
+	});
+
+	test("the bucket holding now is 0 minutes ahead; a later bucket is ahead by the minutes from now to its start", async () => {
+		const now = NOW + 150_000;
+		const { input, table, horizon } = setup(now, { simulatedDays: 5 });
+		const pace = planted([2, 1.5, 1.25, 1, 0.8, 0.9, 1.1, 1.3, 0.7]);
+		const plain = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			PLAIN,
+		);
+		const scaled = await buildScenarios(
+			input,
+			table,
+			horizon,
+			{ noise: false },
+			pace,
+		);
+		for (const [j, ahead] of [
+			[0, 0],
+			[7, 32.5],
+			[24, 117.5],
+		] as const) {
+			const m = paceMultiplierAt(pace, ahead);
+			const p = (plain.units[0] as Float32Array)[j] as number;
+			expect(p).toBeGreaterThan(0);
+			expect((scaled.units[0] as Float32Array)[j]).toBeCloseTo(p * m, 6);
+		}
+	});
+
 	test("noise on draws the same days as noise off (same random stream), scaled", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 30,
 			recentTauMin: 0.001,
 			timeShiftMin: 0,
 		});
-		const off = await buildScenarios(input, table, horizon, { noise: false });
-		const on = await buildScenarios(input, table, horizon, { noise: true });
+		const off = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
+		const on = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
 		const [b0, b1] = dateRange(
 			off.start,
 			"2026-11-13",
@@ -421,8 +457,8 @@ describe("buildScenarios", () => {
 			simulatedDays: 40,
 			recentTauMin: 0.001,
 		});
-		const a = await buildScenarios(input, table, horizon, { noise: true });
-		const b = await buildScenarios(input, table, horizon, { noise: true });
+		const a = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
+		const b = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
 		expect(b.units).toEqual(a.units);
 		expect(b.fable).toEqual(a.fable);
 		// same day, an hour later: the same draws for later dates
@@ -432,7 +468,7 @@ describe("buildScenarios", () => {
 		});
 		const c = await buildScenarios(later.input, later.table, later.horizon, {
 			noise: true,
-		});
+		}, PLAIN);
 		const fri = addLocalDays(localDayStart(NOW, TZ), 1, TZ);
 		const ia = (fri - a.start) / BUCKET_MS;
 		const ic = (fri - c.start) / BUCKET_MS;
@@ -444,62 +480,10 @@ describe("buildScenarios", () => {
 			...table,
 			today: { ...table.today, key: "2026-11-13" },
 		};
-		const d = await buildScenarios(input, other, horizon, { noise: true });
+		const d = await buildScenarios(input, other, horizon, { noise: true }, PLAIN);
 		expect(d.units).not.toEqual(a.units);
 	});
 
-	test("today is scaled by the day factor, later dates are not", async () => {
-		const { input, table, horizon } = setup(NOW, {
-			simulatedDays: 10,
-			recentTauMin: 0.001,
-		});
-		const heavy: DayTable = {
-			...table,
-			today: { ...table.today, unitsSoFar: table.today.unitsSoFar * 2 },
-		};
-		const base = await buildScenarios(input, table, horizon, { noise: false });
-		const up = await buildScenarios(input, heavy, horizon, { noise: false });
-		const ratio = up.diagnostics.dayFactor / base.diagnostics.dayFactor;
-		expect(ratio).toBeGreaterThan(1.1);
-		// 14:00 today, far beyond τ
-		const j = (Date.UTC(2026, 10, 12, 13, 0) - base.start) / BUCKET_MS;
-		expect((up.units[0] as Float32Array)[j]).toBeCloseTo(
-			((base.units[0] as Float32Array)[j] as number) * ratio,
-			6,
-		);
-		const k = (Date.UTC(2026, 10, 13, 13, 0) - base.start) / BUCKET_MS;
-		expect((up.units[0] as Float32Array)[k]).toBe(
-			(base.units[0] as Float32Array)[k] as number,
-		);
-	});
-
-	test("the last-hour blend weights e^(−h/τ)", async () => {
-		const tau = 60;
-		const { input, table, horizon } = setup(NOW, {
-			simulatedDays: 3,
-			recentTauMin: tau,
-		});
-		const off = await buildScenarios(input, table, horizon, { noise: false });
-		const noBlend = await buildScenarios(
-			{
-				...input,
-				settings: settings({ simulatedDays: 3, recentTauMin: 0.001 }),
-			},
-			table,
-			horizon,
-			{ noise: false },
-		);
-		const r = table.today.recentRate;
-		for (const j of [3, 12, 30]) {
-			const h = (off.start + j * BUCKET_MS - NOW) / 60_000;
-			const w = Math.exp(-h / tau);
-			const v = (noBlend.units[1] as Float32Array)[j] as number;
-			expect((off.units[1] as Float32Array)[j]).toBeCloseTo(
-				w * r + (1 - w) * v,
-				6,
-			);
-		}
-	});
 
 	test("a longer horizon leaves the draws of the shared dates unchanged", async () => {
 		const input = makeInput(NOW, { simulatedDays: 30, recentTauMin: 0.001 });
@@ -507,8 +491,8 @@ describe("buildScenarios", () => {
 		const short = computeHorizon(NOW, [account(NOW + 2 * DAY)], TZ);
 		const long = computeHorizon(NOW, [account(NOW + 7 * DAY)], TZ);
 		expect(long.simEnd).toBeGreaterThan(short.simEnd);
-		const a = await buildScenarios(input, table, short, { noise: true });
-		const b = await buildScenarios(input, table, long, { noise: true });
+		const a = await buildScenarios(input, table, short, { noise: true }, PLAIN);
+		const b = await buildScenarios(input, table, long, { noise: true }, PLAIN);
 		for (let s = 0; s < 30; s++)
 			expect(
 				Array.from((b.units[s] as Float32Array).subarray(0, a.bucketCount)),
@@ -527,7 +511,7 @@ describe("buildScenarios", () => {
 		expect(poolFor(noWeekends, "weekend")).toEqual([]);
 		const sc = await buildScenarios(input, noWeekends, horizon, {
 			noise: false,
-		});
+		}, PLAIN);
 		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
 		const [b0] = dateRange(sc.start, "2026-11-14", sat);
 		for (const u of sc.units) {
@@ -558,7 +542,7 @@ describe("buildScenarios", () => {
 		const horizon = computeHorizon(NOW, input.accounts, TZ);
 		const sc = await buildScenarios(weekdaysOnly, table, horizon, {
 			noise: true,
-		});
+		}, PLAIN);
 		expect(sc.diagnostics.bandwidths["2026-11-14"]).toBe(0);
 		const sat = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
 		const [b0, b1] = dateRange(sc.start, "2026-11-14", sat);
@@ -590,7 +574,7 @@ describe("buildScenarios", () => {
 			};
 		});
 		const handmade: DayTable = { days, today: table.today };
-		const sc = await buildScenarios(input, handmade, horizon, { noise: true });
+		const sc = await buildScenarios(input, handmade, horizon, { noise: true }, PLAIN);
 		expect(sc.diagnostics.bandwidths["2026-11-13"]).toBe(0);
 		const fri = addLocalDays(todayStart, 1, TZ);
 		const [b0] = dateRange(sc.start, "2026-11-13", fri);
@@ -619,7 +603,7 @@ describe("buildScenarios", () => {
 			simulatedDays: 20,
 			recentTauMin: 0.001,
 		});
-		const sc = await buildScenarios(input, table, horizon, { noise: false });
+		const sc = await buildScenarios(input, table, horizon, { noise: false }, PLAIN);
 		const sun = addLocalDays(localDayStart(now, TZ), 2, TZ);
 		const [b0, b1] = dateRange(sc.start, "2026-03-29", sun);
 		expect(b1 - b0).toBe(276);
@@ -651,7 +635,7 @@ describe("buildScenarios", () => {
 		};
 		setImmediate(tick);
 		const t0 = performance.now();
-		const sc = await buildScenarios(input, table, horizon, { noise: true });
+		const sc = await buildScenarios(input, table, horizon, { noise: true }, PLAIN);
 		const wall = performance.now() - t0;
 		running = false;
 		console.log(
@@ -755,7 +739,7 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 			};
 		});
 		const handmade: DayTable = { days: pool, today: table.today };
-		const sc = await buildScenarios(input, handmade, horizon, { noiseMode });
+		const sc = await buildScenarios(input, handmade, horizon, { noiseMode }, PLAIN);
 		expect(sc.diagnostics.noiseMode).toBe(noiseMode);
 		expect(sc.diagnostics.noise).toBe(noiseMode !== "off");
 		const fri = addLocalDays(todayStart, 1, TZ);

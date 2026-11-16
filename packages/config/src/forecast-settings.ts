@@ -26,6 +26,7 @@ export interface ForecastConfigData {
 	forecast_recent_tau_min?: unknown;
 	forecast_session_turnover_min?: unknown;
 	forecast_work_start_share_pct?: unknown;
+	forecast_pace_conditioning?: unknown;
 }
 
 type FileKey = keyof ForecastConfigData;
@@ -333,5 +334,11 @@ export function resolveForecastSettings(
 		recentTauMin: numbers.recentTauMin,
 		sessionTurnoverMin: numbers.sessionTurnoverMin,
 		workStartSharePct: numbers.workStartSharePct,
+		paceConditioning: resolveBoolean(
+			input,
+			"FORECAST_PACE_CONDITIONING",
+			"forecast_pace_conditioning",
+			true,
+		),
 	};
 }

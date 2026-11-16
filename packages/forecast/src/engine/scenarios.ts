@@ -1,18 +1,16 @@
 /**
  * Demand scenarios (design 4.4): a smoothed bootstrap of whole recorded days
- * (resampled recorded days plus kernel noise on scale and time), today scaled by
- * the call-centre intraday day-factor update, and every day blended from the
- * last hour's rate by an exponentially decaying weight.
+ * (resampled recorded days plus kernel noise on scale and time), every bucket
+ * scaled by today's pace (E4) at its distance ahead of now.
  */
 import { interquartileRange, sampleStandardDeviation } from "simple-statistics";
 import {
 	addLocalDays,
-	atLocalMinute,
 	localDayKey,
 	localDayStart,
 	localParts,
 } from "../time";
-import type { DayFactorDetail, EpochMs, ForecastInput } from "../types";
+import type { ForecastInput } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, poolFor } from "./days";
 import type {
@@ -23,6 +21,7 @@ import type {
 	RecordedDay,
 	Scenarios,
 } from "./model";
+import { type PaceNow, paceMultiplierAt } from "./pace";
 import { createRng, type Rng } from "./rng";
 import { yieldToEventLoop } from "./yield";
 
@@ -30,12 +29,6 @@ import { yieldToEventLoop } from "./yield";
 const SILVERMAN_FACTOR = 1.06;
 /** Interquartile range of a normal distribution in standard deviations (robust spread in Silverman's rule). */
 const NORMAL_IQR_SD = 1.34;
-/** Day-factor prior strength c as a share of the pool's weighted mean daily total (design 4.4). */
-export const DAY_FACTOR_PRIOR_SHARE = 0.25;
-/** Day factor floor: today counts as at most 4× quieter than its pool, so a slow morning cannot erase the afternoon. */
-export const DAY_FACTOR_MIN = 0.25;
-/** Day factor ceiling: today counts as at most 4× busier than its pool, so one burst cannot dominate the week. */
-export const DAY_FACTOR_MAX = 4;
 /** Simulated days built between two yields to the event loop; at defaults a block takes a few ms. */
 export const SIMULATED_DAYS_PER_YIELD = 25;
 
@@ -126,79 +119,6 @@ export function scaleLogShift(
 	return m + (logTotal - m + h * eps) / Math.sqrt(1 + (h * h) / s2) - logTotal;
 }
 
-/** Units of a recorded day from its local midnight over `elapsed` ms (the last bucket pro rata). */
-function prefixUnits(d: RecordedDay, elapsed: number): number {
-	const full = Math.min(d.units.length, Math.floor(elapsed / BUCKET_MS));
-	let sum = 0;
-	for (let i = 0; i < full; i++) sum += d.units[i] as number;
-	if (full < d.units.length)
-		sum +=
-			(d.units[full] as number) * ((elapsed - full * BUCKET_MS) / BUCKET_MS);
-	return sum;
-}
-
-/**
- * Call-centre intraday day-factor update: a = (Y + c) ÷ (M + c), Y = today's
- * units so far, M = the pool's weighted mean units over the same clock span
- * (local midnight to now's wall-clock time), c = DAY_FACTOR_PRIOR_SHARE of the
- * pool's weighted mean daily total; clamped to [DAY_FACTOR_MIN, DAY_FACTOR_MAX].
- */
-export function dayFactor(
-	table: DayTable,
-	pool: RecordedDay[],
-	now: EpochMs,
-	timeZone: string,
-): number {
-	return dayFactorDetail(table, pool, now, timeZone).a;
-}
-
-/**
- * Design amendment 4, D1: the clamped ratio (Y + c) ÷ (M + c), weighted by the evidence
- * w = min(1, M ÷ c) as a = 1 + (a_cl − 1) × w. Clamp first, then weight, so a burst in a span
- * where the pool has little demand moves the day by at most 1 + 3w up or 1 − 0.75w down.
- */
-export function dayFactorDetail(
-	table: DayTable,
-	pool: RecordedDay[],
-	now: EpochMs,
-	timeZone: string,
-): DayFactorDetail {
-	const y = table.today.unitsSoFar;
-	let weight = 0;
-	let total = 0;
-	let sameSpan = 0;
-	const minute = localParts(now, timeZone).minuteOfDay;
-	const intoMinute = Math.min(
-		59_999,
-		Math.max(0, now - atLocalMinute(table.today.start, minute, timeZone)),
-	);
-	for (const d of pool) {
-		const elapsed =
-			atLocalMinute(d.start, minute, timeZone) - d.start + intoMinute;
-		weight += d.weight;
-		total += d.weight * d.total;
-		sameSpan += d.weight * prefixUnits(d, elapsed);
-	}
-	const neutral = (m: number, c: number): DayFactorDetail => ({
-		a: 1,
-		raw: 1,
-		clamped: 1,
-		weight: 0,
-		y,
-		m,
-		c,
-	});
-	if (!(weight > 0)) return neutral(0, 0);
-	const c = DAY_FACTOR_PRIOR_SHARE * (total / weight);
-	const m = sameSpan / weight;
-	// c = 0: every day of the pool is empty, so there is no evidence to weigh
-	if (!(m + c > 0) || !(c > 0)) return neutral(m, c);
-	const raw = (y + c) / (m + c);
-	const clamped = Math.min(DAY_FACTOR_MAX, Math.max(DAY_FACTOR_MIN, raw));
-	const w = Math.min(1, m / c);
-	return { a: 1 + (clamped - 1) * w, raw, clamped, weight: w, y, m, c };
-}
-
 /** Index of each wall-clock slot (minute of day ÷ bucket) in a recorded day; -1 for a slot the day skipped. */
 function slotIndex(d: RecordedDay, timeZone: string): Int32Array | null {
 	if (d.units.length === SLOTS_PER_DAY) return null;
@@ -225,7 +145,6 @@ interface DatePlan {
 	/** Cumulative weights of `pool`. */
 	cumulative: Float64Array;
 	kernel: ScaleKernel;
-	factor: number;
 	/** This date's own stream, so a longer or shorter horizon leaves the other dates' draws unchanged. */
 	rng: Rng;
 }
@@ -248,9 +167,11 @@ function pick(cumulative: Float64Array, x: number): number {
  * from that date's pool with probability proportional to its weight; with noise,
  * scale it by exp(scaleLogShift(...)) (shrunk by default, see scaleLogShift; a
  * zero-total day has no log total and gets no scale noise), and shift it by a
- * uniform whole number of buckets within ±timeShiftMin; scale today by the day
- * factor; then blend e^(−h/τ)·r + (1 − e^(−h/τ))·value with h the minutes from
- * now to the bucket start (0 for the bucket holding now). Each date has its own
+ * uniform whole number of buckets within ±timeShiftMin; then scale every bucket,
+ * Fable part included, by today's pace m(h) = paceMultiplierAt(pace, h), with h
+ * the minutes from now to the bucket start (0 for the bucket holding now). The
+ * light, typical and heavy lines are read from these scaled days. Off or unfitted
+ * pace is m = 1 everywhere: the plain lines. Each date has its own
  * generator, seeded with today's local day key and the date's key, and draws the
  * same numbers in the same order in every noise mode, so noise off is plain
  * resampling of the same drawn days. A recorded day is laid onto the date by
@@ -270,6 +191,7 @@ export async function buildScenarios(
 	table: DayTable,
 	horizon: Horizon,
 	options: NoiseOptions,
+	pace: PaceNow,
 ): Promise<Scenarios> {
 	const mode = resolveNoiseMode(options);
 	const tz = input.pace.timeZone;
@@ -285,9 +207,6 @@ export async function buildScenarios(
 		Math.floor((settings.timeShiftMin * 60_000) / BUCKET_MS),
 	);
 
-	const todayPool = poolFor(table, table.today.type);
-	const dayToday = dayFactorDetail(table, todayPool, now, tz);
-	const factorToday = dayToday.a;
 	const maps = new Map<RecordedDay, Int32Array | null>();
 	const bandwidths: Record<string, number> = {};
 	const dates: DatePlan[] = [];
@@ -334,19 +253,15 @@ export async function buildScenarios(
 			maps: dayMaps,
 			cumulative,
 			kernel,
-			factor: dayStart === table.today.start ? factorToday : 1,
 			rng: createRng(`${table.today.key}/${key}`),
 		});
 	}
 
-	const tau = settings.recentTauMin;
-	const blend = new Float64Array(bucketCount);
+	const multiplier = new Float64Array(bucketCount);
 	for (let j = 0; j < bucketCount; j++) {
 		const ahead = Math.max(0, start + j * BUCKET_MS - now) / 60_000;
-		blend[j] = tau > 0 ? Math.exp(-ahead / tau) : 0;
+		multiplier[j] = paceMultiplierAt(pace, ahead);
 	}
-	const r = table.today.recentRate;
-	const rFable = table.today.recentFableRate;
 
 	const units: Float32Array[] = [];
 	const fable: Float32Array[] = [];
@@ -366,7 +281,7 @@ export async function buildScenarios(
 				day && day.total > 0
 					? scaleLogShift(date.kernel, Math.log(day.total), eps, mode)
 					: 0;
-			const scale = date.factor * Math.exp(logShift);
+			const scale = Math.exp(logShift);
 			const shift = mode === "off" ? 0 : shiftDraw - shiftMax;
 			for (let j = date.from; j < date.to; j++) {
 				let v = 0;
@@ -386,9 +301,9 @@ export async function buildScenarios(
 						vf = (day.fable[src] as number) * scale;
 					}
 				}
-				const w = blend[j] as number;
-				u[j] = w * r + (1 - w) * v;
-				f[j] = w * rFable + (1 - w) * vf;
+				const m = multiplier[j] as number;
+				u[j] = v * m;
+				f[j] = vf * m;
 			}
 		}
 		units.push(u);
@@ -406,9 +321,7 @@ export async function buildScenarios(
 			noise: mode !== "off",
 			noiseMode: mode,
 			bandwidths,
-			dayFactor: factorToday,
-			day: dayToday,
-			recentRate: r,
+			pace,
 		},
 	};
 }

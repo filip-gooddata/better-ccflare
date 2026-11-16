@@ -43,6 +43,7 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
+		paceConditioning: true,
 		...over,
 	};
 }

@@ -7,9 +7,8 @@ import { describe, expect, test } from "bun:test";
 import { calibrateWithEvidence } from "../calibration";
 import { buildDayTable, poolFor } from "../days";
 import { createForecastEngine, prepareEngineContext } from "../engine";
+import { plainPace } from "../pace";
 import { buildInput, replayFixture } from "./fixtures-engine";
-
-const HOUR_BUCKETS = 12;
 
 /** Smallest daily total whose share of the summed weight, counting it and every smaller total, reaches q. */
 function lowerWeightedQuantile(
@@ -32,7 +31,7 @@ function lowerWeightedQuantile(
 }
 
 describe("forecast inputs from the engine (amendment 4, D2)", () => {
-	test("compute() carries the day factor, recent rate, pool quantiles, work start and every k with its evidence", async () => {
+	test("compute() carries the pace, pool quantiles, work start and every k with its evidence", async () => {
 		const input = buildInput(replayFixture());
 		const result = await createForecastEngine({ noise: false }).compute(input);
 		if (!result.available) throw new Error(result.reason);
@@ -42,12 +41,9 @@ describe("forecast inputs from the engine (amendment 4, D2)", () => {
 		const ctx = await prepareEngineContext(input, { noise: false });
 		if (ctx === "insufficient_history") throw new Error("no forecast");
 		const diagnostics = ctx.scenarios.diagnostics;
-		expect(inputs.dayFactor).toEqual(diagnostics.day);
-		expect(inputs.dayFactor.a).toBe(diagnostics.dayFactor);
-		expect(inputs.recentRatePerHour).toBeCloseTo(
-			HOUR_BUCKETS * diagnostics.recentRate,
-			9,
-		);
+		expect(inputs.pace).toEqual(diagnostics.pace);
+		expect(inputs.pace).toEqual(plainPace("unfitted"));
+		expect(inputs.paceModel).toBeNull();
 		expect(inputs.workStartMinute).toBe(ctx.workStartMinute);
 
 		const table = buildDayTable(input);
