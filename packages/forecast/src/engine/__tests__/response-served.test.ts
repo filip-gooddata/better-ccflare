@@ -152,29 +152,29 @@ describe("stops and shortfall of typical come from the served day", () => {
 		expect(steps).toBe((end - ZERO) / (5 * MIN));
 	});
 
-	test("a stop of the served day's own is dropped where no heavy stop encloses it", () => {
-		// Only day 20 leaves demand unserved: the heavy level lists no stop.
-		const lone = run(0);
-		const response = buildResponse(ctx, lone, 20);
+	test("pinned: a served-day stop is listed where heavy lists none (stops are listed per level)", () => {
+		// Only day 20 leaves demand unserved. In the typical run 18:20–24:00 its own
+		// unserved demand is 2 × 68 = 136 points; the heavy level reads the 90th
+		// percentile of the 41 days' unserved points, 0, below minStopPoints 1, so heavy
+		// lists none of its zero runs although they hold typical's. Light reads 0 too.
+		const response = buildResponse(ctx, run(0), 20);
 		const block = response.day as ForecastBlock;
+		expect(ctx.input.settings.minStopPoints).toBe(1);
+		expect(steps).toBe(68);
+		expect(block.stops.typical).toEqual([{ start: ZERO, end }]);
 		expect(block.stops.heavy).toEqual([]);
-		expect(block.stops.typical).toEqual([]);
-		expect(block.shortfall).toBeNull();
+		expect(block.stops.light).toEqual([]);
+		expect(block.shortfall?.points).toBe(136);
 		expect(validateForecastResponse(response)).toEqual([]);
 	});
 
-	test("a zero run of typical that holds a light stop is a stop, even without the served day's own demand", () => {
-		// Day 19 leaves nothing unserved, yet light lists a stop inside its zero run.
+	test("a served day without its own unserved demand lists no typical stop, though light lists one", () => {
+		// Day 19 leaves nothing unserved; the other days do, so light lists a stop.
 		const response = buildResponse(ctx, run(0.5), 19);
 		const block = response.day as ForecastBlock;
 		expect(block.stops.light.length).toBeGreaterThan(0);
-		expect(block.stops.typical).toHaveLength(1);
-		const [stop] = block.stops.typical;
-		for (const light of block.stops.light) {
-			expect(stop.start).toBeLessThanOrEqual(light.start);
-			expect(light.end).toBeLessThanOrEqual(stop.end);
-		}
-		expect(block.shortfall?.points).toBe(0);
+		expect(block.stops.typical).toEqual([]);
+		expect(block.shortfall).toBeNull();
 		expect(validateForecastResponse(response)).toEqual([]);
 	});
 });

@@ -29,6 +29,20 @@ describe("validateForecastResponse accepts", () => {
 		expect(validateForecastResponse(specNone)).toEqual([]);
 	});
 
+	test("stops listed per level: a light stop without a typical stop, a typical stop without a heavy stop", () => {
+		const response = clone(specFull);
+		response.day.light[4] = 0;
+		response.day.light[5] = 0;
+		response.day.fan.p20[4] = 0;
+		response.day.stops.light = [{ start: 1794493800000, end: 1794495600000 }];
+		response.day.stops.typical = [];
+		response.day.shortfall = null;
+		expect(validateForecastResponse(response)).toEqual([]);
+		const noHeavy = clone(specFull);
+		noHeavy.day.stops.heavy = [];
+		expect(validateForecastResponse(noHeavy)).toEqual([]);
+	});
+
 	test("typical outside the fan, between light and heavy", () => {
 		const response = clone(specFull);
 		expect(response.day.typical[1]).toBeLessThan(response.day.fan.p20[1]);
@@ -204,16 +218,30 @@ describe("validateForecastResponse rejects", () => {
 		expectError(response, "day.stops.typical[0]");
 	});
 
-	test("a light stop outside every typical stop", () => {
+	test("a typical zero run outside heavy's zero run", () => {
 		const response = clone(specFull);
-		response.day.light[4] = 0;
-		response.day.light[5] = 0;
-		response.day.fan.p20[4] = 0;
-		response.day.stops.light = [{ start: 1794493800000, end: 1794495600000 }];
-		expect(validateForecastResponse(response)).toEqual([]);
-		response.day.stops.typical = [];
-		response.day.shortfall = null;
-		expectError(response, "day.stops.light[0]");
+		response.day.heavy[4] = 0.5;
+		const errors = validateForecastResponse(response);
+		expect(
+			errors.some(
+				(e) => e.includes("day.heavy[4]") && e.includes("zero runs must nest"),
+			),
+		).toBe(true);
+	});
+
+	test("a light zero run outside typical's zero run", () => {
+		const response = clone(specFull);
+		response.day.light[2] = 0;
+		response.day.fan.p20[2] = 0;
+		response.day.fan.p30[2] = 0;
+		response.day.fan.p40[2] = 0;
+		const errors = validateForecastResponse(response);
+		expect(
+			errors.some(
+				(e) =>
+					e.includes("day.typical[2]") && e.includes("zero runs must nest"),
+			),
+		).toBe(true);
 	});
 
 	test("a projected stop that starts at computedAt (a begun stop is stopNow only)", () => {
