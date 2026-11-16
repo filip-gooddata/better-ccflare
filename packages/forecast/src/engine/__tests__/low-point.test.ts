@@ -203,38 +203,3 @@ describe("score order and gates (amendment 5, E2 and E3)", () => {
 		).toBe(false);
 	});
 });
-
-describe("score order is transitive (advisor point 3)", () => {
-	const score = (lowPoint: number, otherLow: number): PlanScore => ({
-		lowPoint,
-		otherLow,
-		dayLowPoints: lowPoint,
-		weekLowPoints: otherLow,
-		typicalLow: 30,
-		departures: 0,
-		poolPoints: 200,
-	});
-	// Pairwise "within 0.5" made A beat B (other low), B beat C (other low) and C beat A (S by 0.8).
-	const a = score(0, 2);
-	const b = score(0.4, 1);
-	const c = score(0.8, 0);
-
-	test("S by its 0.5-point bin: C (bin 1) first, then A before B (same bin, other low)", () => {
-		expect(compareScores(c, a)).toBeLessThan(0);
-		expect(compareScores(a, b)).toBeLessThan(0);
-		expect(compareScores(c, b)).toBeLessThan(0);
-	});
-
-	test("every input order sorts to the same order", () => {
-		const orders = [
-			[a, b, c],
-			[a, c, b],
-			[b, a, c],
-			[b, c, a],
-			[c, a, b],
-			[c, b, a],
-		];
-		for (const order of orders)
-			expect([...order].sort(compareScores)).toEqual([c, a, b]);
-	});
-});

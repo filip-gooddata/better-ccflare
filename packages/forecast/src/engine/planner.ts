@@ -42,8 +42,8 @@ const REASON_MIN_GAIN_POINTS = 0.05;
 
 /**
  * Score of one plan (design amendment 5, E2), in points of the pool (100 × counted accounts). Higher
- * is better. Compared by compareScores: lowPoint; within TIER_TOLERANCE_POINTS the other limit's
- * low, then typicalLow, then fewer departures.
+ * is better. Ranked by rankTiers: lowPoint, otherLow and typicalLow each kept within
+ * TIER_TOLERANCE_POINTS of the best value still in play, then fewer departures.
  */
 export interface PlanScore {
 	/** S: the smaller of dayLowPoints and weekLowPoints. */
@@ -147,47 +147,125 @@ export function scorePlan(
 	};
 }
 
-/** Higher first when a and b differ by more than `tol`; 0 otherwise. */
-function higher(a: number, b: number, tol: number): number {
-	return Math.abs(a - b) > tol ? b - a : 0;
-}
+/** A score item compared with TIER_TOLERANCE_POINTS, in ranking order (amendment 5, E2). */
+export type ScoreStage = "low-point" | "other-low" | "typical-low";
+
+const TOLERANCE_STAGES: readonly [ScoreStage, (s: PlanScore) => number][] = [
+	["low-point", (s) => s.lowPoint],
+	["other-low", (s) => s.otherLow],
+	["typical-low", (s) => s.typicalLow],
+];
 
 /**
- * The fixed TIER_TOLERANCE_POINTS-wide bin of a score value. Values in one bin tie; comparing bins,
- * not pairwise distances, keeps the order transitive (pairwise "within 0.5" can cycle).
+ * The best-anchored selection of one tier (amendment 5, E2): at each tolerance stage in turn, the
+ * plans whose value is within TIER_TOLERANCE_POINTS of the best value among the plans still kept
+ * stay; each other plan drops at that stage. Anchoring to the best value, not to bins or pairs, makes
+ * the result independent of where values sit and of the input order.
  */
-function bin(value: number): number {
-	return Math.floor(value / TIER_TOLERANCE_POINTS);
-}
-
-/** Higher bin first; 0 when a and b share a bin. */
-function higherBin(a: number, b: number): number {
-	return bin(b) - bin(a);
+function selectTier<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+): { kept: T[]; dropped: { item: T; stage: ScoreStage }[] } {
+	let kept = [...items];
+	const dropped: { item: T; stage: ScoreStage }[] = [];
+	for (const [stage, value] of TOLERANCE_STAGES) {
+		const best = Math.max(...kept.map((x) => value(scoreOf(x))));
+		const next: T[] = [];
+		for (const x of kept) {
+			if (best - value(scoreOf(x)) <= TIER_TOLERANCE_POINTS + SCORE_EPS)
+				next.push(x);
+			else dropped.push({ item: x, stage });
+		}
+		kept = next;
+	}
+	return { kept, dropped };
 }
 
 /**
- * Score order (amendment 5, E2): negative when `a` is the better plan (sorts first), positive when `b`
- * is. S higher by its TIER_TOLERANCE_POINTS bin; in one bin the other limit's low, then the typical
- * low (also by bin), then fewer departures from on demand; then the exact values in the same order.
+ * Order inside a tier: fewer departures from on demand, then the exact S, other low and typical low
+ * (higher first), then the key ascending. A total order, so the order does not depend on the input.
+ */
+function compareInTier(
+	a: PlanScore,
+	b: PlanScore,
+	keyA: string | number,
+	keyB: string | number,
+): number {
+	return (
+		a.departures - b.departures ||
+		b.lowPoint - a.lowPoint ||
+		b.otherLow - a.otherLow ||
+		b.typicalLow - a.typicalLow ||
+		(keyA < keyB ? -1 : keyA > keyB ? 1 : 0)
+	);
+}
+
+/**
+ * Plans ranked into tiers, best first (amendment 5, E2): the first tier is selectTier of all plans,
+ * the next selectTier of the rest, and so on; each tier is ordered by compareInTier. `droppedAt` is
+ * the stage on which a plan left the selection of the tier before its own (null in the first tier).
+ * `keyOf` must differ between distinct plans; it is the final tie-break.
+ */
+export function rankTiers<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+	keyOf: (item: T) => string | number,
+): { item: T; droppedAt: ScoreStage | null }[][] {
+	const tiers: { item: T; droppedAt: ScoreStage | null }[][] = [];
+	let rest: { item: T; droppedAt: ScoreStage | null }[] = items.map((item) => ({
+		item,
+		droppedAt: null,
+	}));
+	while (rest.length > 0) {
+		const { kept, dropped } = selectTier(rest, (x) => scoreOf(x.item));
+		tiers.push(
+			kept.sort((a, b) =>
+				compareInTier(
+					scoreOf(a.item),
+					scoreOf(b.item),
+					keyOf(a.item),
+					keyOf(b.item),
+				),
+			),
+		);
+		rest = dropped.map(({ item, stage }) => ({
+			item: item.item,
+			droppedAt: stage,
+		}));
+	}
+	return tiers;
+}
+
+/** The best plan by rankTiers, or null for none. */
+export function selectBest<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+	keyOf: (item: T) => string | number,
+): T | null {
+	if (items.length === 0) return null;
+	const { kept } = selectTier(items, scoreOf);
+	return kept.reduce((best, x) =>
+		compareInTier(scoreOf(x), scoreOf(best), keyOf(x), keyOf(best)) < 0
+			? x
+			: best,
+	);
+}
+
+/**
+ * Two plans in the order rankTiers gives them: negative when `a` ranks first, positive when `b`
+ * does, 0 when nothing but a key would separate them. For two plans only: ranking more than two
+ * goes through rankTiers, since pairwise tolerance comparisons can cycle.
  */
 export function compareScores(a: PlanScore, b: PlanScore): number {
-	return (
-		higherBin(a.lowPoint, b.lowPoint) ||
-		higherBin(a.otherLow, b.otherLow) ||
-		higherBin(a.typicalLow, b.typicalLow) ||
-		a.departures - b.departures ||
-		higher(a.lowPoint, b.lowPoint, SCORE_EPS) ||
-		higher(a.otherLow, b.otherLow, SCORE_EPS) ||
-		higher(a.typicalLow, b.typicalLow, SCORE_EPS)
-	);
+	const { dropped } = selectTier([a, b], (s) => s);
+	if (dropped.length > 0) return dropped[0].item === b ? -1 : 1;
+	return compareInTier(a, b, 0, 0);
 }
 
-function equalWithinTier(a: PlanScore, b: PlanScore): boolean {
-	return (
-		bin(a.lowPoint) === bin(b.lowPoint) &&
-		bin(a.otherLow) === bin(b.otherLow) &&
-		bin(a.typicalLow) === bin(b.typicalLow)
-	);
+/** The stage on which `next` drops against `top` when only the two are ranked; null within one tier. */
+function pairStage(top: PlanScore, next: PlanScore): ScoreStage | null {
+	const { dropped } = selectTier([top, next], (s) => s);
+	return dropped.find((d) => d.item === next)?.stage ?? null;
 }
 
 /** Gain of S from `base` to `next`, in points. */
@@ -209,12 +287,17 @@ export function openingEarns(
 }
 
 /**
- * Reason token (amendment 2, B4) naming the first score item, in compareScores order, on which `top`
- * differs from `next`, and its gain: `low-point+<points>`, `weekly-low+<points>` or
- * `five-hour-low+<points>` (the other limit), `typical-low+<points>`. Null when they differ only in
- * departures or not at all. `top` is expected to sort before `next`.
+ * Reason token (amendment 2, B4) naming the score item on which `top` ranks before `next`, and its
+ * gain: `low-point+<points>`, `weekly-low+<points>` or `five-hour-low+<points>` (the other limit),
+ * `typical-low+<points>`. `stage` is the item on which `next` dropped (rankTiers droppedAt); by
+ * default the stage of the two ranked alone. Within one tier: null when departures decide or nothing
+ * differs, else the first item, in stage order, whose exact values differ.
  */
-export function decidingReason(top: PlanScore, next: PlanScore): string | null {
+export function decidingReason(
+	top: PlanScore,
+	next: PlanScore,
+	stage: ScoreStage | null = pairStage(top, next),
+): string | null {
 	// One decimal, or one significant digit for a gain that would show as 0.0.
 	const points = (value: number) =>
 		Math.abs(value) >= REASON_MIN_GAIN_POINTS
@@ -222,18 +305,15 @@ export function decidingReason(top: PlanScore, next: PlanScore): string | null {
 			: String(Number(value.toPrecision(1)));
 	const other = () =>
 		top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
-	const differs = [
-		(a: number, b: number) => bin(a) !== bin(b),
-		(a: number, b: number) => Math.abs(a - b) > SCORE_EPS,
-	];
-	for (const differ of differs) {
-		if (differ(top.lowPoint, next.lowPoint))
-			return `low-point+${points(top.lowPoint - next.lowPoint)}`;
-		if (differ(top.otherLow, next.otherLow))
-			return `${other()}+${points(top.otherLow - next.otherLow)}`;
-		if (differ(top.typicalLow, next.typicalLow))
-			return `typical-low+${points(top.typicalLow - next.typicalLow)}`;
+	const token = (s: ScoreStage, value: (x: PlanScore) => number) =>
+		`${s === "other-low" ? other() : s}+${points(value(top) - value(next))}`;
+	if (stage) {
+		const found = TOLERANCE_STAGES.find(([s]) => s === stage);
+		return found ? token(stage, found[1]) : null;
 	}
+	if (top.departures !== next.departures) return null;
+	for (const [s, value] of TOLERANCE_STAGES)
+		if (Math.abs(value(top) - value(next)) > SCORE_EPS) return token(s, value);
 	return null;
 }
 
@@ -265,8 +345,13 @@ function planKey(plan: SimPlan): string {
 	return JSON.stringify(plan);
 }
 
-function better(a: Evaluated, b: Evaluated | null): boolean {
-	return b === null || compareScores(a.score, b.score) < 0;
+/** The best of the candidates by rankTiers, the plan key breaking exact ties. */
+function bestOf(candidates: Evaluated[]): Evaluated | null {
+	return selectBest(
+		candidates,
+		(x) => x.score,
+		(x) => planKey(x.plan),
+	);
 }
 
 export async function planForecast(ctx: EngineContext): Promise<{
@@ -324,26 +409,23 @@ export async function planForecast(ctx: EngineContext): Promise<{
 			),
 		]);
 	}
-	let bestOpening: Evaluated | null = null;
+	const earners: Evaluated[] = [];
 	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
 		const openAt = [...baseline.plan.openAt];
 		closed.forEach((j, x) => {
 			openAt[j] = combo[x];
 		});
 		const candidate = await evaluate({ ...baseline.plan, openAt });
-		if (
-			openingEarns(candidate.score, baseline.score, openMin) &&
-			better(candidate, bestOpening)
-		)
-			bestOpening = candidate;
+		if (openingEarns(candidate.score, baseline.score, openMin))
+			earners.push(candidate);
 	}
-	if (bestOpening) best = bestOpening;
+	best = bestOf(earners) ?? best;
 
-	// 2. Order for unattached demand now: each account preferred in turn.
-	for (let j = 0; j < n; j++) {
-		const candidate = await evaluate({ ...best.plan, preferred: j });
-		if (better(candidate, best)) best = candidate;
-	}
+	// 2. Order for unattached demand now: each account preferred in turn, ranked with the plan so far.
+	const preferences: Evaluated[] = [best];
+	for (let j = 0; j < n; j++)
+		preferences.push(await evaluate({ ...best.plan, preferred: j }));
+	best = bestOf(preferences) ?? best;
 
 	// An opening stays only while it still earns its place (openingEarns) in the final combination;
 	// dropping one can change what another earns, so repeat until nothing drops.
@@ -366,8 +448,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		.filter((s) => s.recentUnits > 0)
 		.sort((a, b) => b.recentUnits - a.recentUnits)
 		.slice(0, MAX_MOVE_SESSIONS);
-	let bestMove: Evaluated | null = null;
-	let bestMoveSession: (typeof movable)[number] | null = null;
+	const moves: Evaluated[] = [];
 	const noMove = best;
 	for (const session of movable) {
 		for (let to = 0; to < n; to++) {
@@ -377,15 +458,13 @@ export async function planForecast(ctx: EngineContext): Promise<{
 				...noMove.plan,
 				move: { sessionId: session.sessionId, to },
 			});
-			if (
-				lowPointGain(candidate.score, noMove.score) >= moveMin &&
-				better(candidate, bestMove)
-			) {
-				bestMove = candidate;
-				bestMoveSession = session;
-			}
+			if (lowPointGain(candidate.score, noMove.score) >= moveMin)
+				moves.push(candidate);
 		}
 	}
+	const bestMove = bestOf(moves);
+	const bestMoveSession =
+		movable.find((s) => s.sessionId === bestMove?.plan.move?.sessionId) ?? null;
 	if (bestMove?.plan.move && bestMoveSession) {
 		best = bestMove;
 		const to = bestMove.plan.move.to;
@@ -434,21 +513,31 @@ function round1(value: number): number {
 	return Math.round(value * 10) / 10;
 }
 
-/** Accounts grouped into tiers of plan scores equal within the tier tolerance, best first. */
-function tiersOf(scored: { score: PlanScore; j: number }[]): number[][] {
-	const order = [...scored].sort(
-		(a, b) => compareScores(a.score, b.score) || a.j - b.j,
+/**
+ * Accounts grouped into the rankTiers tiers of their preference plans, best first, the account index
+ * breaking exact ties; with each account's tier number and the stage on which it dropped.
+ */
+function tiersOf(scored: { score: PlanScore; j: number }[]): {
+	tiers: number[][];
+	rankOf: Map<number, { tier: number; droppedAt: ScoreStage | null }>;
+} {
+	const ranked = rankTiers(
+		scored,
+		(x) => x.score,
+		(x) => x.j,
 	);
-	const tiers: number[][] = [];
-	let head: PlanScore | null = null;
-	for (const { score, j } of order) {
-		if (head && equalWithinTier(head, score)) tiers[tiers.length - 1].push(j);
-		else {
-			tiers.push([j]);
-			head = score;
-		}
-	}
-	return tiers;
+	const rankOf = new Map<
+		number,
+		{ tier: number; droppedAt: ScoreStage | null }
+	>();
+	ranked.forEach((tier, t) => {
+		for (const { item, droppedAt } of tier)
+			rankOf.set(item.j, { tier: t, droppedAt });
+	});
+	return {
+		tiers: ranked.map((tier) => tier.map(({ item }) => item.j)),
+		rankOf,
+	};
 }
 
 /**
@@ -510,7 +599,7 @@ export function placementOf(
 ): PlacementAdvice | null {
 	if (preferred.length < 2) return null;
 	const plan = best.plan;
-	const tiers = tiersOf(
+	const { tiers, rankOf } = tiersOf(
 		preferred.map((evaluated, j) => ({ score: evaluated.score, j })),
 	);
 	const due = dueRoutingOpening(ctx, plan);
@@ -552,9 +641,21 @@ export function placementOf(
 	else if (gain >= REASON_MIN_GAIN_POINTS)
 		reason = `low-point+${gain.toFixed(1)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
-	else
+	else {
+		// The stage on which the second account dropped from the first account's tier; the two
+		// ranked alone when the tiers are not adjacent (a held account was moved).
+		const second = ordered[1][0];
+		const firstTier = rankOf.get(first)?.tier ?? 0;
+		const rank = rankOf.get(second);
+		const stage =
+			rank?.tier === firstTier
+				? null
+				: rank?.tier === firstTier + 1
+					? rank.droppedAt
+					: undefined;
 		reason =
-			decidingReason(top, preferred[ordered[1][0]].score) ?? "no-preference";
+			decidingReason(top, preferred[second].score, stage) ?? "no-preference";
+	}
 	return {
 		tiers: ordered.map((tier) => tier.map((j) => ctx.accounts[j].accountId)),
 		rule: opens ? "forecast-open" : "forecast-lookahead",
@@ -583,7 +684,11 @@ export function openingBeam(
 	baseline: PlanScore,
 	openMinGainPoints: number,
 ): EpochMs[] {
-	const sorted = [...singles].sort((x, y) => compareScores(x.score, y.score));
+	const sorted = rankTiers(
+		singles,
+		(x) => x.score,
+		(x) => x.at,
+	).flatMap((tier) => tier.map(({ item }) => item));
 	const beam = sorted.slice(0, OPENING_BEAM);
 	const earns = (x: { score: PlanScore }) =>
 		openingEarns(x.score, baseline, openMinGainPoints);
