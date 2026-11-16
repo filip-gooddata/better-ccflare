@@ -440,4 +440,70 @@ describe("placement: a held account goes behind every unheld one (amendment 5, E
 		expect(advice?.tiers).toEqual([["acct-a"], ["acct-c"], ["acct-b"]]);
 		expect(advice?.rule).toBe("forecast-open");
 	});
+
+	test("with the held account moved out from between them, the reason names the item that dropped the second account", () => {
+		const now = prague(12, 7);
+		const ctx = makeCtx({
+			now,
+			accounts: [
+				account({ id: "acct-a", fiveUsed: 20, fiveReset: prague(12, 10) }),
+				account({ id: "acct-b" }),
+				account({ id: "acct-c", fiveUsed: 20, fiveReset: prague(12, 9) }),
+			],
+			rate: () => 0,
+			settings: { prewarm: false },
+		});
+		const plan: SimPlan = {
+			openAt: [null, now + 60 * MIN, null],
+			preferred: null,
+			move: null,
+		};
+		const evaluated = (
+			lowPoint: number,
+			otherLow: number,
+			typicalLow: number,
+		) => ({
+			plan,
+			result: null as unknown as SimulationResult,
+			score: {
+				lowPoint,
+				otherLow,
+				dayLowPoints: lowPoint,
+				weekLowPoints: otherLow,
+				typicalLow,
+				departures: 0,
+				poolPoints: 300,
+			},
+		});
+		// Tiers by score: a (10.1, 50, 100); b (10.4, 50.4, 90), dropped on the typical low; c (10.3,
+		// 49.8, 100), dropped on the weekly low against a and b. b is held, so c comes second; a ranks
+		// ahead of c by the weekly low (0.2), not by S, where c is 0.2 higher.
+		const a = evaluated(10.1, 50, 100);
+		const advice = placementOf(
+			ctx,
+			[a, evaluated(10.4, 50.4, 90), evaluated(10.3, 49.8, 100)],
+			a,
+			a,
+		);
+		expect(advice?.tiers).toEqual([["acct-a"], ["acct-c"], ["acct-b"]]);
+		expect(advice?.reason).toBe("weekly-low+0.2");
+	});
+});
+
+describe("reason within one tier follows the exact order", () => {
+	test("an S advantage below SCORE_EPS that ranks first is the one named", () => {
+		const s = (over: Partial<PlanScore>): PlanScore => ({
+			lowPoint: 80,
+			otherLow: 160,
+			dayLowPoints: 80,
+			weekLowPoints: 160,
+			typicalLow: 100,
+			departures: 0,
+			poolPoints: 200,
+			...over,
+		});
+		expect(
+			decidingReason(s({ lowPoint: 80 + 5e-10 }), s({ typicalLow: 100.3 })),
+		).toBe("low-point+5e-10");
+	});
 });

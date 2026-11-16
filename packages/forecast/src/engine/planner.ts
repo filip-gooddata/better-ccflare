@@ -202,19 +202,21 @@ function compareInTier(
 
 /**
  * Plans ranked into tiers, best first (amendment 5, E2): the first tier is selectTier of all plans,
- * the next selectTier of the rest, and so on; each tier is ordered by compareInTier. `droppedAt` is
- * the stage on which a plan left the selection of the tier before its own (null in the first tier).
- * `keyOf` must differ between distinct plans; it is the final tie-break.
+ * the next selectTier of the rest, and so on; each tier is ordered by compareInTier. `drops[t]` is
+ * the stage on which a plan left the selection of tier t, for every tier before its own; `droppedAt`
+ * is the last of them (null in the first tier). `keyOf` must differ between distinct plans; it is the
+ * final tie-break.
  */
 export function rankTiers<T>(
 	items: readonly T[],
 	scoreOf: (item: T) => PlanScore,
 	keyOf: (item: T) => string | number,
-): { item: T; droppedAt: ScoreStage | null }[][] {
-	const tiers: { item: T; droppedAt: ScoreStage | null }[][] = [];
-	let rest: { item: T; droppedAt: ScoreStage | null }[] = items.map((item) => ({
+): RankedPlan<T>[][] {
+	const tiers: RankedPlan<T>[][] = [];
+	let rest: RankedPlan<T>[] = items.map((item) => ({
 		item,
 		droppedAt: null,
+		drops: [],
 	}));
 	while (rest.length > 0) {
 		const { kept, dropped } = selectTier(rest, (x) => scoreOf(x.item));
@@ -231,9 +233,17 @@ export function rankTiers<T>(
 		rest = dropped.map(({ item, stage }) => ({
 			item: item.item,
 			droppedAt: stage,
+			drops: [...item.drops, stage],
 		}));
 	}
 	return tiers;
+}
+
+/** One plan in rankTiers' result. */
+export interface RankedPlan<T> {
+	item: T;
+	droppedAt: ScoreStage | null;
+	drops: ScoreStage[];
 }
 
 /** The best plan by rankTiers, or null for none. */
@@ -313,7 +323,7 @@ export function decidingReason(
 	}
 	if (top.departures !== next.departures) return null;
 	for (const [s, value] of TOLERANCE_STAGES)
-		if (Math.abs(value(top) - value(next)) > SCORE_EPS) return token(s, value);
+		if (value(top) !== value(next)) return token(s, value);
 	return null;
 }
 
@@ -515,24 +525,20 @@ function round1(value: number): number {
 
 /**
  * Accounts grouped into the rankTiers tiers of their preference plans, best first, the account index
- * breaking exact ties; with each account's tier number and the stage on which it dropped.
+ * breaking exact ties; with each account's tier number and the stages on which it dropped.
  */
 function tiersOf(scored: { score: PlanScore; j: number }[]): {
 	tiers: number[][];
-	rankOf: Map<number, { tier: number; droppedAt: ScoreStage | null }>;
+	rankOf: Map<number, { tier: number; drops: ScoreStage[] }>;
 } {
 	const ranked = rankTiers(
 		scored,
 		(x) => x.score,
 		(x) => x.j,
 	);
-	const rankOf = new Map<
-		number,
-		{ tier: number; droppedAt: ScoreStage | null }
-	>();
+	const rankOf = new Map<number, { tier: number; drops: ScoreStage[] }>();
 	ranked.forEach((tier, t) => {
-		for (const { item, droppedAt } of tier)
-			rankOf.set(item.j, { tier: t, droppedAt });
+		for (const { item, drops } of tier) rankOf.set(item.j, { tier: t, drops });
 	});
 	return {
 		tiers: ranked.map((tier) => tier.map(({ item }) => item.j)),
@@ -642,19 +648,21 @@ export function placementOf(
 		reason = `low-point+${gain.toFixed(1)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
 	else {
-		// The stage on which the second account dropped from the first account's tier; the two
-		// ranked alone when the tiers are not adjacent (a held account was moved).
+		// The stage on which the second account dropped from the first account's tier (null inside
+		// one tier). A held second account that ranked above the first is behind it by the hold, not
+		// by score: no score item is named.
 		const second = ordered[1][0];
 		const firstTier = rankOf.get(first)?.tier ?? 0;
 		const rank = rankOf.get(second);
-		const stage =
-			rank?.tier === firstTier
-				? null
-				: rank?.tier === firstTier + 1
-					? rank.droppedAt
-					: undefined;
+		const tier = rank?.tier ?? firstTier;
 		reason =
-			decidingReason(top, preferred[second].score, stage) ?? "no-preference";
+			(tier < firstTier
+				? null
+				: decidingReason(
+						top,
+						preferred[second].score,
+						tier === firstTier ? null : (rank?.drops[firstTier] ?? null),
+					)) ?? "no-preference";
 	}
 	return {
 		tiers: ordered.map((tier) => tier.map((j) => ctx.accounts[j].accountId)),
