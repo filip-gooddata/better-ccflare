@@ -74,6 +74,7 @@ export function account(
 		weekly: { usedPct: 0, resetsAt: Date.UTC(2026, 10, 16, 8) },
 		fable: null,
 		blockedUntil: null,
+		blockedSince: null,
 		readAt: NOW,
 		...parts,
 	};

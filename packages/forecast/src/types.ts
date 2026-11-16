@@ -88,6 +88,13 @@ export interface AccountLimits {
 	fable: LimitState | null;
 	/** End of an upstream refusal cooldown, when one is running. */
 	blockedUntil: EpochMs | null;
+	/**
+	 * Start of the running refusal cooldown (`rate_limited_at`). Null when
+	 * `blockedUntil` is null, when the start is unknown, or when the stamp lies
+	 * after now; absent counts as null. The engine ignores a value after now or at
+	 * or after `blockedUntil`.
+	 */
+	blockedSince?: EpochMs | null;
 	readAt: EpochMs;
 }
 

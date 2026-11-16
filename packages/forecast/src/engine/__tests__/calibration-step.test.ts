@@ -66,6 +66,7 @@ const ACCOUNT: AccountLimits = {
 	weekly: { usedPct: 0, resetsAt: null },
 	fable: null,
 	blockedUntil: null,
+	blockedSince: null,
 	readAt: 0,
 };
 

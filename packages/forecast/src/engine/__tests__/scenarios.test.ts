@@ -67,6 +67,7 @@ function account(weeklyReset: EpochMs): AccountLimits {
 		weekly: { usedPct: 10, resetsAt: weeklyReset },
 		fable: null,
 		blockedUntil: null,
+		blockedSince: null,
 		readAt: NOW,
 	};
 }

@@ -149,6 +149,20 @@ export function pooledLeftNow(
 }
 
 /**
+ * Start of the account's running refusal cooldown, or null: no cooldown running
+ * at now, no start known, or a start after now or at or after its end.
+ */
+export function cooldownSince(
+	account: AccountLimits,
+	now: EpochMs,
+): EpochMs | null {
+	const until = account.blockedUntil;
+	const since = account.blockedSince ?? null;
+	if (until === null || until <= now || since === null) return null;
+	return since <= now && since < until ? since : null;
+}
+
+/**
  * When the account comes back, if it is out now (spec section 5): the latest of
  * its running reasons, because all of them must end. Null when it is not out.
  * The day quantity also counts a running refusal cooldown; the week only the weekly limit.
@@ -190,7 +204,9 @@ interface ReplayEvent {
  * Replays the counted accounts' readings from `from` to now. Events are reading
  * times and reset times, so a reset shows even when no reading follows it.
  * Starts at the first moment every counted account has a reading of every
- * window the quantity needs; null when that never happens.
+ * window the quantity needs; null when that never happens. Day: an account in a
+ * refusal cooldown running at now counts 0 and out from the cooldown's start (an
+ * event marked as a jump), or from the start when the cooldown began earlier.
  */
 function replay(
 	ctx: EngineContext,
@@ -217,6 +233,15 @@ function replay(
 	const start = Math.max(from, ...firstSeen.values());
 	const times = new Set<EpochMs>([start]);
 	const resets = new Set<EpochMs>();
+	// Day: an account in a running cooldown counts 0 and out from its start, a jump.
+	const since = ctx.accounts.map((a) =>
+		quantity === "day" ? cooldownSince(a, ctx.now) : null,
+	);
+	for (const at of since)
+		if (at !== null && at > start) {
+			times.add(at);
+			resets.add(at);
+		}
 	for (const r of readings) {
 		if (r.at > start) times.add(r.at);
 		if (r.resetsAt !== null && r.resetsAt > start && r.resetsAt <= ctx.now) {
@@ -228,7 +253,12 @@ function replay(
 	const snapshot = (t: EpochMs, before: boolean): Snapshot => {
 		let left = 0;
 		const out: boolean[] = [];
-		for (const id of ids) {
+		for (const [i, id] of ids.entries()) {
+			const from = since[i];
+			if (from !== null && (before ? t > from : t >= from)) {
+				out.push(true);
+				continue;
+			}
 			const five = state.get(`${id}|five_hour`);
 			const weekly = state.get(`${id}|seven_day`);
 			const ratio = capRatio(ctx.calibration, id);
@@ -269,7 +299,8 @@ interface Entry {
 
 /**
  * `day.past` / `week.past` (spec section 6): pooled quota left from the block's
- * start to now, one entry per change in the readings, a reset as two entries.
+ * start to now, one entry per change in the readings, a reset or the start of a
+ * cooldown running now (day) as two entries.
  * Before a change that follows a flat stretch, the last reading of the stretch
  * is kept too, so the line stays flat until the readings moved instead of
  * sloping across the whole stretch. The last entry is now, from the accounts as
@@ -291,7 +322,7 @@ export function pastSeries(ctx: EngineContext, quantity: Quantity): Series {
 	const last = () => entries[entries.length - 1];
 	const change = (prevT: EpochMs, t: EpochMs, v: number) => {
 		if (prevT > last().t) entries.push({ t: prevT, v: last().v, jump: false });
-		entries.push({ t, v, jump: false });
+		if (t > last().t || v !== last().v) entries.push({ t, v, jump: false });
 	};
 	let prevT = events[0].t;
 	for (const event of events.slice(1)) {
@@ -330,7 +361,9 @@ function thin(entries: Entry[]): Entry[] {
  * every counted account was out per the readings. A stop still running at the
  * last reading is `stopNow`, not a past stop; when the accounts as last read
  * show it over without a reading that ended it, it ends at now, the closest the
- * readings can place it. A refusal cooldown is not in the readings and does not count.
+ * readings can place it. A refusal cooldown is not in the readings: one still
+ * running at now counts its account out from its start (day); an ended one does
+ * not count.
  */
 export function pastStops(ctx: EngineContext, quantity: Quantity): Interval[] {
 	const events = replay(ctx, quantity, pastFrom(ctx, quantity));
@@ -355,8 +388,9 @@ export function pastStops(ctx: EngineContext, quantity: Quantity): Interval[] {
 
 /**
  * When the account at `index` went out in its current out run, per the readings
- * (all of them, not only this block's). Null when the readings do not show it out
- * at the last reading (for example out only by a refusal cooldown).
+ * (all of them, not only this block's) and, for the day, a cooldown running now
+ * from its start. Null when neither shows it out at the last event; a cooldown
+ * begun before the first reading is floored at the replay's start.
  */
 export function outSince(
 	ctx: EngineContext,

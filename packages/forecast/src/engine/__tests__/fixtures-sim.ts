@@ -64,6 +64,7 @@ export interface AccountSpec {
 	fableUsed?: number;
 	fableReset?: EpochMs | null;
 	blockedUntil?: EpochMs | null;
+	blockedSince?: EpochMs | null;
 }
 
 export function account(spec: AccountSpec): AccountLimits {
@@ -78,6 +79,7 @@ export function account(spec: AccountSpec): AccountLimits {
 				? null
 				: { usedPct: spec.fableUsed, resetsAt: spec.fableReset ?? null },
 		blockedUntil: spec.blockedUntil ?? null,
+		blockedSince: spec.blockedSince ?? null,
 		readAt: 0,
 	};
 }

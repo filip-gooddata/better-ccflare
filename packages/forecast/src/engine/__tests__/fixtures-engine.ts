@@ -188,6 +188,7 @@ function account(
 		weekly: { usedPct: weeklyUsed, resetsAt: weeklyReset },
 		fable: null,
 		blockedUntil,
+		blockedSince: null,
 		readAt: now,
 	};
 }
