@@ -36,7 +36,7 @@ describe("pace refit log line", () => {
 		expect(
 			paceRefitLine({ status: "ok", state, ms: 4210.6 }, null, T0 + MIN),
 		).toBe(
-			"forecast e4 refit status=ok ms=4211 cadenceMin=60 days=84 weeks=12 cells=41/189 belowFloor=2 candidates=101 floor=10" +
+			"forecast e4 refit status=ok ms=4211 cadenceMin=60 days=84 weeks=12 cells=41/189 belowFloor=2 switchOn=0-1h/span-60/7,1-2h/day-k1/9 candidates=101 floor=10" +
 				" daytypes present=0.4123/0.03111 one=0.5/0.04 workday-weekend=0.42/0.031 merged=Mon|TueWedThuFri|SatSun:0.4/0.02999",
 		);
 	});
@@ -48,6 +48,30 @@ describe("pace refit log line", () => {
 			T0,
 		);
 		expect(line.endsWith(" daytypes=none")).toBe(true);
+	});
+
+	it("writes switchOn=none with no cell below the floor and masks odd ids", () => {
+		expect(
+			paceRefitLine(
+				{ status: "ok", state: { ...state, belowFloor: [] }, ms: 1 },
+				null,
+				T0,
+			),
+		).toContain(" belowFloor=0 switchOn=none ");
+		expect(
+			paceRefitLine(
+				{
+					status: "ok",
+					state: {
+						...state,
+						belowFloor: [{ band: "0-1h", feature: "a b/c,d", units: 3 }],
+					},
+					ms: 1,
+				},
+				null,
+				T0,
+			),
+		).toContain(" belowFloor=1 switchOn=0-1h/a_b_c_d/3 ");
 	});
 
 	it("masks characters outside the id alphabet in partition ids", () => {

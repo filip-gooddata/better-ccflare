@@ -8,6 +8,20 @@ export const PACE_REFIT_CADENCE_MIN = 60;
 const num = (x: number) =>
 	Number.isFinite(x) ? String(+x.toPrecision(4)) : "na";
 
+/** Model ids (bands, features) as logged: anything outside the id alphabet is masked. */
+const ident = (id: string) => id.replace(/[^A-Za-z0-9._-]/g, "_");
+
+/** Cells that pass every test but the evidence floor: band/feature/units each, so they switch on by themselves. */
+function switchOn(state: PaceFitState): string {
+	if (state.belowFloor.length === 0) return "switchOn=none";
+	return `switchOn=${state.belowFloor
+		.map(
+			({ band, feature, units }) =>
+				`${ident(band)}/${ident(feature)}/${Number.isFinite(units) ? units : "na"}`,
+		)
+		.join(",")}`;
+}
+
 function dayTypes(state: PaceFitState): string {
 	const rows = state.dayTypeComparison ?? [];
 	if (rows.length === 0) return "daytypes=none";
@@ -35,7 +49,7 @@ export function paceRefitLine(
 	const head = `forecast e4 refit status=${outcome.status} ms=${Math.round(outcome.ms)} cadenceMin=${PACE_REFIT_CADENCE_MIN}`;
 	if (outcome.status === "ok") {
 		const s = outcome.state;
-		return `${head} days=${s.days} weeks=${s.weeks} cells=${s.cellsEstablished}/${s.cellsTotal} belowFloor=${s.belowFloor.length} candidates=${s.candidates} floor=${s.floor} ${dayTypes(s)}`;
+		return `${head} days=${s.days} weeks=${s.weeks} cells=${s.cellsEstablished}/${s.cellsTotal} belowFloor=${s.belowFloor.length} ${switchOn(s)} candidates=${s.candidates} floor=${s.floor} ${dayTypes(s)}`;
 	}
 	const reason = outcome.status === "timeout" ? "timeout" : outcome.reason;
 	const age =
