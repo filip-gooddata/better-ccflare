@@ -6,7 +6,6 @@ import { resolveForecastSettings } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
 import { validateForecastResponse } from "../../contract/validate";
-import { plainPace } from "../../engine/pace";
 import { unavailableResponse } from "../../engine/response";
 import type { ForecastDb } from "../../history/ports";
 import {
@@ -1054,7 +1053,32 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 	it("writes the forecast inputs line after an available computation; the provider's response does not carry them (amendment 4, D2)", async () => {
 		const h = harness();
 		const inputs: ForecastInputsDetail = {
-			pace: plainPace("unfitted"),
+			pace: {
+				status: "unfitted",
+				fittedAt: null,
+				bands: (
+					[
+						["0-1h", 30],
+						["1-2h", 90],
+						["2-4h", 180],
+						["4-8h", 360],
+						["8-16h", 720],
+						["16h-1d", 1200],
+						["1-2d", 2160],
+						["2-4d", 4320],
+						["4-7d", 7920],
+					] as [string, number][]
+				).map(([band, centreMin]) => ({
+					band,
+					centreMin,
+					m: 1,
+					feature: null,
+					ratio: null,
+					coef: null,
+					clipped: false,
+					lambda: null,
+				})),
+			},
 			paceModel: null,
 			pool: { name: "workday", days: 12, medianUnits: 80, p90Units: 120 },
 			workStartMinute: 480,
