@@ -6,6 +6,11 @@ import { resolveForecastSettings } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
 import { validateForecastResponse } from "../../contract/validate";
+import type {
+	PaceFitState,
+	PaceSeries,
+	PaceSeriesInput,
+} from "../../engine/pace/types";
 import { unavailableResponse } from "../../engine/response";
 import {
 	runTranscriptBackfill,
@@ -56,12 +61,19 @@ import type {
 } from "../../types";
 import { bucketStart } from "../../units";
 import {
+	PACE_REFIT_TIMEOUT_MS,
+	type PaceRefitOutcome,
+	type PaceRefitRunner,
+} from "../pace-refit-runner";
+import {
 	createForecastService,
 	FORECAST_MIN_SPACING_MS,
 	FORECAST_POLL_SETTLE_MS,
 	FORECAST_STALE_POLLS,
 	type ForecastService,
 	type ForecastServiceDeps,
+	PACE_REFIT_CADENCE_MS,
+	paceRefitRange,
 } from "../service";
 
 const MIN = 60_000;
@@ -360,6 +372,7 @@ function harness(
 			info: (m) => infos.push(m),
 			warn: (m) => warns.push(m),
 		},
+		paceRefit: null,
 		...rest,
 	});
 	return {
@@ -1480,16 +1493,33 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 	it("writes the forecast inputs line after an available computation; the provider's response does not carry them (amendment 4, D2)", async () => {
 		const h = harness();
 		const inputs: ForecastInputsDetail = {
-			dayFactor: {
-				a: 1.2,
-				raw: 1.4,
-				clamped: 1.4,
-				weight: 0.5,
-				y: 30,
-				m: 10,
-				c: 20,
+			pace: {
+				status: "unfitted",
+				fittedAt: null,
+				bands: (
+					[
+						["0-1h", 30],
+						["1-2h", 90],
+						["2-4h", 180],
+						["4-8h", 360],
+						["8-16h", 720],
+						["16h-1d", 1200],
+						["1-2d", 2160],
+						["2-4d", 4320],
+						["4-7d", 7920],
+					] as [string, number][]
+				).map(([band, centreMin]) => ({
+					band,
+					centreMin,
+					m: 1,
+					feature: null,
+					ratio: null,
+					coef: null,
+					clipped: false,
+					lambda: null,
+				})),
 			},
-			recentRatePerHour: 6,
+			paceModel: null,
 			pool: { name: "workday", days: 12, medianUnits: 80, p90Units: 120 },
 			workStartMinute: 480,
 			limits: [
@@ -1511,11 +1541,11 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 		for (let i = 1; i <= 5; i++) await cycle(h, FORECAST_MIN_SPACING_MS);
 		const lines = h.infos.filter((m) => m.startsWith("forecast inputs"));
 		expect(lines).toEqual([
-			`forecast inputs dayFactor a=1.200 clamped=1.400 w=0.5000 raw=1.400 Y=30.00 M=10.00 c=20.00 recentRate=6.00/h pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30 oldestH=200.0 newestH=0.5 cap: ${ID} r=6.00 binds=yes`,
+			`forecast inputs e4=unfitted fitAge=none days=none weeks=none cells=none e4m 0-1h=1.00 1-2h=1.00 2-4h=1.00 4-8h=1.00 8-16h=1.00 16h-1d=1.00 1-2d=1.00 2-4d=1.00 4-7d=1.00 e4f none e4floor count=0 pool=workday:12 median=80.0 p90=120.0 workStart=08:00 k: ${ID}/five_hour=2.0000 own instances=4 points=30 oldestH=200.0 newestH=0.5 cap: ${ID} r=6.00 binds=yes`,
 		]);
 		const json = JSON.stringify(serve(h));
-		expect(json).not.toContain("dayFactor");
-		expect(json).not.toContain("recentRate");
+		expect(json).not.toContain("paceModel");
+		expect(json).not.toContain("belowFloor");
 		expect(json).not.toContain("medianUnits");
 	});
 
@@ -2211,5 +2241,240 @@ describe("forecast service: usage-detail pass at creation", () => {
 		await flush();
 		await next.service.stop();
 		expect(next.usageDetailBackfills).toEqual(["/tmp/transcripts"]);
+	});
+});
+
+function fitState(fittedAt: EpochMs, over: Partial<PaceFitState> = {}) {
+	const state: PaceFitState = {
+		fittedAt,
+		days: 84,
+		weeks: 12,
+		candidates: 101,
+		floor: 10,
+		cellsEstablished: 5,
+		cellsTotal: 189,
+		belowFloor: [],
+		baseline: { workday: [], monday: [], weekend: [] },
+		bands: [],
+		selected: [],
+		dayTypeComparison: [],
+		...over,
+	};
+	return state;
+}
+
+/** Each run waits until the test finishes it. */
+class FakeRefitRunner implements PaceRefitRunner {
+	calls: {
+		series: PaceSeries;
+		now: EpochMs;
+		timeoutMs: number;
+		signal?: AbortSignal;
+	}[] = [];
+	private waiting: ((o: PaceRefitOutcome) => void)[] = [];
+	run(
+		series: PaceSeries,
+		now: EpochMs,
+		opts: { timeoutMs: number; signal?: AbortSignal },
+	): Promise<PaceRefitOutcome> {
+		this.calls.push({ series, now, ...opts });
+		return new Promise((resolve) => {
+			this.waiting.push(resolve);
+			opts.signal?.addEventListener("abort", () =>
+				resolve({ status: "error", reason: "stopped", ms: 0 }),
+			);
+		});
+	}
+	async finish(outcome: PaceRefitOutcome) {
+		const resolve = this.waiting.shift();
+		if (!resolve) throw new Error("no refit running");
+		resolve(outcome);
+		await flush();
+	}
+}
+
+function refitHarness(
+	over: Parameters<typeof harness>[0] & { buildFails?: boolean } = {},
+) {
+	const runner = new FakeRefitRunner();
+	const seriesInputs: PaceSeriesInput[] = [];
+	const { buildFails, ...rest } = over;
+	const h = harness({
+		...rest,
+		paceRefit: {
+			runner,
+			buildSeries: (input) => {
+				seriesInputs.push(input);
+				if (buildFails) throw new Error("bad history");
+				return {
+					start: input.historyFrom,
+					units: new Float64Array(1),
+					censored: new Uint8Array(1),
+					timeZone: input.timeZone,
+				};
+			},
+		},
+	});
+	const refitLines = () =>
+		h.infos.filter((m) => m.startsWith("forecast e4 refit"));
+	return { ...h, runner, seriesInputs, refitLines };
+}
+
+const paceOff = {
+	paceConditioning: false,
+} as unknown as Partial<ForecastSettings>;
+const paceOn = {
+	paceConditioning: true,
+} as unknown as Partial<ForecastSettings>;
+
+describe("forecast service: E4 refit in the worker", () => {
+	it("refits at start-up; forecasts get null until the fit lands, then the new state", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		expect(h.engine.inputs[0]?.demandModel).toBeNull();
+		expect(h.runner.calls).toHaveLength(1);
+		expect(h.runner.calls[0]?.now).toBe(T0);
+		expect(h.runner.calls[0]?.timeoutMs).toBe(PACE_REFIT_TIMEOUT_MS);
+
+		const s1 = fitState(T0);
+		await h.runner.finish({ status: "ok", state: s1, ms: 4000 });
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs[1]?.demandModel).toBe(s1);
+		expect(h.refitLines()).toHaveLength(1);
+		expect(h.refitLines()[0]).toStartWith(
+			"forecast e4 refit status=ok ms=4000 cadenceMin=60 days=84",
+		);
+	});
+
+	it("the forecast does not wait for a running refit", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs).toHaveLength(2);
+		expect(h.engine.inputs[1]?.demandModel).toBeNull();
+		expect(h.runner.calls).toHaveLength(1);
+	});
+
+	it("refits every 60 minutes from the start of the last refit", async () => {
+		expect(PACE_REFIT_CADENCE_MS).toBe(60 * MIN);
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.time.advance(59 * MIN);
+		expect(h.runner.calls).toHaveLength(1);
+		await h.time.advance(MIN);
+		expect(h.runner.calls).toHaveLength(2);
+		expect(h.runner.calls[1]?.now).toBe(T0 + 60 * MIN);
+		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(3);
+		expect(h.runner.calls[2]?.now).toBe(T0 + 120 * MIN);
+		// repeated computations do not start extra refits
+		await h.service.runOnce();
+		await flush();
+		expect(h.runner.calls).toHaveLength(3);
+	});
+
+	it("starts no second refit while one runs", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(1);
+		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(2);
+	});
+
+	it("keeps the old state on a timeout and on a fit error, and logs the reason", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const s1 = fitState(T0);
+		await h.runner.finish({ status: "ok", state: s1, ms: 1 });
+		await h.time.advance(60 * MIN);
+		await h.runner.finish({ status: "timeout", ms: PACE_REFIT_TIMEOUT_MS });
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.demandModel).toBe(s1);
+		await h.time.advance(60 * MIN);
+		await h.runner.finish({ status: "error", reason: "fit-error", ms: 2 });
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.demandModel).toBe(s1);
+		expect(h.refitLines().slice(1)).toEqual([
+			`forecast e4 refit status=timeout ms=${PACE_REFIT_TIMEOUT_MS} cadenceMin=60 reason=timeout keptAgeMin=60`,
+			"forecast e4 refit status=error ms=2 cadenceMin=60 reason=fit-error keptAgeMin=120",
+		]);
+	});
+
+	it("logs a failure to build the refit input and starts no worker", async () => {
+		const h = refitHarness({ buildFails: true });
+		await h.service.runOnce();
+		await flush();
+		expect(h.runner.calls).toHaveLength(0);
+		expect(h.refitLines()).toHaveLength(1);
+		expect(h.refitLines()[0]).toMatch(
+			/^forecast e4 refit status=error ms=\d+ cadenceMin=60 reason=input-error keptAgeMin=none$/,
+		);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.demandModel).toBeNull();
+	});
+
+	it("builds the refit input over the lookback with the counted accounts", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const input = h.seriesInputs[0];
+		expect(input?.now).toBe(T0);
+		expect(input?.timeZone).toBe(PACE.timeZone);
+		expect(input?.accounts).toEqual([A]);
+		expect(input?.historyFrom).toBe(
+			paceRefitRange(T0, h.settings.current.historyLookbackDays, 0).historyFrom,
+		);
+	});
+
+	it("skips refits while paceConditioning is off and resumes at the next tick", async () => {
+		const h = refitHarness({ settings: paceOff });
+		await h.service.runOnce();
+		await flush();
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(0);
+		expect(h.refitLines()).toHaveLength(0);
+		h.settings.current = { ...h.settings.current, ...paceOn };
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(1);
+	});
+
+	it("stop aborts the running refit and arms no further refit", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		await h.service.stop();
+		expect(h.runner.calls[0]?.signal?.aborted).toBe(true);
+		expect(h.time.pending).toHaveLength(0);
+		await h.time.advance(120 * MIN);
+		expect(h.runner.calls).toHaveLength(1);
+		expect(h.refitLines()).toHaveLength(0);
+	});
+});
+
+describe("paceRefitRange", () => {
+	const DAY = 24 * 60 * MIN;
+	it("covers the lookback, clipped to the first stored bucket, and readings 7 days earlier", () => {
+		expect(paceRefitRange(T0, 84, null)).toEqual({
+			historyFrom: T0,
+			readingsFrom: T0 - 7 * DAY,
+		});
+		expect(paceRefitRange(T0, 84, 0)).toEqual({
+			historyFrom: T0 - 84 * DAY,
+			readingsFrom: T0 - 91 * DAY,
+		});
+		expect(paceRefitRange(T0, 84, T0 - 10 * DAY)).toEqual({
+			historyFrom: T0 - 10 * DAY,
+			readingsFrom: T0 - 17 * DAY,
+		});
 	});
 });

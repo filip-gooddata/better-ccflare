@@ -43,13 +43,34 @@ const DEFAULTS = {
 	moveMinGainPoints: 2,
 	openMinGainPoints: 1,
 	historyHalfLifeDays: 14,
-	historyLookbackDays: 56,
+	historyLookbackDays: 84,
 	recentTauMin: 45,
 	sessionTurnoverMin: 60,
 	workStartSharePct: 5,
+	paceConditioning: true,
 };
 
 describe("resolveForecastSettings", () => {
+	it("paceConditioning: on by default, off from the file or the environment, the environment first", () => {
+		expect(resolve().settings.paceConditioning).toBe(true);
+		expect(
+			resolve({}, { forecast_pace_conditioning: false }).settings
+				.paceConditioning,
+		).toBe(false);
+		expect(
+			resolve({ FORECAST_PACE_CONDITIONING: "off" }).settings.paceConditioning,
+		).toBe(false);
+		expect(
+			resolve(
+				{ FORECAST_PACE_CONDITIONING: "true" },
+				{ forecast_pace_conditioning: false },
+			).settings.paceConditioning,
+		).toBe(true);
+		const bad = resolve({}, { forecast_pace_conditioning: "nope" });
+		expect(bad.settings.paceConditioning).toBe(true);
+		expect(bad.warnings).toEqual(['forecast_pace_conditioning="nope"']);
+	});
+
 	it("gives the design defaults with nothing set", () => {
 		const { settings, warnings } = resolve();
 		expect(settings).toEqual(DEFAULTS);
@@ -86,6 +107,7 @@ describe("resolveForecastSettings", () => {
 				forecast_recent_tau_min: 30,
 				forecast_session_turnover_min: 90,
 				forecast_work_start_share_pct: 12.5,
+				forecast_pace_conditioning: false,
 			},
 		);
 		expect(warnings).toEqual([]);
@@ -112,6 +134,7 @@ describe("resolveForecastSettings", () => {
 			recentTauMin: 30,
 			sessionTurnoverMin: 90,
 			workStartSharePct: 12.5,
+			paceConditioning: false,
 		});
 	});
 

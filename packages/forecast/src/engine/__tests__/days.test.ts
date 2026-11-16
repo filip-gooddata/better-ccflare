@@ -51,6 +51,7 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
+		paceConditioning: true,
 		...over,
 	};
 }
@@ -105,9 +106,6 @@ function table(types: DayType[], todayType: DayType): DayTable {
 			key: "today",
 			start: 0,
 			type: todayType,
-			unitsSoFar: 0,
-			recentRate: 0,
-			recentFableRate: 0,
 		},
 	};
 }
@@ -175,7 +173,7 @@ describe("buildDayTable", () => {
 		]);
 	});
 
-	test("missing buckets are zero; today is not in the table but feeds unitsSoFar and the recent rate", () => {
+	test("missing buckets are zero; today is not in the table, and nothing of today's demand or of the last hour is carried", () => {
 		const yStart = addLocalDays(todayStart, -1, TZ);
 		const gap = yStart + 100 * BUCKET_MS;
 		const h = history(from, NOW, (t) => {
@@ -192,10 +190,15 @@ describe("buildDayTable", () => {
 		expect(t.today.key).toBe("2026-11-12");
 		expect(t.today.type).toBe("workday");
 		expect(t.today.start).toBe(todayStart);
-		// 09:00 local of 10:00 → 108 buckets at 0.02, then 12 at 0.06
-		expect(t.today.unitsSoFar).toBeCloseTo(108 * 0.02 + 12 * 0.06, 9);
-		expect(t.today.recentRate).toBeCloseTo(0.06, 12);
-		expect(t.today.recentFableRate).toBeCloseTo(0.015, 12);
+		// no units so far and no last-hour rate: today is its key, start and day type only
+		expect(Object.keys(t.today).sort()).toEqual(["key", "start", "type"]);
+		for (const d of t.days) expect(d.start).toBeLessThan(todayStart);
+		// a burst in the last hour changes nothing in the table
+		const burst = history(from, NOW, (t) =>
+			t === gap ? 0 : t >= NOW - 3_600_000 ? 5 : t >= todayStart ? 0.02 : 0.01,
+		);
+		const b = buildDayTable(input({ history: burst, historyFrom: from }));
+		expect(b).toEqual(t);
 	});
 
 	test("DST: the 25-hour day of 2026-10-25 in Europe/Prague has 300 buckets and keeps every unit", () => {

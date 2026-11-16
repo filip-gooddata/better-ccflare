@@ -378,7 +378,7 @@ This is a stated deviation from the live router, which orders idle accounts by a
 
 **Holds.** A planned opening later than on demand would open the account is a hold: until that time the account counts as held and takes no new work. The placement advice follows the simulated order: a due routing-opening, or the idle accounts the plan does not hold, come first with `forecast-open`, and a held account goes behind every other. A hold can leak live, because a request without a session key, or one placed on stale advice, goes by the plain session-pace rules and may open the held account.
 
-**Calibration speed.** Both calibrations, and with them r, are recomputed at every computation from the stored readings of the last 56 days with a 14-day half-life (`historyLookbackDays`, `historyHalfLifeDays`). After a step change by the provider they move half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (`packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way in 240–246 h and 90 % in 822–828 h; kW in 318–324 h and 924–942 h; k5 in 312 h and 906 h).
+**Calibration speed.** Both calibrations, and with them r, are recomputed at every computation from the stored readings of the last 84 days with a 14-day half-life (`historyLookbackDays`, `historyHalfLifeDays`). After a step change by the provider they move half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (`packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way in 240–246 h and 90 % in 822–828 h; kW in 318–324 h and 924–942 h; k5 in 312 h and 906 h).
 
 ### How routing uses it
 

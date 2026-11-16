@@ -6,11 +6,11 @@ import type {
 	AccountId,
 	AccountLimits,
 	Calibration,
-	DayFactorDetail,
 	EpochMs,
 	ForecastInput,
 	ForecastInputsDetail,
 } from "../types";
+import type { PaceNow } from "./pace";
 
 export type DayType = "workday" | "monday" | "weekend";
 
@@ -31,17 +31,12 @@ export interface RecordedDay {
 	fableTotal: number;
 }
 
-/** Today so far (incomplete, never in a pool). */
+/** Today (incomplete, never in a pool): its key and day type. */
 export interface TodaySoFar {
 	key: string;
 	/** Local midnight. */
 	start: EpochMs;
 	type: DayType;
-	/** Units from local midnight to now. */
-	unitsSoFar: number;
-	/** Mean units per bucket over the last 60 minutes (Fable part separately). */
-	recentRate: number;
-	recentFableRate: number;
 }
 
 export interface DayTable {
@@ -79,7 +74,7 @@ export interface NoiseOptions {
 
 /**
  * Demand of every simulated day (smoothed bootstrap of whole recorded days,
- * day factor and last-hour blend already applied), per BUCKET_MS bucket.
+ * today's pace multiplier already applied), per BUCKET_MS bucket.
  */
 export interface Scenarios {
 	/** bucketStart(now): bucket 0 contains now and holds its full-bucket demand. */
@@ -95,12 +90,8 @@ export interface Scenarios {
 		noiseMode: NoiseMode;
 		/** Scale bandwidth h per pool used, keyed by the date it served ("YYYY-MM-DD"). */
 		bandwidths: Record<string, number>;
-		/** The factor applied to today (day.a). */
-		dayFactor: number;
-		/** The day factor with its inputs (design amendment 4, D1). */
-		day: DayFactorDetail;
-		/** Units per BUCKET_MS bucket over the last hour. */
-		recentRate: number;
+		/** Today's pace (E4) whose multipliers scaled the buckets. */
+		pace: PaceNow;
 	};
 }
 

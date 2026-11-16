@@ -1,3 +1,9 @@
+import { buildPaceSeries } from "../engine/pace";
+import type {
+	PaceFitState,
+	PaceSeries,
+	PaceSeriesInput,
+} from "../engine/pace/types";
 import { unavailableResponse } from "../engine/response";
 import {
 	runTranscriptBackfill,
@@ -40,6 +46,12 @@ import {
 	createInputsLog,
 	usageDetailBackfillLine,
 } from "./log-lines";
+import { PACE_REFIT_CADENCE_MIN, paceRefitLine } from "./pace-refit-log";
+import {
+	createPaceRefitRunner,
+	PACE_REFIT_TIMEOUT_MS,
+	type PaceRefitRunner,
+} from "./pace-refit-runner";
 
 /** A kept result older than this many usage poll intervals is stale. */
 export const FORECAST_STALE_POLLS = 3;
@@ -49,6 +61,29 @@ export const FORECAST_POLL_SETTLE_MS = 5_000;
 export const FORECAST_MIN_SPACING_MS = 30_000;
 
 const DAY_MS = 24 * 60 * 60_000;
+
+/** The E4 refit runs at start-up and then this often, timed from each refit's start. */
+export const PACE_REFIT_CADENCE_MS = PACE_REFIT_CADENCE_MIN * 60_000;
+/** A seven_day reading holds until its reset, so one taken up to 7 days before the window still censors inside it. */
+const READINGS_LEAD_MS = 7 * DAY_MS;
+
+/** History and readings the refit loads: the lookback, clipped to the first stored bucket. */
+export function paceRefitRange(
+	now: EpochMs,
+	lookbackDays: number,
+	earliest: EpochMs | null,
+): { historyFrom: EpochMs; readingsFrom: EpochMs } {
+	const historyFrom = Math.max(now - lookbackDays * DAY_MS, earliest ?? now);
+	return { historyFrom, readingsFrom: historyFrom - READINGS_LEAD_MS };
+}
+
+export interface PaceRefitDeps {
+	/** Runs the fit off the main thread. */
+	runner: PaceRefitRunner;
+	/** Builds the pooled series on the main thread. */
+	buildSeries(input: PaceSeriesInput): PaceSeries;
+	timeoutMs?: number;
+}
 
 export interface ForecastServiceTimer {
 	set(fn: () => void, ms: number): unknown;
@@ -92,6 +127,8 @@ export interface ForecastServiceDeps {
 	/** The usage poll interval from the config. */
 	pollIntervalMs: number;
 	logger: { info(msg: string): void; warn(msg: string): void };
+	/** The E4 refit. Defaults to the forecast worker over buildPaceSeries; null runs no refit. */
+	paceRefit?: PaceRefitDeps | null;
 }
 
 export interface ForecastService {
@@ -136,6 +173,16 @@ export function createForecastService(
 	let backfillStarted = false;
 	let usageDetailRun: Promise<void> | null = null;
 	let quietWaiters: (() => void)[] = [];
+	const refitDeps: PaceRefitDeps | null =
+		deps.paceRefit === undefined
+			? { runner: createPaceRefitRunner(), buildSeries: buildPaceSeries }
+			: deps.paceRefit;
+	/** The last successful fit, swapped in whole; null until the first. */
+	let paceState: PaceFitState | null = null;
+	let refitRunning: Promise<void> | null = null;
+	let refitAbort: AbortController | null = null;
+	let refitHandle: unknown = null;
+	let refitsStarted = false;
 
 	const backfill =
 		deps.backfill ??
@@ -315,6 +362,7 @@ export function createForecastService(
 					accountHistory,
 					readings,
 					sessions,
+					demandModel: paceState,
 				});
 			} catch (error) {
 				failures.push(`engine=${message(error)}`);
@@ -339,6 +387,83 @@ export function createForecastService(
 		}
 		if (failures.length > 0)
 			logger.warn(`forecast cycle failed ${failures.join(" ")}`);
+	};
+
+	const refit = async (refitWith: PaceRefitDeps, signal: AbortSignal) => {
+		const now = clock.now();
+		const started = performance.now();
+		let series: PaceSeries;
+		try {
+			const settings = deps.settings();
+			const { historyFrom, readingsFrom } = paceRefitRange(
+				now,
+				settings.historyLookbackDays,
+				await store.earliest(),
+			);
+			const [history, readings, limits] = await Promise.all([
+				store.loadPooled(historyFrom, now),
+				loadReadings({ db }, readingsFrom, now),
+				deps.loadLimits(now),
+			]);
+			series = refitWith.buildSeries({
+				history,
+				historyFrom,
+				now,
+				readings,
+				accounts: countedIds(limits),
+				timeZone: deps.pace().timeZone,
+			});
+		} catch {
+			if (!stopped)
+				logger.info(
+					paceRefitLine(
+						{
+							status: "error",
+							reason: "input-error",
+							ms: performance.now() - started,
+						},
+						paceState,
+						clock.now(),
+					),
+				);
+			return;
+		}
+		if (stopped) return;
+		const outcome = await refitWith.runner.run(series, now, {
+			timeoutMs: refitWith.timeoutMs ?? PACE_REFIT_TIMEOUT_MS,
+			signal,
+		});
+		if (stopped) return;
+		// One assignment: a forecast sees the old state or the new one, never a mix.
+		if (outcome.status === "ok") paceState = outcome.state;
+		logger.info(paceRefitLine(outcome, paceState, clock.now()));
+	};
+
+	/** Arms the next refit one cadence from now, then refits unless one runs or the setting is off. */
+	const triggerRefit = () => {
+		if (stopped || !refitDeps) return;
+		if (refitHandle !== null) timer.clear(refitHandle);
+		refitHandle = timer.set(() => {
+			refitHandle = null;
+			triggerRefit();
+		}, PACE_REFIT_CADENCE_MS);
+		if (refitRunning) return;
+		try {
+			if (!deps.settings().paceConditioning) return;
+		} catch {
+			return;
+		}
+		const abort = new AbortController();
+		refitAbort = abort;
+		refitRunning = refit(refitDeps, abort.signal)
+			.catch((error: unknown) => {
+				const name = error instanceof Error ? error.name : typeof error;
+				logger.warn(`forecast e4 refit failed error=${name}`);
+			})
+			.finally(() => {
+				refitRunning = null;
+				refitAbort = null;
+			});
 	};
 
 	const clearPending = () => {
@@ -375,6 +500,10 @@ export function createForecastService(
 	/** Starts a computation now; it covers every snapshot seen so far. */
 	const start = (): Promise<void> => {
 		if (running) return running;
+		if (!refitsStarted) {
+			refitsStarted = true;
+			triggerRefit();
+		}
 		clearPending();
 		wanted = false;
 		lastStart = clock.now();
@@ -506,8 +635,12 @@ export function createForecastService(
 			stopped = true;
 			wanted = false;
 			clearPending();
+			if (refitHandle !== null) timer.clear(refitHandle);
+			refitHandle = null;
+			refitAbort?.abort();
 			deps.scheduler?.stop();
 			if (running) await running;
+			if (refitRunning) await refitRunning;
 			await startupCheck;
 			if (usageDetailRun) await usageDetailRun;
 			settleQuiet();
