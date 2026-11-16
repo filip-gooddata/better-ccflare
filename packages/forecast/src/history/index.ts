@@ -27,3 +27,9 @@ export {
 	syncProxyDemand,
 } from "./proxy-demand";
 export { loadReadings } from "./readings";
+export {
+	runUsageDetailBackfill,
+	type UsageDetailBackfillCounts,
+	type UsageDetailBackfillDeps,
+	type UsageDetailBackfillResult,
+} from "./usage-detail-backfill";

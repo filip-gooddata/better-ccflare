@@ -4,6 +4,7 @@ import type { ForecastDb } from "../history/ports";
 import { earliestProxyBucket, syncProxyDemand } from "../history/proxy-demand";
 import { usageDetailCutoff } from "../history/proxy-usage-detail";
 import { loadReadings } from "../history/readings";
+import { runUsageDetailBackfill } from "../history/usage-detail-backfill";
 import {
 	type PrewarmForecastView,
 	type PrewarmScheduler,
@@ -27,6 +28,7 @@ import {
 	backfillLine,
 	createAvailabilityLog,
 	createInputsLog,
+	usageDetailBackfillLine,
 } from "./log-lines";
 
 /** A kept result older than this many usage poll intervals is stale. */
@@ -63,6 +65,11 @@ export interface ForecastServiceDeps {
 	scheduler: PrewarmScheduler | null;
 	/** Defaults to runTranscriptBackfill over `store` and `db`. */
 	backfill?(transcriptsDir: string): Promise<unknown>;
+	/**
+	 * Runs after `backfill` succeeds. Defaults to runUsageDetailBackfill over
+	 * `db`, with `store` as the meta store.
+	 */
+	usageDetailBackfill?(transcriptsDir: string): Promise<unknown>;
 	clock: { now(): EpochMs };
 	/** The server passes unref'd timers so none keeps the process alive. */
 	timer: ForecastServiceTimer;
@@ -91,6 +98,10 @@ export interface ForecastService {
 
 const message = (error: unknown) =>
 	(error instanceof Error ? error.message : String(error)).slice(0, 200);
+
+/** The error's name only: a message could carry a transcript path. */
+const errorName = (error: unknown) =>
+	error instanceof Error ? error.name : typeof error;
 
 const countedIds = (limits: AccountLimits[]): AccountId[] =>
 	limits.filter((l) => l.counted).map((l) => l.accountId);
@@ -123,6 +134,17 @@ export function createForecastService(
 				now: () => clock.now(),
 				timeZone: deps.pace().timeZone,
 			}));
+	const usageDetailBackfill =
+		deps.usageDetailBackfill ??
+		((transcriptsDir: string) =>
+			runUsageDetailBackfill({
+				db,
+				meta: store,
+				transcriptsDir,
+				earliestProxyBucket: () => earliestProxyBucket({ db }),
+				now: () => clock.now(),
+				historyLookbackDays: deps.settings().historyLookbackDays,
+			}));
 	const availability = createAvailabilityLog((msg) => logger.info(msg));
 	const inputsLog = createInputsLog((msg) => logger.info(msg));
 
@@ -138,13 +160,30 @@ export function createForecastService(
 			.then(
 				(result) => {
 					logger.info(backfillLine(result, clock.now() - startedAt));
+					return true;
 				},
 				(error: unknown) => {
-					// The error's name only: a message could carry a transcript path.
-					const name = error instanceof Error ? error.name : typeof error;
-					logger.warn(`forecast backfill failed error=${name}`);
+					logger.warn(`forecast backfill failed error=${errorName(error)}`);
+					return false;
 				},
-			);
+			)
+			.then((succeeded) => {
+				// Sequential: it reads the cut-over the demand backfill settled on.
+				if (!succeeded) return;
+				const detailStartedAt = clock.now();
+				return usageDetailBackfill(dir).then(
+					(result) => {
+						logger.info(
+							usageDetailBackfillLine(result, clock.now() - detailStartedAt),
+						);
+					},
+					(error: unknown) => {
+						logger.warn(
+							`forecast usage detail backfill failed error=${errorName(error)}`,
+						);
+					},
+				);
+			});
 	};
 
 	const fresh = (now: EpochMs) =>

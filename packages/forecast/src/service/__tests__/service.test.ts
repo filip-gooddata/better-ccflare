@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveForecastSettings } from "@better-ccflare/config";
@@ -7,7 +7,23 @@ import { DatabaseOperations } from "@better-ccflare/database";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
 import { validateForecastResponse } from "../../contract/validate";
 import { unavailableResponse } from "../../engine/response";
+import {
+	runTranscriptBackfill,
+	TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+	TRANSCRIPT_BACKFILL_META_KEY,
+	TRANSCRIPT_BACKFILL_WRITTEN_META_KEY,
+} from "../../history/backfill";
+import { createDemandStore } from "../../history/demand-store";
 import type { ForecastDb } from "../../history/ports";
+import { earliestProxyBucket } from "../../history/proxy-demand";
+import {
+	SESSION_SALT_META_KEY,
+	type SessionRequestRow,
+	USAGE_DETAIL_BACKFILL_COVERAGE_META_KEY,
+	USAGE_DETAIL_BACKFILL_META_KEY,
+	type UsageDetailDb,
+	type UsageTokenRow,
+} from "../../history/usage-detail";
 import {
 	FakeRunner,
 	FakeStore,
@@ -272,6 +288,7 @@ interface Harness {
 	scheduler: FakeScheduler;
 	settings: { current: ForecastSettings };
 	backfills: string[];
+	usageDetailBackfills: string[];
 	store: FakeDemandStore;
 	db: ForecastDb;
 	failSync: { on: boolean };
@@ -304,6 +321,7 @@ function harness(
 	const warns: string[] = [];
 	const infos: string[] = [];
 	const backfills: string[] = [];
+	const usageDetailBackfills: string[] = [];
 	const time = over.time ?? new FakeTime();
 	const engine = new FakeEngine(log);
 	const tracker = new FakeTracker(log);
@@ -328,6 +346,9 @@ function harness(
 		backfill: async (dir) => {
 			backfills.push(dir);
 		},
+		usageDetailBackfill: async (dir) => {
+			usageDetailBackfills.push(dir);
+		},
 		clock: time.clock,
 		timer: time.timer,
 		pollIntervalMs: POLL,
@@ -348,6 +369,7 @@ function harness(
 		scheduler,
 		settings: current,
 		backfills,
+		usageDetailBackfills,
 		store,
 		db,
 		failSync,
@@ -668,6 +690,365 @@ describe("forecast service: backfill", () => {
 		await h.service.runOnce();
 		expect(h.scheduler.ticks.length).toBe(1);
 		gate.resolve();
+	});
+});
+
+/** UsageDetailDb rows kept in memory; the rest of the db is the real one. */
+class MemoryUsageDetail {
+	tokens = new Map<string, UsageTokenRow>();
+	requests = new Map<string, SessionRequestRow>();
+	async upsertUsageTokens(rows: UsageTokenRow[]) {
+		for (const r of rows)
+			this.tokens.set(
+				`${r.bucketStart}|${r.accountId}|${r.source}|${r.family}`,
+				{ ...r },
+			);
+	}
+	async upsertSessionRequests(rows: SessionRequestRow[]) {
+		for (const r of rows)
+			this.requests.set(`${r.source}|${r.sessionKey}|${r.at}|${r.seq}`, {
+				...r,
+			});
+	}
+	async replaceUsageTokens() {}
+	async replaceSessionRequests() {}
+	async getSessionRequests() {
+		return [];
+	}
+	async getUsageTokens() {
+		return [];
+	}
+	async pruneUsageDetail() {}
+}
+
+const USAGE_DETAIL_METHODS = new Set<string>([
+	"upsertUsageTokens",
+	"upsertSessionRequests",
+	"replaceUsageTokens",
+	"replaceSessionRequests",
+	"getSessionRequests",
+	"getUsageTokens",
+	"pruneUsageDetail",
+] satisfies (keyof UsageDetailDb)[]);
+
+function startupDb(detail: MemoryUsageDetail): ForecastDb {
+	const real = tempDb() as unknown as ForecastDb;
+	return new Proxy(real, {
+		get(target, prop, receiver) {
+			if (typeof prop === "string" && USAGE_DETAIL_METHODS.has(prop)) {
+				const fn = Reflect.get(detail, prop) as (...a: unknown[]) => unknown;
+				return fn.bind(detail);
+			}
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+function transcriptLine(at: EpochMs, n: number, model = "claude-opus-5-5") {
+	return JSON.stringify({
+		type: "assistant",
+		sessionId: `sess-secret-${n}`,
+		requestId: `req_${n}`,
+		timestamp: new Date(at).toISOString(),
+		message: {
+			id: `msg_${n}`,
+			model,
+			content: [{ type: "text", text: "private words" }],
+			usage: {
+				input_tokens: 10,
+				output_tokens: 20,
+				cache_read_input_tokens: 300,
+				cache_creation_input_tokens: 40,
+				cache_creation: {
+					ephemeral_5m_input_tokens: 30,
+					ephemeral_1h_input_tokens: 10,
+				},
+			},
+		},
+	});
+}
+
+function transcriptsRoot(): string {
+	const root = mkdtempSync(join(tmpdir(), "forecast-service-transcripts-"));
+	dirs.push(root);
+	mkdirSync(join(root, "proj"), { recursive: true });
+	writeFileSync(
+		join(root, "proj", "one.jsonl"),
+		`${[
+			transcriptLine(T0 - 2 * 3_600_000, 1),
+			transcriptLine(T0 - 2 * 3_600_000 + 30_000, 2, "claude-fable-5-2"),
+			transcriptLine(T0 - 3_600_000, 3),
+		].join("\n")}\n`,
+	);
+	writeFileSync(
+		join(root, "proj", "two.jsonl"),
+		`${transcriptLine(T0 - 90 * MIN, 4, "claude-sonnet-5")}\n`,
+	);
+	return root;
+}
+
+const TRANSCRIPT_META_KEYS = [
+	TRANSCRIPT_BACKFILL_META_KEY,
+	TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+	TRANSCRIPT_BACKFILL_WRITTEN_META_KEY,
+];
+
+async function demandSnapshot(db: ForecastDb): Promise<string> {
+	const far = T0 + 400 * 24 * 60 * MIN;
+	return JSON.stringify({
+		transcript: await db.getForecastDemandByAccount("transcript", 0, far),
+		proxy: await db.getForecastDemandByAccount("proxy", 0, far),
+		pooled: await db.getForecastDemandPooled(0, far),
+		meta: await Promise.all(
+			TRANSCRIPT_META_KEYS.map((k) => db.getForecastMeta(k)),
+		),
+	});
+}
+
+async function fullSnapshot(
+	db: ForecastDb,
+	detail: MemoryUsageDetail,
+): Promise<string> {
+	const sorted = <T>(m: Map<string, T>) =>
+		[...m.entries()].sort(([a], [b]) => a.localeCompare(b));
+	return JSON.stringify({
+		demand: await demandSnapshot(db),
+		tokens: sorted(detail.tokens),
+		requests: sorted(detail.requests),
+		coverage: await db.getForecastMeta(USAGE_DETAIL_BACKFILL_COVERAGE_META_KEY),
+		salt: await db.getForecastMeta(SESSION_SALT_META_KEY),
+		marker: await db.getForecastMeta(USAGE_DETAIL_BACKFILL_META_KEY),
+	});
+}
+
+async function untilLogged(h: Harness, prefix: string): Promise<string> {
+	for (let i = 0; i < 400; i++) {
+		const found = h.infos.find((m) => m.startsWith(prefix));
+		if (found) return found;
+		await new Promise((r) => setTimeout(r, 5));
+	}
+	throw new Error(`no line starting with ${prefix}`);
+}
+
+const DETAIL_LINE = "forecast usage detail backfill finished";
+
+describe("forecast service: usage-detail backfill", () => {
+	it("starts after the existing backfill finishes, whatever its status", async () => {
+		const order: string[] = [];
+		const gate = new Deferred();
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			backfill: async () => {
+				order.push("backfill:start");
+				await gate.promise;
+				order.push("backfill:end");
+				return { status: "already_done" };
+			},
+			usageDetailBackfill: async (dir) => {
+				order.push(`detail:${dir}`);
+				return { status: "done" };
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(order).toEqual(["backfill:start"]);
+		gate.resolve();
+		await flush();
+		expect(order).toEqual([
+			"backfill:start",
+			"backfill:end",
+			"detail:/tmp/transcripts",
+		]);
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		await flush();
+		expect(order.filter((o) => o.startsWith("detail"))).toHaveLength(1);
+	});
+
+	it("does not start when the existing backfill failed; the next start retries both", async () => {
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			backfill: async () => {
+				throw new Error("boom");
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(h.usageDetailBackfills).toEqual([]);
+	});
+
+	it("logs a failure by error name only", async () => {
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			usageDetailBackfill: async () => {
+				throw new TypeError("/private/conversation/path secret");
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(h.warns).toEqual([
+			"forecast usage detail backfill failed error=TypeError",
+		]);
+	});
+
+	it("ends with one line of counts and status only", async () => {
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			usageDetailBackfill: async () => {
+				h.time.now += 321;
+				return {
+					status: "done",
+					files: 12,
+					unreadable: 1,
+					lines: 900,
+					malformed: 2,
+					tokenRows: 40,
+					sessionRequests: 17,
+					path: "/Users/someone/.claude/projects/x.jsonl",
+				};
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(h.infos.filter((m) => m.startsWith(DETAIL_LINE))).toEqual([
+			`${DETAIL_LINE} status=done files=12 unreadable=1 lines=900 malformed=2 tokenRows=40 requests=17 ms=321`,
+		]);
+	});
+
+	it("first start with the old marker already set runs the new pass and fills both tables", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		await db.setForecastMeta(TRANSCRIPT_BACKFILL_META_KEY, '{"rows":2}');
+		await db.setForecastMeta(
+			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+			String(T0 - 30 * MIN),
+		);
+		await db.upsertForecastDemand([
+			{
+				bucketStart: T0 - 120 * MIN,
+				accountId: "",
+				source: "transcript",
+				units: 12.5,
+				fableUnits: 2,
+				requestCount: 2,
+			},
+		]);
+		const before = await demandSnapshot(db);
+		const root = transcriptsRoot();
+		const h = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		await h.service.runOnce();
+		const line = await untilLogged(h, DETAIL_LINE);
+		expect(
+			h.infos.find((m) => m.startsWith("forecast backfill finished")),
+		).toContain("status=already_done");
+		expect(line).toContain("status=done files=2 unreadable=0 lines=4");
+		expect(detail.tokens.size).toBeGreaterThan(0);
+		expect(detail.requests.size).toBe(4);
+		for (const r of detail.tokens.values()) {
+			expect(r.source).toBe("transcript");
+			expect(r.bucketStart).toBeLessThan(T0 - 30 * MIN);
+		}
+		expect(await db.getForecastMeta(USAGE_DETAIL_BACKFILL_META_KEY)).not.toBe(
+			null,
+		);
+		expect(await demandSnapshot(db)).toBe(before);
+		expect(JSON.stringify([...detail.requests.values()])).not.toContain(
+			"sess-secret",
+		);
+		await h.service.stop();
+	});
+
+	it("a second start logs already_done, reads no transcript and changes no stored row", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		const root = transcriptsRoot();
+		const first = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		await first.service.runOnce();
+		expect(await untilLogged(first, DETAIL_LINE)).toContain("status=done");
+		await first.service.stop();
+		const before = await fullSnapshot(db, detail);
+		expect(detail.requests.size).toBeGreaterThan(0);
+
+		// A transcript that would add rows if anything were read.
+		writeFileSync(
+			join(root, "proj", "three.jsonl"),
+			`${transcriptLine(T0 - 4 * 3_600_000, 9)}\n`,
+		);
+		const second = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		await second.service.runOnce();
+		const line = await untilLogged(second, DETAIL_LINE);
+		expect(line).toContain("status=already_done files=0 unreadable=0 lines=0");
+		expect(
+			second.infos.find((m) => m.startsWith("forecast backfill finished")),
+		).toContain("status=already_done");
+		expect(await fullSnapshot(db, detail)).toBe(before);
+		await second.service.stop();
+	});
+
+	it("leaves forecast_demand rows and the existing markers byte-identical across the new pass", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		const root = transcriptsRoot();
+		let afterExisting: string | null = null;
+		const h = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: async (dir) => {
+				const result = await runTranscriptBackfill({
+					store,
+					transcriptsDir: dir,
+					earliestProxyBucket: () => earliestProxyBucket({ db }),
+					now: () => T0,
+				});
+				afterExisting = await demandSnapshot(db);
+				return result;
+			},
+			usageDetailBackfill: undefined,
+		});
+		await h.service.runOnce();
+		expect(await untilLogged(h, DETAIL_LINE)).toContain("status=done");
+		expect(afterExisting).not.toBe(null);
+		expect(await demandSnapshot(db)).toBe(afterExisting as unknown as string);
+
+		// Same requests per bucket in both tables.
+		const demand = await db.getForecastDemandByAccount(
+			"transcript",
+			0,
+			T0 + MIN,
+		);
+		const perBucket = new Map<number, number>();
+		for (const r of detail.tokens.values())
+			perBucket.set(
+				r.bucketStart,
+				(perBucket.get(r.bucketStart) ?? 0) + r.requestCount,
+			);
+		expect(perBucket).toEqual(
+			new Map(demand.map((r) => [r.bucketStart, r.requestCount])),
+		);
+		await h.service.stop();
 	});
 });
 

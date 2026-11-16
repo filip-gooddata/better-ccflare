@@ -61,6 +61,29 @@ export function backfillLine(result: unknown, runMs: number): string {
 	].join(" ");
 }
 
+/** One INFO line with the usage-detail backfill's counts, status and run time; counts only. */
+export function usageDetailBackfillLine(
+	result: unknown,
+	runMs: number,
+): string {
+	const r =
+		result !== null && typeof result === "object"
+			? (result as Record<string, unknown>)
+			: {};
+	const status = field(r, "status");
+	return [
+		"forecast usage detail backfill finished",
+		`status=${typeof status === "string" && BACKFILL_STATUSES.has(status) ? status : "unknown"}`,
+		`files=${count(r, "files")}`,
+		`unreadable=${count(r, "unreadable")}`,
+		`lines=${count(r, "lines")}`,
+		`malformed=${count(r, "malformed")}`,
+		`tokenRows=${count(r, "tokenRows")}`,
+		`requests=${count(r, "sessionRequests")}`,
+		`ms=${Number.isFinite(runMs) ? Math.max(0, Math.round(runMs)) : "?"}`,
+	].join(" ");
+}
+
 /** The printed line, and the key that decides whether it says something new. */
 function describe(result: Extract<ForecastResult, { available: false }>): {
 	line: string;

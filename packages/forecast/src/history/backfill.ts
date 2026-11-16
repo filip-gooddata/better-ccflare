@@ -32,8 +32,8 @@ export const TRANSCRIPT_BACKFILL_CUTOVER_META_KEY =
 export const TRANSCRIPT_BACKFILL_WRITTEN_META_KEY =
 	"transcript_backfill_written";
 
-const DEFAULT_SLICE_BUDGET_MS = 30;
-const DEFAULT_UPSERT_BATCH_SIZE = 500;
+export const DEFAULT_SLICE_BUDGET_MS = 30;
+export const DEFAULT_UPSERT_BATCH_SIZE = 500;
 const DEFAULT_READ_CHUNK_BYTES = 1 << 20;
 const NEWLINE = 0x0a;
 const USAGE_NEEDLE = Buffer.from('"usage"');
@@ -109,12 +109,7 @@ export type BackfillResult =
 			lastDemandDay: string | null;
 	  } & BackfillCounts);
 
-interface Response {
-	at: EpochMs;
-	usage: TokenUsage;
-}
-
-function emptyCounts(): BackfillCounts {
+export function emptyCounts(): BackfillCounts {
 	return {
 		files: 0,
 		unreadable: 0,
@@ -238,7 +233,7 @@ async function readWrittenRange(
 	return { from: range.from, until: range.until };
 }
 
-class Slicer {
+export class Slicer {
 	private sliceStart = performance.now();
 	constructor(private readonly budgetMs: number) {}
 
@@ -311,7 +306,99 @@ async function* fileLines(
 	}
 }
 
-async function dirExists(path: string): Promise<boolean> {
+/** One response kept after dedupe; `file` indexes TranscriptScan.files. */
+export interface ScannedResponse {
+	at: EpochMs;
+	usage: TokenUsage;
+	file: number;
+	/** Position of the line it was first kept from, in reading order across all files. */
+	line: number;
+}
+
+export interface TranscriptScan {
+	/** The `*.jsonl` files, sorted, as listed under the root. */
+	files: string[];
+	/** Keyed responses, deduped by message id and request id. */
+	responses: Map<string, ScannedResponse>;
+	/** Responses with neither id, each its own response. */
+	unkeyed: ScannedResponse[];
+}
+
+/**
+ * Reads every transcript under `root` and dedupes its usage lines. A repeated
+ * response keeps its first timestamp, the usage with the greatest output and
+ * the file where it was first kept.
+ */
+export async function scanTranscripts(
+	root: string,
+	counts: BackfillCounts,
+	slicer: Slicer,
+	readChunkBytes?: number,
+): Promise<TranscriptScan> {
+	const chunkBytes = Math.max(1024, readChunkBytes ?? DEFAULT_READ_CHUNK_BYTES);
+	const responses = new Map<string, ScannedResponse>();
+	const unkeyed: ScannedResponse[] = [];
+
+	const files = await listTranscripts(root, counts, slicer);
+	for (const [file, path] of files.entries()) {
+		try {
+			for await (const raw of fileLines(path, chunkBytes)) {
+				counts.lines++;
+				if (raw.indexOf(USAGE_NEEDLE) !== -1) {
+					let scanned: ScannedLine | null = null;
+					try {
+						scanned = scanUsageLine(raw);
+					} catch {
+						// MalformedLineError only; its message holds no line content.
+					}
+					if (scanned === null) {
+						counts.malformed++;
+					} else {
+						const line = usageMetadata(scanned);
+						if (line === null) counts.skipped++;
+						else if (line.key === null) {
+							counts.unkeyed++;
+							unkeyed.push({
+								at: line.at,
+								usage: line.usage,
+								file,
+								line: counts.lines,
+							});
+						} else {
+							const seen = responses.get(line.key);
+							if (seen === undefined) {
+								responses.set(line.key, {
+									at: line.at,
+									usage: line.usage,
+									file,
+									line: counts.lines,
+								});
+							} else {
+								counts.deduped++;
+								// Streamed responses repeat their usage; the line with the most
+								// output is the final one. The response starts at its first line.
+								if (line.usage.outputTokens >= seen.usage.outputTokens) {
+									seen.usage = line.usage;
+								}
+								seen.at = Math.min(seen.at, line.at);
+							}
+						}
+					}
+				} else if (raw.length > 0) {
+					counts.skipped++;
+				}
+				await slicer.maybeYield();
+			}
+			counts.files++;
+		} catch {
+			counts.unreadable++;
+		}
+		await slicer.maybeYield();
+	}
+	return { files, responses, unkeyed };
+}
+
+export async function dirExists(path: string): Promise<boolean> {
 	try {
 		await readdir(path);
 		return true;
@@ -343,59 +430,12 @@ export async function runTranscriptBackfill(
 	} = await resolveCutover(deps);
 
 	const slicer = new Slicer(deps.sliceBudgetMs ?? DEFAULT_SLICE_BUDGET_MS);
-	const chunkBytes = Math.max(
-		1024,
-		deps.readChunkBytes ?? DEFAULT_READ_CHUNK_BYTES,
+	const { responses, unkeyed } = await scanTranscripts(
+		deps.transcriptsDir,
+		counts,
+		slicer,
+		deps.readChunkBytes,
 	);
-	const responses = new Map<string, Response>();
-	const unkeyed: Response[] = [];
-
-	const files = await listTranscripts(deps.transcriptsDir, counts, slicer);
-	for (const file of files) {
-		try {
-			for await (const raw of fileLines(file, chunkBytes)) {
-				counts.lines++;
-				if (raw.indexOf(USAGE_NEEDLE) !== -1) {
-					let scanned: ScannedLine | null = null;
-					try {
-						scanned = scanUsageLine(raw);
-					} catch {
-						// MalformedLineError only; its message holds no line content.
-					}
-					if (scanned === null) {
-						counts.malformed++;
-					} else {
-						const line = usageMetadata(scanned);
-						if (line === null) counts.skipped++;
-						else if (line.key === null) {
-							counts.unkeyed++;
-							unkeyed.push({ at: line.at, usage: line.usage });
-						} else {
-							const seen = responses.get(line.key);
-							if (seen === undefined) {
-								responses.set(line.key, { at: line.at, usage: line.usage });
-							} else {
-								counts.deduped++;
-								// Streamed responses repeat their usage; the line with the most
-								// output is the final one. The response starts at its first line.
-								if (line.usage.outputTokens >= seen.usage.outputTokens) {
-									seen.usage = line.usage;
-								}
-								seen.at = Math.min(seen.at, line.at);
-							}
-						}
-					}
-				} else if (raw.length > 0) {
-					counts.skipped++;
-				}
-				await slicer.maybeYield();
-			}
-			counts.files++;
-		} catch {
-			counts.unreadable++;
-		}
-		await slicer.maybeYield();
-	}
 
 	const buckets = new Map<EpochMs, StoredDemandRow>();
 	for (const group of [responses.values(), unkeyed.values()]) {
