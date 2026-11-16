@@ -32,7 +32,7 @@ export interface ProxySyncResult {
 const ERROR_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
 /** The error name only, when it is a plain identifier: a message could carry a path. */
-function errorName(error: unknown): string {
+export function errorName(error: unknown): string {
 	const name = error instanceof Error ? error.name : typeof error;
 	return ERROR_NAME.test(name) ? name : "Error";
 }
@@ -113,8 +113,10 @@ type UsageDetailSync = Pick<
 >;
 
 /**
- * Rebuild the usage detail of [min(from, through), to), or [0, to) before any
- * rebuild finished, and advance `through` to `to` once it has. A throw is
+ * Rebuild the usage detail of [min(from, bucketStart(through - 60 min)), to),
+ * or [0, to) before any rebuild finished, and advance `through` to `to` once it
+ * has. Reaching back one sync window behind `through` catches requests saved
+ * late into the last rebuilt buckets, as the demand sync does. A throw is
  * returned as the error name and leaves `through` where it was.
  */
 async function syncUsageDetail(
@@ -132,7 +134,10 @@ async function syncUsageDetail(
 		const through = Number(stored);
 		detailFrom =
 			stored !== null && Number.isFinite(through) && through >= 0
-				? Math.min(from, through)
+				? Math.min(
+						from,
+						Math.max(0, bucketStart(through - PROXY_SYNC_WINDOW_MS)),
+					)
 				: 0;
 		const requests =
 			detailFrom < from

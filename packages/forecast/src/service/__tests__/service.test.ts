@@ -19,6 +19,7 @@ import {
 	earliestProxyBucket,
 	PROXY_SYNC_MARKER,
 } from "../../history/proxy-demand";
+import { sessionKey } from "../../history/session-key";
 import {
 	SESSION_SALT_META_KEY,
 	type SessionRequestRow,
@@ -1662,5 +1663,180 @@ describe("forecast service: usage-detail retention", () => {
 		await h.service.runOnce();
 		expect(h.engine.inputs).toHaveLength(1);
 		expect(h.warns.join("\n")).toContain("prune=");
+	});
+
+	it("a failing prune is logged by a plain error name only, never its message", async () => {
+		const real = tempDb() as unknown as ForecastDb;
+		const db = new Proxy(real, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (prop === "pruneUsageDetail")
+					return async () => {
+						const error = new Error("/private/fake-prune-path/x.db secret");
+						error.name = "Bad /fake-prune-path name";
+						throw error;
+					};
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const h = harness({ db });
+		await h.service.runOnce();
+		expect(h.warns).toEqual(["forecast cycle failed prune=Error"]);
+		expect(h.warns.join("\n")).not.toContain("fake-prune-path");
+	});
+});
+
+describe("forecast service: F3 start-up and salt", () => {
+	it("a usage-detail pass failure with a non-identifier name logs error=Error", async () => {
+		const h = harness({
+			settings: { transcriptsDir: "/tmp/transcripts" },
+			usageDetailBackfill: async () => {
+				const error = new Error("/private/fake-detail-path secret");
+				error.name = "Bad /fake-detail-path name";
+				throw error;
+			},
+		});
+		await h.service.runOnce();
+		await flush();
+		expect(h.warns).toEqual([
+			"forecast usage detail backfill failed error=Error",
+		]);
+	});
+
+	it("the proxy sync and the transcript pass share one salt creation through the service defaults", async () => {
+		const ops = tempDb();
+		await ops.getAdapter().run(
+			`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at)
+				 VALUES ('acct-a', 'acct-a', 'anthropic', 'refresh-a', 'access-a', 0)`,
+		);
+		const gate = new Deferred();
+		let saltReads = 0;
+		let saltWrites = 0;
+		const db = new Proxy(ops as unknown as ForecastDb, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (typeof value !== "function") return value;
+				if (prop === "getForecastMeta")
+					return async (key: string) => {
+						if (key === SESSION_SALT_META_KEY) {
+							saltReads++;
+							await gate.promise;
+						}
+						return value.call(target, key);
+					};
+				if (prop === "setForecastMeta")
+					return async (key: string, v: string) => {
+						if (key === SESSION_SALT_META_KEY) saltWrites++;
+						return value.call(target, key, v);
+					};
+				return value.bind(target);
+			},
+		});
+		const root = transcriptsRoot();
+		const h = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store: createDemandStore({ db }),
+			usageDetailBackfill: undefined,
+		});
+		// no request yet: the first sync needs no salt; the transcript pass then waits on it
+		await h.service.runOnce();
+		for (let i = 0; i < 400 && saltReads === 0; i++)
+			await new Promise((r) => setTimeout(r, 5));
+		expect(saltReads).toBe(1);
+
+		await ops.getAdapter().run(
+			`INSERT INTO requests (id, timestamp, method, path, account_used, model,
+			   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+			   client_session_id)
+			 VALUES ('req-1', ?, 'POST', '/v1/messages', 'acct-a', 'claude-opus-4-1', 10, 20, 100, 50, 's1')`,
+			[T0 + MIN],
+		);
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		const second = h.service.runOnce();
+		await flush();
+		gate.resolve();
+		await second;
+		expect(await untilLogged(h, DETAIL_LINE)).toContain("status=done");
+
+		expect(saltWrites).toBe(1);
+		const salt = (await ops.getForecastMeta(SESSION_SALT_META_KEY)) as string;
+		expect(salt).toMatch(/^[0-9a-f]{64}$/);
+		const far = T0 + 1000 * MIN;
+		const proxyRows = await ops.getSessionRequests("proxy", 0, far);
+		expect(proxyRows.map((r) => r.sessionKey)).toEqual([
+			sessionKey(salt, "proxy", "s1"),
+		]);
+		const transcriptKeys = new Set(
+			(await ops.getSessionRequests("transcript", 0, far)).map(
+				(r) => r.sessionKey,
+			),
+		);
+		expect(transcriptKeys).toEqual(
+			new Set([
+				sessionKey(salt, "transcript", join("proj", "one.jsonl")),
+				sessionKey(salt, "transcript", join("proj", "two.jsonl")),
+			]),
+		);
+		await h.service.stop();
+	});
+
+	it("production start-up through notifyUsagePoll alone runs the new pass once, and a second start changes nothing", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		await db.setForecastMeta(TRANSCRIPT_BACKFILL_META_KEY, '{"rows":2}');
+		await db.setForecastMeta(
+			TRANSCRIPT_BACKFILL_CUTOVER_META_KEY,
+			String(T0 - 30 * MIN),
+		);
+		const root = transcriptsRoot();
+		const first = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		first.service.notifyUsagePoll();
+		expect(first.engine.inputs).toHaveLength(0);
+		await first.time.advance(FORECAST_POLL_SETTLE_MS);
+		expect(first.engine.inputs.map((i) => i.now)).toEqual([
+			T0 + FORECAST_POLL_SETTLE_MS,
+		]);
+		const line = await untilLogged(first, DETAIL_LINE);
+		expect(
+			first.infos.find((m) => m.startsWith("forecast backfill finished")),
+		).toContain("status=already_done");
+		expect(line).toContain("status=done files=2 unreadable=0 lines=4");
+		expect(first.infos.filter((m) => m.startsWith(DETAIL_LINE))).toHaveLength(
+			1,
+		);
+		expect(detail.tokens.size).toBeGreaterThan(0);
+		expect(detail.requests.size).toBe(4);
+		expect(await db.getForecastMeta(USAGE_DETAIL_BACKFILL_META_KEY)).not.toBe(
+			null,
+		);
+		await first.time.advance(10 * FORECAST_MIN_SPACING_MS);
+		expect(first.engine.inputs).toHaveLength(1);
+		await first.service.stop();
+		const before = await fullSnapshot(db, detail);
+
+		const second = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		second.time.now = first.time.now;
+		second.service.notifyUsagePoll();
+		await second.time.advance(FORECAST_POLL_SETTLE_MS);
+		expect(second.engine.inputs).toHaveLength(1);
+		expect(await untilLogged(second, DETAIL_LINE)).toContain(
+			"status=already_done files=0 unreadable=0 lines=0",
+		);
+		expect(await fullSnapshot(db, detail)).toBe(before);
+		await second.service.stop();
 	});
 });

@@ -584,7 +584,7 @@ describe("proxy usage detail: catching up the history", () => {
 			expect(ok.detailError).toBeUndefined();
 			expect(ranges).toEqual([
 				[T0 + 140 * MIN, T0 + 305 * MIN],
-				[T0 + B, T0 + 305 * MIN],
+				[T0 - 55 * MIN, T0 + 305 * MIN],
 			]);
 			expect(await through()).toBe(String(T0 + 305 * MIN));
 			expect(await stored(ops)).toEqual(
@@ -592,6 +592,33 @@ describe("proxy usage detail: catching up the history", () => {
 			);
 		});
 	}
+
+	it("after detail failures longer than the window, a request saved late into the last rebuilt bucket is still rebuilt", async () => {
+		const all: Req[] = [];
+		const add = async (r: Req) => {
+			all.push(r);
+			await insert(ops, r);
+		};
+		const failing = { on: false };
+		const db = failingDetail(ops, "replaceUsageTokens", failing);
+		await add(req("s1", T0 - 10 * MIN));
+		await syncProxyDemand({ db }, T0 + 2 * MIN);
+		expect(await ops.getForecastMeta(USAGE_DETAIL_PROXY_THROUGH_META_KEY)).toBe(
+			String(T0 + B),
+		);
+		// started inside the last rebuilt bucket, saved only after that sync
+		await add(req("s1", T0 + MIN, { account: "acct-b" }));
+
+		failing.on = true;
+		for (const now of [T0 + 100 * MIN, T0 + 200 * MIN]) {
+			const result = await syncProxyDemand({ db }, now);
+			expect(result.detailError).toBe("DiskFullError");
+		}
+		failing.on = false;
+		const ok = await syncProxyDemand({ db }, T0 + 300 * MIN);
+		expect(ok.detailError).toBeUndefined();
+		expect(await stored(ops)).toEqual(await fullRecompute(all, T0 + 300 * MIN));
+	});
 
 	it("a failure on the very first sync leaves through unset, so the next sync rebuilds everything", async () => {
 		const all = [req("s1", T0 - 2 * DAY), req("s2", T0 - 1 * MIN)];

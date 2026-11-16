@@ -16,7 +16,7 @@ export interface ProxyUsageDetailResult {
 /** One MetaAccess per database, so sessionSalt shares one salt creation per store. */
 const metaByDb = new WeakMap<ForecastDb, MetaAccess>();
 
-function metaAccess(db: ForecastDb): MetaAccess {
+export function usageDetailMeta(db: ForecastDb): MetaAccess {
 	let meta = metaByDb.get(db);
 	if (!meta) {
 		meta = {
@@ -45,7 +45,7 @@ export async function recordProxyUsageDetail(
 	const sessions: SessionRequestRow[] = [];
 	const seqs = new Map<string, number>();
 	const salt = requests.some((r) => r.clientSessionId)
-		? await sessionSalt(metaAccess(db))
+		? await sessionSalt(usageDetailMeta(db))
 		: null;
 
 	for (const request of requests) {

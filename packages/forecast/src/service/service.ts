@@ -1,8 +1,15 @@
 import { unavailableResponse } from "../engine/response";
 import { runTranscriptBackfill } from "../history/backfill";
 import type { ForecastDb } from "../history/ports";
-import { earliestProxyBucket, syncProxyDemand } from "../history/proxy-demand";
-import { usageDetailCutoff } from "../history/proxy-usage-detail";
+import {
+	earliestProxyBucket,
+	errorName,
+	syncProxyDemand,
+} from "../history/proxy-demand";
+import {
+	usageDetailCutoff,
+	usageDetailMeta,
+} from "../history/proxy-usage-detail";
 import { loadReadings } from "../history/readings";
 import { runUsageDetailBackfill } from "../history/usage-detail-backfill";
 import {
@@ -67,7 +74,7 @@ export interface ForecastServiceDeps {
 	backfill?(transcriptsDir: string): Promise<unknown>;
 	/**
 	 * Runs after `backfill` succeeds. Defaults to runUsageDetailBackfill over
-	 * `db`, with `store` as the meta store.
+	 * `db`, with usageDetailMeta(db) as the meta store.
 	 */
 	usageDetailBackfill?(transcriptsDir: string): Promise<unknown>;
 	clock: { now(): EpochMs };
@@ -98,10 +105,6 @@ export interface ForecastService {
 
 const message = (error: unknown) =>
 	(error instanceof Error ? error.message : String(error)).slice(0, 200);
-
-/** The error's name only: a message could carry a transcript path. */
-const errorName = (error: unknown) =>
-	error instanceof Error ? error.name : typeof error;
 
 const countedIds = (limits: AccountLimits[]): AccountId[] =>
 	limits.filter((l) => l.counted).map((l) => l.accountId);
@@ -139,7 +142,7 @@ export function createForecastService(
 		((transcriptsDir: string) =>
 			runUsageDetailBackfill({
 				db,
-				meta: store,
+				meta: usageDetailMeta(db),
 				transcriptsDir,
 				earliestProxyBucket: () => earliestProxyBucket({ db }),
 				now: () => clock.now(),
@@ -214,7 +217,7 @@ export function createForecastService(
 				usageDetailCutoff(now, deps.settings().historyLookbackDays),
 			);
 		} catch (error) {
-			failures.push(`prune=${message(error)}`);
+			failures.push(`prune=${errorName(error)}`);
 		}
 		try {
 			const settings = deps.settings();
