@@ -3,7 +3,9 @@ import {
 	getModelFamily,
 	isAccountAvailable,
 	isUsageExhausted,
+	mapModelName,
 	providerAcceptsClientModel,
+	splitModelRouting,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -25,6 +27,7 @@ import {
 } from "./limit-blocked";
 import {
 	type FamilyExhaustionOrigin,
+	getFamilyBlock,
 	getFamilyExhaustionOrigin,
 	getFamilyExhaustionUntil,
 	isAccountExhaustedForModel,
@@ -444,8 +447,10 @@ export function isComboSessionFallbackDisabled(ctx: ProxyContext): boolean {
 }
 
 /**
- * Whether `account` should be excluded from routing for `model`'s family:
- * either its cached usage telemetry shows a fully exhausted (>=100%, future
+ * Whether `account` should be excluded from routing for `model`'s family.
+ * A standing family block (origin "family_blocked") excludes in every mode;
+ * the remaining checks run only when capacity routing is on: either its
+ * cached usage telemetry shows a fully exhausted (>=100%, future
  * reset) weekly_scoped cap for that family (origin "telemetry_confirmed"),
  * or the family was recently observed exhausted via an out_of_credits 429
  * (negative cache — origin as recorded by markFamilyExhausted, normally
@@ -456,13 +461,36 @@ function isAccountCapacityExcluded(
 	account: Account,
 	model: string,
 	now: number,
+	capacityRoutingEnabled: boolean,
 ): {
 	excluded: boolean;
 	resetAt: number | null;
 	origin: FamilyExhaustionOrigin | null;
 } {
 	const family = getModelFamily(model);
+	// A block is recorded for the family upstream refused, which is the family
+	// of the model this account actually sends (mapModelName: the mapped
+	// primary model, or the client's model when no mapping applies or
+	// "force account model" turns mapping off).
+	const upstreamFamily =
+		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
+		family;
+	if (!upstreamFamily) return { excluded: false, resetAt: null, origin: null };
+
+	// A standing family block is an observed upstream refusal of this family
+	// on this account: it excludes whatever MODEL_SCOPED_CAPACITY_ROUTING and
+	// the overage signal say, until the family's limit resets.
+	const block = getFamilyBlock(account.id, upstreamFamily, now);
+	if (block) {
+		log.info(
+			`family_blocked: excluding ${account.name} for ${upstreamFamily} until ${new Date(block.until).toISOString()} (source=${block.source})`,
+		);
+		return { excluded: true, resetAt: block.until, origin: "family_blocked" };
+	}
 	if (!family) return { excluded: false, resetAt: null, origin: null };
+	if (!capacityRoutingEnabled) {
+		return { excluded: false, resetAt: null, origin: null };
+	}
 
 	const usageResult = isAccountExhaustedForModel(
 		usageCache.get(account.id),
@@ -961,8 +989,9 @@ export async function selectAccountsForRequest(
 						// Per-slot capacity check uses the slot's own model override
 						// (not the combo family's request model), since slots can carry
 						// distinct concrete models within the same family.
+						// A family block excludes the slot even with capacity routing
+						// off; the telemetry and negative-cache checks need it on.
 						if (
-							capacityRoutingEnabled &&
 							isAccountCapacityExcluded(
 								account,
 								// Passthrough slots (empty model) carry no model of their
@@ -971,6 +1000,7 @@ export async function selectAccountsForRequest(
 								// silently no-op for those slots.
 								slot.model || model,
 								capacityNow,
+								capacityRoutingEnabled,
 							).excluded
 						) {
 							continue;
@@ -1271,10 +1301,13 @@ export async function selectAccountsForRequest(
 	// cap for this model's family is exhausted. Only when the filter empties
 	// an otherwise non-empty candidate list do we record exhaustion info —
 	// an empty candidate list from the strategy itself is the ordinary
-	// pool_exhausted case and must not be relabeled.
-	if (model && isCapacityRoutingEnabled(ctx)) {
+	// pool_exhausted case and must not be relabeled. Family blocks apply in
+	// every mode; the telemetry and negative-cache checks only when capacity
+	// routing is on (isAccountCapacityExcluded).
+	if (model) {
 		const family = getModelFamily(model);
 		if (family) {
+			const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
 			const now = Date.now();
 			const available: Account[] = [];
 			let earliestResetAt: number | null = null;
@@ -1284,17 +1317,23 @@ export async function selectAccountsForRequest(
 			// reactive-only exclusion downgrades the whole response to neutral
 			// wording, since that account's exhaustion was never corroborated.
 			let allTelemetryConfirmed = true;
+			// Likewise "family_blocked" only when every exclusion was a block.
+			let allFamilyBlocked = true;
 
 			for (const account of orderedAccounts) {
 				const { excluded, resetAt, origin } = isAccountCapacityExcluded(
 					account,
 					model,
 					now,
+					capacityRoutingEnabled,
 				);
 				if (excluded) {
 					anyExcluded = true;
 					if (origin !== "telemetry_confirmed") {
 						allTelemetryConfirmed = false;
+					}
+					if (origin !== "family_blocked") {
+						allFamilyBlocked = false;
 					}
 					if (
 						resetAt != null &&
@@ -1338,7 +1377,14 @@ export async function selectAccountsForRequest(
 					) {
 						continue;
 					}
-					if (isAccountCapacityExcluded(account, model, now).excluded) {
+					if (
+						isAccountCapacityExcluded(
+							account,
+							model,
+							now,
+							capacityRoutingEnabled,
+						).excluded
+					) {
 						continue;
 					}
 					if (
@@ -1372,7 +1418,9 @@ export async function selectAccountsForRequest(
 					resetAt: earliestResetAt,
 					origin: allTelemetryConfirmed
 						? "telemetry_confirmed"
-						: "recent_upstream_rejection",
+						: allFamilyBlocked
+							? "family_blocked"
+							: "recent_upstream_rejection",
 				});
 				return [];
 			}

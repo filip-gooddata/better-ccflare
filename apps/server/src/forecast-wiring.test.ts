@@ -41,6 +41,10 @@ import { type APIContext, APIRouter } from "@better-ccflare/http-api";
 import { SessionPaceStrategy } from "@better-ccflare/load-balancer";
 import { Logger } from "@better-ccflare/logger";
 import type { UsageData } from "@better-ccflare/providers";
+import {
+	blockFamily,
+	clearFamilyBlocksForAccount,
+} from "@better-ccflare/proxy";
 import type {
 	Account,
 	RequestMeta,
@@ -549,6 +553,81 @@ describe("loadClaudeLimits", () => {
 		expect(byId.get("r")?.counted).toBe(false);
 		expect(byId.get("c")?.blockedUntil).toBe(NOW + HOUR);
 		expect(byId.get("c")?.fiveHour).toEqual({ usedPct: 0, resetsAt: null });
+	});
+
+	describe("a Fable family block", () => {
+		afterEach(() => {
+			for (const id of ["a", "b", "c"]) clearFamilyBlocksForAccount(id);
+		});
+
+		const reading = {
+			five_hour: {
+				utilization: 40,
+				resets_at: new Date(NOW + HOUR).toISOString(),
+			},
+			seven_day: {
+				utilization: 30,
+				resets_at: new Date(NOW + DAY).toISOString(),
+			},
+			seven_day_fable: {
+				utilization: 7,
+				resets_at: new Date(NOW + DAY).toISOString(),
+			},
+		} as UsageData;
+
+		it("reads Fable as used up until the block lifts and leaves the account open", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha");
+			await insertClaude(dbOps, "b", "beta");
+			blockFamily("a", "fable", NOW + 2 * DAY, "header", NOW - MIN);
+			const limits = await loadClaudeLimits(dbOps, { get: () => reading }, NOW);
+			const byId = new Map(limits.map((l) => [l.accountId, l]));
+			const a = byId.get("a");
+			expect(a?.fable).toEqual({ usedPct: 100, resetsAt: NOW + 2 * DAY });
+			expect(a?.blockedUntil).toBeNull();
+			expect(a?.counted).toBe(true);
+			expect(a?.fiveHour).toEqual({ usedPct: 40, resetsAt: NOW + HOUR });
+			expect(a?.weekly).toEqual({ usedPct: 30, resetsAt: NOW + DAY });
+			expect(byId.get("b")?.fable).toEqual({
+				usedPct: 7,
+				resetsAt: NOW + DAY,
+			});
+		});
+
+		it("reports the block without a usage reading", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha");
+			blockFamily("a", "fable", NOW + DAY, "usage", NOW);
+			const [a] = await loadClaudeLimits(dbOps, { get: () => null }, NOW);
+			expect(a?.fable).toEqual({ usedPct: 100, resetsAt: NOW + DAY });
+			expect(a?.blockedUntil).toBeNull();
+		});
+
+		it("keeps an account cooldown as blockedUntil next to the block", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "c", "cool", { cooldown: NOW + HOUR });
+			blockFamily("c", "fable", NOW + DAY, "header", NOW);
+			const [c] = await loadClaudeLimits(dbOps, { get: () => reading }, NOW);
+			expect(c?.blockedUntil).toBe(NOW + HOUR);
+			expect(c?.fable).toEqual({ usedPct: 100, resetsAt: NOW + DAY });
+		});
+
+		it("ignores a lifted block and a block on another family", async () => {
+			const dbOps = tempDb();
+			await insertClaude(dbOps, "a", "alpha");
+			await insertClaude(dbOps, "b", "beta");
+			blockFamily("a", "fable", NOW + MIN, "header", NOW - HOUR);
+			blockFamily("b", "opus", NOW + DAY, "header", NOW);
+			const limits = await loadClaudeLimits(
+				dbOps,
+				{ get: () => reading },
+				NOW + 2 * MIN,
+			);
+			for (const l of limits) {
+				expect(l.fable).toEqual({ usedPct: 7, resetsAt: NOW + DAY });
+				expect(l.blockedUntil).toBeNull();
+			}
+		});
 	});
 });
 

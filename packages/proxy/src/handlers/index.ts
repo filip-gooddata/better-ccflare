@@ -25,9 +25,15 @@ export {
 	isRewriteTargetServable,
 } from "./agent-interceptor";
 export {
+	blockFamily,
+	clearFamilyBlocksForAccount,
 	clearFamilyExhaustionForAccount,
 	createModelFamilyExhaustedResponse,
+	type FamilyBlock,
+	type FamilyBlockSource,
 	type FamilyExhaustionOrigin,
+	getFamilyBlock,
+	getFamilyBlocksForAccount,
 	getFamilyExhaustionOrigin,
 	getFamilyExhaustionUntil,
 	isAccountExhaustedForModel,

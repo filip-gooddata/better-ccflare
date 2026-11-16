@@ -2,6 +2,8 @@ import {
 	getModelFamily,
 	isUsageExhausted,
 	isUseExtraUsageEnabled,
+	mapModelName,
+	splitModelRouting,
 } from "@better-ccflare/core";
 import {
 	extractFiveHourWindow,
@@ -26,6 +28,7 @@ import {
 	requestExcludedProviders,
 } from "./account-selector";
 import {
+	getFamilyBlock,
 	getFamilyExhaustionOrigin,
 	isAccountExhaustedForModel,
 } from "./model-capacity";
@@ -46,12 +49,15 @@ import type { ProxyContext } from "./proxy-types";
  *   same extra-usage exception (the "use extra usage" switch AND provider
  *   capacity). A provider without those two windows falls back to the
  *   representative snapshot the prefilter uses, reported as `weekly`.
- * - `family`: the model-scoped capacity filter, only when it runs for this
- *   request, with its own overage rule (resolveOverageStatus, no global
- *   switch). Its reset is the LATEST exhausted family row, since the account
- *   serves the family again only once every row has reset. A reactive 429
- *   mark carries only a TTL guess, not a reset, so it counts as unknown
- *   (null) unless exhausted telemetry rows give the real one.
+ * - `family`: the model-family filter in selectAccountsForRequest. A standing
+ *   family block counts in every mode, with the block's own end as its reset.
+ *   Telemetry and the reactive 429 mark count only when capacity routing is
+ *   on, with the same extra-usage exception as above
+ *   (isAccountExhaustedForModel). A telemetry reset is the LATEST exhausted
+ *   family row, since the account serves the family again only once every
+ *   row has reset. A reactive 429 mark carries only a TTL guess, not a reset,
+ *   so it counts as unknown (null) unless exhausted telemetry rows give the
+ *   real one.
  */
 export function collectLimitBlockedAccounts(
 	accounts: Account[],
@@ -62,8 +68,8 @@ export function collectLimitBlockedAccounts(
 ): LimitBlockedAccount[] {
 	const excludedProviders = requestExcludedProviders(meta);
 	const forcedModel = model && isForceAccountModelEnabled(ctx) ? model : null;
-	const family =
-		model && isCapacityRoutingEnabled(ctx) ? getModelFamily(model) : null;
+	const family = model ? getModelFamily(model) : null;
+	const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
 
 	const blocked: LimitBlockedAccount[] = [];
 	for (const account of accounts) {
@@ -72,7 +78,13 @@ export function collectLimitBlockedAccounts(
 		if (forcedModel !== null && !accountServesModel(account, forcedModel)) {
 			continue;
 		}
-		const limits = limitsInForce(account, model, family, now);
+		const limits = limitsInForce(
+			account,
+			model,
+			family,
+			capacityRoutingEnabled,
+			now,
+		);
 		if (limits.length > 0) blocked.push({ account, limits });
 	}
 	return blocked;
@@ -82,6 +94,7 @@ function limitsInForce(
 	account: Account,
 	model: string | undefined,
 	family: string | null,
+	capacityRoutingEnabled: boolean,
 	now: number,
 ): AccountLimit[] {
 	const limits: AccountLimit[] = [];
@@ -128,7 +141,13 @@ function limitsInForce(
 	}
 
 	if (model && family) {
-		const familyLimit = familyLimitInForce(account, model, family, now);
+		const familyLimit = familyLimitInForce(
+			account,
+			model,
+			family,
+			capacityRoutingEnabled,
+			now,
+		);
 		if (familyLimit) limits.push(familyLimit);
 	}
 	return limits;
@@ -138,8 +157,20 @@ function familyLimitInForce(
 	account: Account,
 	model: string,
 	family: string,
+	capacityRoutingEnabled: boolean,
 	now: number,
 ): AccountLimit | null {
+	// Blocks are recorded for the family upstream refused: the family of the
+	// model this account actually sends (mapModelName honors "force account
+	// model", which turns mapping off).
+	const upstreamFamily =
+		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
+		family;
+	const block = getFamilyBlock(account.id, upstreamFamily, now);
+	if (block)
+		return { kind: "family", family: upstreamFamily, resetAt: block.until };
+	if (!capacityRoutingEnabled) return null;
+
 	const usage = usageCache.get(account.id);
 	const exhaustedRows = usage
 		? extractModelFamilyWindows(

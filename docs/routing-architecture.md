@@ -209,7 +209,7 @@ Per-client-session stickiness keyed on `metadata.user_id` (the whole string, as 
 - **Rebind after failover**: the proxy calls `strategy.onRequestServed(meta, account, status)` once it has committed to an account's response (`packages/proxy/src/proxy.ts`, `recordServedAccount`). If a request this strategy routed was served (2xx/3xx) by an account other than the session's mapped one, the session rebinds to it and does not return. Requests that never reach `select()` (force-routed by `x-better-ccflare-account-id`, combo slots) never rebind.
 - **Idle expiry**: a mapping expires after `session_pace_idle_ms` (default 1 hour, the prompt-cache lifetime) without a request; the next request is placed fresh.
 - The paid extra-usage pool plays no part in the ranking.
-- **All accounts limited**: when a request has no account only because every account that could serve it is out on a limit (provider cooldown, exhausted 5-hour or weekly window, or, with `MODEL_SCOPED_CAPACITY_ROUTING=exhausted`, the requested family's exhausted window), the proxy does not compose `503 pool_exhausted` or `429 model_family_exhausted`. It forwards the request to the account that becomes usable first: per account, the latest reset among the limits blocking it; an unknown reset sorts last; ties go to the lower priority number, then the name. The client receives that account's own upstream response unchanged, normally Anthropic's limit refusal with its real reset, or a success if the usage data was stale. Paused accounts, accounts needing re-authentication and accounts excluded for other reasons are never targets; with none left the local error stays. The rule applies to new, mapped and session-less requests alike and does not rewrite mappings. It applies to every request class as well: messages and `count_tokens` with a model (with `MODEL_SCOPED_CAPACITY_ROUTING=exhausted` too, where the strategy already left no candidate before the family filter ran), `HEAD /api/hello`, and requests made before any usage data is loaded, which then rank on cooldowns alone. Each such request makes one upstream attempt, or two when that account's refusal leaves another account usable sooner. It logs `session-pace place … rule=all-exhausted reason=earliest-reset` with every candidate's usable-again time and blocking limits. A 429 from an account chosen this way sets its cooldown from the response but leaves `consecutive_rate_limits`, the backoff ramp and the circuit breaker alone, so repeated refusals do not delay the account once its reset passes. Forced-account requests (`x-better-ccflare-account-id`), `x-better-ccflare-bypass-session` probes and combo routes are outside the rule. `CCFLARE_PASSTHROUGH_ON_EMPTY_POOL` is reached only when the rule finds no target. If accounts that looked available all refuse for limits during the request, the proxy answers with a genuine upstream refusal too (see [Master Pipeline](#master-pipeline)).
+- **All accounts limited**: when a request has no account only because every account that could serve it is out on a limit (provider cooldown, exhausted 5-hour or weekly window, a [family block](#family-blocks) for the requested family, or, with `MODEL_SCOPED_CAPACITY_ROUTING=exhausted`, the requested family's exhausted window), the proxy does not compose `503 pool_exhausted` or `429 model_family_exhausted`. It forwards the request to the account that becomes usable first: per account, the latest reset among the limits blocking it; an unknown reset sorts last; ties go to the lower priority number, then the name. The client receives that account's own upstream response unchanged, normally Anthropic's limit refusal with its real reset, or a success if the usage data was stale. Paused accounts, accounts needing re-authentication and accounts excluded for other reasons are never targets; with none left the local error stays. The rule applies to new, mapped and session-less requests alike and does not rewrite mappings. It applies to every request class as well: messages and `count_tokens` with a model (with `MODEL_SCOPED_CAPACITY_ROUTING=exhausted` too, where the strategy already left no candidate before the family filter ran), `HEAD /api/hello`, and requests made before any usage data is loaded, which then rank on cooldowns alone. Each such request makes one upstream attempt, or two when that account's refusal leaves another account usable sooner. It logs `session-pace place … rule=all-exhausted reason=earliest-reset` with every candidate's usable-again time and blocking limits. A 429 from an account chosen this way sets its cooldown from the response but leaves `consecutive_rate_limits`, the backoff ramp and the circuit breaker alone, so repeated refusals do not delay the account once its reset passes; a refusal that concerns only the requested family sets no cooldown at all and leaves the account routable for other families. Forced-account requests (`x-better-ccflare-account-id`), `x-better-ccflare-bypass-session` probes and combo routes are outside the rule. `CCFLARE_PASSTHROUGH_ON_EMPTY_POOL` is reached only when the rule finds no target. If accounts that looked available all refuse for limits during the request, the proxy answers with a genuine upstream refusal too (see [Master Pipeline](#master-pipeline)).
 
 Usage figures come from the usage cache, refreshed by the usage poller every `usage_poll_interval_ms` (default 90 s, ±20% jitter); a cached entry expires after 10 minutes without a successful poll. Response headers on proxied Anthropic requests do not update this cache.
 
@@ -266,15 +266,15 @@ flowchart TD
 
 ## Model-Capacity Routing
 
-When `model_scoped_capacity_routing` is set to `exhausted`, accounts whose weekly per-model-family cap (e.g. a Fable/Opus/Sonnet-specific quota) is provably exhausted are excluded from routing for requests of that family — in both normal and combo-slot routing. Exclusion has two independent signals: a **telemetry-confirmed** one (the account's own usage payload shows every relevant weekly-scoped row at ≥100% with a future reset, and pay-as-you-go overage is confirmed unavailable) and a **reactive** one (a recently observed `out_of_credits` 429 sidelines the account for that family for a short, fixed TTL to bridge the telemetry poll interval). The filter fails open on any ambiguity — an unknown model family, missing/dropped telemetry rows, or an unresolved overage signal never causes an exclusion — because a false exclusion removes a working account while a false pass only costs one extra 429 round-trip. Only when excluding accounts empties an otherwise non-empty candidate pool does the request get the structured `model_family_exhausted` response instead of falling through to the generic pool-exhausted path.
+When `model_scoped_capacity_routing` is set to `exhausted`, accounts whose weekly per-model-family cap (e.g. a Fable/Opus/Sonnet-specific quota) is provably exhausted are excluded from routing for requests of that family — in both normal and combo-slot routing. Exclusion has two independent signals: a **telemetry-confirmed** one (the account's own usage payload shows every relevant weekly-scoped row at ≥100% with a future reset, and paid overage cannot serve it: overage counts only when `use_extra_usage` is on and the account has extra usage left, spend enabled and below its limit) and a **reactive** one (a recently observed `out_of_credits` 429 sidelines the account for that family for a short, fixed TTL to bridge the telemetry poll interval). The filter fails open on telemetry ambiguity — an unknown model family or missing/dropped telemetry rows never cause an exclusion — because a false exclusion removes a working account while a false pass only costs one extra 429 round-trip. Only when excluding accounts empties an otherwise non-empty candidate pool does the request get the structured `model_family_exhausted` response instead of falling through to the generic pool-exhausted path; under `session-pace` the all-limited rule forwards the request to the account usable first instead. [Family blocks](#family-blocks) are a third signal that applies whatever this setting is.
 
 ```mermaid
 flowchart TD
     A["Model-scoped capacity routing<br/>mode = exhausted?"] -->|"No"| B["Filter is a no-op"]
     A -->|"Yes"| C["Resolve the request model's family:<br/>fable / opus / sonnet / haiku"]
-    C --> D{"Telemetry: EVERY weekly_scoped row<br/>for this family is >= 100% with a<br/>future reset, AND overage is<br/>CONFIRMED unavailable?"}
+    C --> D{"Telemetry: EVERY weekly_scoped row<br/>for this family is >= 100% with a<br/>future reset, AND overage cannot<br/>serve it (use_extra_usage off or<br/>no extra usage left)?"}
     D -->|"Yes"| E["Exclude —<br/>origin: telemetry_confirmed"]
-    D -->|"No (fails open on unknown<br/>family, missing telemetry, or<br/>unknown overage status)"| F{"Reactive negative cache:<br/>a recent out_of_credits 429<br/>for this (account, family)?<br/>(~5 minute TTL)"}
+    D -->|"No (fails open on unknown<br/>family or missing telemetry)"| F{"Reactive negative cache:<br/>a recent out_of_credits 429<br/>for this (account, family)?<br/>(~5 minute TTL)"}
     F -->|"Yes"| G["Exclude —<br/>origin: recent_upstream_rejection"]
     F -->|"No"| H["Account stays in<br/>the candidate pool"]
     E --> I{"Did excluding accounts empty an<br/>otherwise non-empty candidate pool?"}
@@ -284,6 +284,38 @@ flowchart TD
 ```
 
 *Source: `packages/proxy/src/handlers/model-capacity.ts` (`isAccountExhaustedForModel`, `markFamilyExhausted`), `packages/proxy/src/handlers/account-selector.ts` (`isAccountCapacityExcluded`), `packages/proxy/src/handlers/proxy-operations.ts` (the `out_of_credits` 429 handler that feeds the reactive cache — distinct from the unrelated `all_models_exhausted_429` per-account cooldown reason used when an account's own configured model-fallback list is exhausted).*
+
+### Family blocks
+
+A 429 from an Anthropic account can concern one model family's weekly limit (`weekly_scoped`, e.g. Fable) rather than the account. `proxy-operations.ts` logs every upstream 429 as `[ccflare] account=<name> upstream_429 model=<model> headers=<name>=<value>; …` (only `anthropic-ratelimit-*`, `x-ratelimit-*`, `retry-after`, `x-should-retry`; never auth headers, cookies or bodies) and classifies it (`handlers/family-refusal.ts`):
+
+- `anthropic-ratelimit-unified-representative-claim` of `five_hour` or `seven_day`, or a 5-hour or `weekly_all` reading at or above 100% with a future reset → **account-wide** (an exhausted account window outranks a family claim).
+- The claim exactly `seven_day_<family>` for the requested family (e.g. `seven_day_fable`) → **family**. Other claim values are ignored. Whether Anthropic sends this header on such a refusal is not yet confirmed.
+- Otherwise the usage readings: every `weekly_scoped` row of the requested family at or above 100%, with both the 5-hour and `weekly_all` readings present and below 100% → **family**.
+- Anything else (no usage readings, unknown family, family below 100%) → **unclassified**.
+
+Reset times cannot be used: on an account whose weekly Fable and overall weekly limits reset at the same instant, the two are indistinguishable by reset.
+
+A family refusal calls `blockFamily(account, family, until = family reset)`, logs `[ccflare] account=<name> family_block family=<f> until=<ISO> source=<header|usage> detail=<…>`, writes no account cooldown and fails over. An account-wide refusal benches the account as before (`cooldown_applied reason=model_fallback_429`). An unclassified one logs `[ccflare] account=<name> family_refusal_unclassified detail=<…>` and then benches the account as before.
+
+A standing block excludes the account for that family in selection regardless of `model_scoped_capacity_routing` (log token `family_blocked`); other families still route to it, and a sticky session of the blocked family moves to another account. When no account can serve the family, the request takes the all-limited path (`session-pace` `rule=all-exhausted`) to the account usable first and the client gets Anthropic's own 429; that refusal does not bench the account for other families. The synthesized `model_family_exhausted` response remains only for strategies without the all-limited rule. The dashboard's Force Reset clears an account's family blocks. Blocks are in memory only: after a restart the account's own `weekly_scoped` telemetry (with `model_scoped_capacity_routing=exhausted`) keeps the family out.
+
+```mermaid
+flowchart TD
+    A["Upstream 429 from an Anthropic account"] --> B["Log upstream_429 with rate-limit headers"]
+    B --> C{"claim five_hour / seven_day,<br/>or 5h or weekly_all >= 100%?"}
+    C -->|"yes"| W["Account-wide"]
+    C -->|"no"| E{"claim seven_day_family?"}
+    E -->|"yes"| F["Family"]
+    E -->|"absent or other"| D{"Family readings"}
+    D -->|"family rows all >= 100%,<br/>5h and weekly_all read and below"| F
+    D -->|"none / unknown family /<br/>family below 100%"| U["Unclassified"]
+    F --> F2["blockFamily until family reset,<br/>log family_block, no cooldown, fail over"]
+    W --> W2["Bench account<br/>(cooldown_applied reason=model_fallback_429)"]
+    U --> U2["Log family_refusal_unclassified,<br/>bench account as before"]
+```
+
+*Source: `packages/proxy/src/handlers/family-refusal.ts`, `packages/proxy/src/handlers/proxy-operations.ts`, `packages/proxy/src/handlers/model-capacity.ts` (family blocks), `packages/proxy/src/handlers/account-selector.ts`.*
 
 ## Auto-Fallback
 
@@ -327,6 +359,7 @@ Only `session-pace` takes advice, only when `routing` is on, and only for reques
 - **Live session**: moved only when the plan says the lowest point ends higher after paying the cold-cache re-read on the other account (the gain threshold is `moveMinGainPoints`). The target must be among the candidates, not out, and pass the family guard; otherwise the session stays. Each move is applied once per plan and logged as
   `session-pace move session=<tag> from=<name> to=<name> rule=forecast-move reason=<reason> gain=<points> cost=<points>`.
 - The model-family (Fable) guard stays hard. The all-limited rule is unchanged and decides as before when every account is out.
+- A standing Fable [family block](#family-blocks) reaches the forecast as the account's Fable limit used up (100%) until the block lifts, with or without a usage reading; the account's `blockedUntil` stays empty, because a family refusal writes no account cooldown, so the forecast still counts the account as open for other models.
 
 **Fallback**: when `routing` is off, the forecast is disabled, the result is stale or missing, the engine failed, or the advisor fails, session-pace gets no advice and routes exactly as pace.3 did.
 

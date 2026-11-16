@@ -43,6 +43,7 @@ import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
+	clearFamilyBlocksForAccount,
 	clearFamilyExhaustionForAccount,
 	clearModelCooldownsForAccount,
 	clearOpenAICompatibleModelCacheForAccount,
@@ -3980,6 +3981,9 @@ export function createAccountForceResetRateLimitHandler(
 				);
 			}
 			clearAccountRefreshCache(accountId);
+			// A hand reset lifts the account's per-family blocks too, not only
+			// the account-wide one.
+			clearFamilyBlocksForAccount(accountId);
 
 			// Trigger immediate poll if this server has a polling token provider for the account.
 			let usagePollTriggered = await usageCache.refreshNow(accountId);

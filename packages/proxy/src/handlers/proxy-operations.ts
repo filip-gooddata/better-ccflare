@@ -8,6 +8,7 @@ import {
 	isUsageExhausted,
 	logError,
 	type ModelRouting,
+	mapModelName,
 	ProviderError,
 	parseNightWindow,
 	splitModelRouting,
@@ -54,8 +55,9 @@ import { forwardToClient as defaultForwardToClient } from "../response-handler";
 import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
+import { classifyRefusalScope, rateLimitHeaderSummary } from "./family-refusal";
 import { isAllLimitedSelection } from "./limit-blocked";
-import { markFamilyExhausted } from "./model-capacity";
+import { blockFamily, markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
 	markModelCooling,
@@ -2382,6 +2384,11 @@ export async function proxyWithAccount(
 			rawResponse: Response,
 			requestedModel: string | null,
 		): Promise<UpstreamErrorClassification> => {
+			if (rawResponse.status === 429 && isClaudeProvider) {
+				log.info(
+					`[ccflare] account=${account.name} upstream_429 model=${requestedModel ?? "none"} headers=${rateLimitHeaderSummary(rawResponse.headers)}`,
+				);
+			}
 			// ── out_of_credits: model/beta-scoped depletion, NOT account-wide (issue #261) ──
 			// Anthropic returns 429 + `overage-disabled-reason: out_of_credits` with no reset
 			// header. This is scoped to a specific model/beta (e.g. context-1m), not the
@@ -2687,19 +2694,51 @@ export async function proxyWithAccount(
 					return null;
 				}
 
-				log.warn(
-					`Account ${account.name} rate-limited (429), no model fallbacks — failing over to next account`,
-				);
-				applyRateLimitCooldown(
-					account,
-					{
-						resetTime: cooldown.until,
-						resetIsInferred,
-						reason,
-						preserveStreak: isAllLimitedSelection(requestMeta),
-					},
-					ctx,
-				);
+				// ── family refusal: one model family's weekly limit, NOT account-wide ──
+				// A refused Fable request on an account whose Fable weekly limit is
+				// spent must not bench the account for every other family. The
+				// family is blocked until its limit resets and the request fails
+				// over with no account cooldown; the audit row and the hold for the
+				// all-limited replay below are the same as for an account bench.
+				const refusal = isClaudeProvider
+					? classifyRefusalScope({
+							headers: rawResponse.headers,
+							usageData: usageCache.get(account.id),
+							model: requestedModel,
+							now: Date.now(),
+							headerResetAt: resetIsInferred ? null : cooldown.until,
+						})
+					: null;
+				if (refusal?.scope === "family") {
+					const block = blockFamily(
+						account.id,
+						refusal.family,
+						refusal.until,
+						refusal.source,
+					);
+					log.warn(
+						`[ccflare] account=${account.name} family_block family=${refusal.family} until=${new Date(block?.until ?? refusal.until).toISOString()} source=${refusal.source} detail=${refusal.detail}`,
+					);
+				} else {
+					if (refusal?.scope === "unclassified") {
+						log.warn(
+							`[ccflare] account=${account.name} family_refusal_unclassified detail=${refusal.detail}`,
+						);
+					}
+					log.warn(
+						`Account ${account.name} rate-limited (429), no model fallbacks — failing over to next account`,
+					);
+					applyRateLimitCooldown(
+						account,
+						{
+							resetTime: cooldown.until,
+							resetIsInferred,
+							reason,
+							preserveStreak: isAllLimitedSelection(requestMeta),
+						},
+						ctx,
+					);
+				}
 				saveNoFallback429AuditRow();
 				if (!(await holdLimitRefusal(rawResponse))) {
 					cancelDiscardedResponseBody(rawResponse);
@@ -3037,6 +3076,9 @@ export async function proxyWithAccount(
 		// model_mappings arrays and legacy model_fallbacks. We already tried index 0
 		// (the primary), so start at index 1.
 		let zai1305AlreadyChecked = false;
+		// Models the model-list loop below sent upstream, in order. Read by the
+		// exhausted-list 429 path to decide between a family block and a bench.
+		const attemptedModels: string[] = [];
 
 		// The request carried images and this model cannot read them. Classified
 		// separately from `isModelUnavailableError`: that predicate answers only
@@ -3163,6 +3205,13 @@ export async function proxyWithAccount(
 					return withSanitizedProxyHeaders(rawResponse);
 				}
 
+				// The primary attempt sent mapModelName's result upstream (a
+				// mapping may rename the client's model to another family, unless
+				// "force account model" turns mapping off), so the family check
+				// compares upstream models only.
+				attemptedModels.push(
+					splitModelRouting(mapModelName(requestedModel, account)).model,
+				);
 				for (let i = 1; i < modelList.length; i++) {
 					const nextModel = modelList[i];
 					log.info(
@@ -3264,6 +3313,7 @@ export async function proxyWithAccount(
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
 						: await forwardUpstream(retryTransformedRequest);
+					attemptedModels.push(nextBareModel);
 					if (retryTransformedBodyText === undefined) {
 						// Body unreadable — unreachable for a buffer-backed Request.
 						// Record the model and leave the replay on the previous request
@@ -3303,6 +3353,11 @@ export async function proxyWithAccount(
 						log,
 					);
 					zai1305AlreadyChecked = true;
+					if (rawResponse.status === 429 && isClaudeProvider) {
+						log.info(
+							`[ccflare] account=${account.name} upstream_429 model=${nextBareModel} headers=${rateLimitHeaderSummary(rawResponse.headers)}`,
+						);
+					}
 					if (!(await isModelUnavailableError(rawResponse.clone()))) {
 						break; // Success — stop cycling
 					}
@@ -3359,19 +3414,61 @@ export async function proxyWithAccount(
 							providerReset.resetTime,
 						);
 						const reason: RateLimitReason = "all_models_exhausted_429";
-						applyRateLimitCooldown(
-							account,
-							{
-								resetTime: cooldown.until,
-								resetIsInferred:
-									!isExplicitUpstreamCooldown(cooldown.source) ||
-									(cooldown.source === "provider" &&
-										providerReset.resetIsInferred),
-								reason,
-								preserveStreak: isAllLimitedSelection(requestMeta),
-							},
-							ctx,
-						);
+						const resetIsInferred =
+							!isExplicitUpstreamCooldown(cooldown.source) ||
+							(cooldown.source === "provider" && providerReset.resetIsInferred);
+						// Same family rule as the no-fallback path: when every model
+						// the list tried belongs to one family and the last refusal
+						// concerns that family's limit, block the family instead of
+						// benching the account. A list that spans families falls back
+						// to the account bench.
+						const lastAttemptedModel = attemptedModels.at(-1);
+						const refusal =
+							isClaudeProvider && lastAttemptedModel
+								? classifyRefusalScope({
+										headers: rawResponse.headers,
+										usageData: usageCache.get(account.id),
+										model: lastAttemptedModel,
+										now: Date.now(),
+										headerResetAt: resetIsInferred ? null : cooldown.until,
+									})
+								: null;
+						const spansFamilies =
+							refusal?.scope === "family" &&
+							!attemptedModels.every(
+								(model) => getModelFamily(model) === refusal.family,
+							);
+						if (refusal?.scope === "family" && !spansFamilies) {
+							const block = blockFamily(
+								account.id,
+								refusal.family,
+								refusal.until,
+								refusal.source,
+							);
+							log.warn(
+								`[ccflare] account=${account.name} family_block family=${refusal.family} until=${new Date(block?.until ?? refusal.until).toISOString()} source=${refusal.source} detail=${refusal.detail} (after model list ${attemptedModels.join(",")})`,
+							);
+						} else {
+							if (refusal?.scope === "unclassified" || spansFamilies) {
+								log.warn(
+									`[ccflare] account=${account.name} family_refusal_unclassified detail=${
+										spansFamilies
+											? `model list spans families (${attemptedModels.join(",")})`
+											: refusal?.detail
+									}`,
+								);
+							}
+							applyRateLimitCooldown(
+								account,
+								{
+									resetTime: cooldown.until,
+									resetIsInferred,
+									reason,
+									preserveStreak: isAllLimitedSelection(requestMeta),
+								},
+								ctx,
+							);
+						}
 						const responseTime = Date.now() - requestMeta.timestamp;
 						const modelRewrite = isModelRewrite(
 							requestMeta.originalModel,

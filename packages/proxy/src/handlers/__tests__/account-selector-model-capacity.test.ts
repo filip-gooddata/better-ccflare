@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock } from "bun:test";
+import { setUseExtraUsage } from "@better-ccflare/core";
 import { usageCache } from "@better-ccflare/providers";
 import type {
 	Account,
@@ -536,7 +537,11 @@ describe("selectAccountsForRequest — skipCombo option (v3 Fix3)", () => {
 
 // ── v3 S4 (integration level): overage tri-state ────────────────────────────────
 
-describe("selectAccountsForRequest — overage tri-state (integration)", () => {
+describe("selectAccountsForRequest — extra usage (integration)", () => {
+	afterEach(() => {
+		setUseExtraUsage(false);
+	});
+
 	function scopedUsageWithOverage(
 		displayName: string,
 		now: number,
@@ -570,7 +575,8 @@ describe("selectAccountsForRequest — overage tri-state (integration)", () => {
 		} as never;
 	}
 
-	it("keeps an account routable when overage is available (extra_usage.is_enabled=true)", async () => {
+	it("keeps an account routable when the extra-usage switch is on and overage is available (extra_usage.is_enabled=true)", async () => {
+		setUseExtraUsage(true);
 		const acc = makeAccount({ id: "acc-overage-available" });
 		usageCache.set(
 			acc.id,
@@ -582,6 +588,20 @@ describe("selectAccountsForRequest — overage tri-state (integration)", () => {
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
 		expect(result.map((a) => a.id)).toEqual(["acc-overage-available"]);
+	});
+
+	it("excludes an account whose overage is reported enabled while the extra-usage switch is off", async () => {
+		const acc = makeAccount({ id: "acc-overage-switch-off" });
+		usageCache.set(
+			acc.id,
+			scopedUsageWithOverage("Fable", Date.now(), { spendEnabled: true }),
+		);
+		const ctx = makeCtx({ accounts: [acc], capacityRoutingMode: "exhausted" });
+		const meta = makeRequestMeta();
+
+		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
+
+		expect(result).toHaveLength(0);
 	});
 
 	it("excludes an account when overage is explicitly unavailable (extra_usage.is_enabled=false)", async () => {
@@ -598,7 +618,8 @@ describe("selectAccountsForRequest — overage tri-state (integration)", () => {
 		expect(result).toHaveLength(0);
 	});
 
-	it("fails open (keeps the account) when overage status is unknown (no extra_usage, no spend block)", async () => {
+	it("excludes an account with no overage signal at all (no extra usage known)", async () => {
+		setUseExtraUsage(true);
 		const acc = makeAccount({ id: "acc-overage-unknown" });
 		usageCache.set(acc.id, scopedUsageWithOverage("Fable", Date.now()));
 		const ctx = makeCtx({ accounts: [acc], capacityRoutingMode: "exhausted" });
@@ -606,7 +627,7 @@ describe("selectAccountsForRequest — overage tri-state (integration)", () => {
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result.map((a) => a.id)).toEqual(["acc-overage-unknown"]);
+		expect(result).toHaveLength(0);
 	});
 });
 
