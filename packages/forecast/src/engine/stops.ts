@@ -10,7 +10,13 @@ import type {
 	Shortfall,
 } from "../types";
 import type { EngineContext, OutLimit, SimulationResult } from "./model";
-import { accountLeft, comesBackAt, outSince, type Quantity } from "./past";
+import {
+	accountLeft,
+	capRatio,
+	comesBackAt,
+	outSince,
+	type Quantity,
+} from "./past";
 import { levelOf } from "./percentile";
 
 /** A level value below this is 0: it is what the response rounds to 0.0. */
@@ -36,15 +42,22 @@ export function countsFor(quantity: Quantity, limit: OutLimit): boolean {
 
 /**
  * An account's fill for the spill rule (spec section 6): its used share now.
- * Day: the use of its open 5-hour window, 0 with no open window. Week: its
- * weekly use.
+ * Day: 100 minus its 5-hour quota left, capped by its weekly quota left in 5-hour
+ * points (`ratio`; no cap when null) as in section 3; a running cooldown does not
+ * enter the fill. Week: its weekly use.
  */
 export function fillAtNow(
 	account: AccountLimits,
 	quantity: Quantity,
 	now: EpochMs,
+	ratio: number | null = null,
 ): number {
-	const limit = quantity === "day" ? account.fiveHour : account.weekly;
+	if (quantity === "day")
+		return (
+			100 -
+			accountLeft("day", account.fiveHour, account.weekly, now, false, ratio)
+		);
+	const limit = account.weekly;
 	if (limit.resetsAt === null || limit.resetsAt <= now) return 0;
 	return Math.min(100, Math.max(0, limit.usedPct));
 }
@@ -231,7 +244,14 @@ function projectedOuts(
 		});
 	} else {
 		const left = ctx.accounts.map((a) =>
-			accountLeft(quantity, a.fiveHour, a.weekly, ctx.now),
+			accountLeft(
+				quantity,
+				a.fiveHour,
+				a.weekly,
+				ctx.now,
+				false,
+				capRatio(ctx.calibration, a.accountId),
+			),
 		);
 		left.forEach((l, a) => {
 			if (l > left[last]) last = a;
@@ -302,7 +322,9 @@ export function shortfall(
 	}
 	const points = levelOf(unservedPoints(ctx, sim, quantity, counted), 50);
 	const pointsTenths = Math.round(points * TENTHS);
-	const fills = ctx.accounts.map((a) => fillAtNow(a, quantity, ctx.now));
+	const fills = ctx.accounts.map((a) =>
+		fillAtNow(a, quantity, ctx.now, capRatio(ctx.calibration, a.accountId)),
+	);
 	const parts = spill(pointsTenths, who.last, fills, who.outAt);
 	const perAccount: Record<AccountId, number> = {};
 	ctx.accounts.forEach((a, i) => {

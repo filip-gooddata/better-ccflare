@@ -121,14 +121,19 @@ function orNone(v: number | null, digits: number): string {
 
 /**
  * One INFO line with what an available forecast was computed from: the day factor, the
- * recent rate, today's pool, the learned work start and every k. Numbers, fixed words and
- * account ids only.
+ * recent rate, today's pool, the learned work start, every k with the hours ago of the
+ * oldest and newest reading it counted, and each account's weekly cap on the day line
+ * (r = k5 / kW, and whether it binds now). Numbers, fixed words and account ids only.
  */
 export function inputsLine(d: ForecastInputsDetail): string {
 	const f = d.dayFactor;
 	const limits = d.limits.map(
 		(l) =>
-			`${accountId(l.accountId)}/${word(l.limit, LIMITS)}=${l.k === null ? "none" : fixed(l.k, 4)} ${word(l.source, SOURCES)} instances=${num(l.instances)} points=${num(l.points)}`,
+			`${accountId(l.accountId)}/${word(l.limit, LIMITS)}=${l.k === null ? "none" : fixed(l.k, 4)} ${word(l.source, SOURCES)} instances=${num(l.instances)} points=${num(l.points)} oldestH=${orNone(l.oldestHoursAgo, 1)} newestH=${orNone(l.newestHoursAgo, 1)}`,
+	);
+	const caps = d.caps.map(
+		(c) =>
+			`${accountId(c.accountId)} r=${c.ratio === null ? "none" : fixed(c.ratio, 2)} binds=${c.binds === true ? "yes" : "no"}`,
 	);
 	return [
 		"forecast inputs",
@@ -145,10 +150,17 @@ export function inputsLine(d: ForecastInputsDetail): string {
 		`p90=${orNone(d.pool.p90Units, 1)}`,
 		`workStart=${clock(d.workStartMinute)}`,
 		`k: ${limits.join("; ")}`,
+		`cap: ${caps.join("; ")}`,
 	].join(" ");
 }
 
-/** What a new line must differ in: a rounded to 0.1 and each k rounded to 0.05. */
+/**
+ * What a new line must differ in: a rounded to 0.1 and each k rounded to 0.05. The reading
+ * ages, r and the cap's binds flag stay out, like the other printed numbers: the ages move at
+ * every computation, r follows the keyed k5 and kW, and binds can flip at each computation
+ * while an account's two quotas left sit near each other (serving lowers both at the same
+ * rate). A line written for another reason carries their current values.
+ */
 function inputsKey(d: ForecastInputsDetail): string {
 	const a = Number.isFinite(d.dayFactor.a)
 		? String(Math.round(d.dayFactor.a * 10))

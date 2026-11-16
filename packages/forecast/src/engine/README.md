@@ -21,7 +21,12 @@ does to the heavy line; `noiseMode` wins over `noise`, and `noise: true` or abse
    account and limit, over the window instances of the usage readings. A window instance is a run of
    consecutive readings whose reset time lies within `RESET_TIME_TOLERANCE_MS` (60 s) of the run's first
    reading and whose level never falls: the upstream sends one window's reset time with sub-second
-   jitter, and a fall inside a window means its counter was reset.
+   jitter, and a fall inside a window means its counter was reset. Both calibrations, and with them the
+   weekly cap ratio r = k5 ÷ kW, are recomputed at every computation from the stored readings of the last
+   56 days with a 14-day half-life (`historyLookbackDays`, `historyHalfLifeDays`). After a step change by
+   the provider they have moved half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each
+   limit on its own (`__tests__/calibration-step.test.ts`: r half-way 240–246 h, 90 % 822–828 h; kW 318–324 h
+   and 924–942 h; k5 312 h and 906 h).
 4. **Scenarios** (`scenarios.ts`). A smoothed bootstrap resamples whole recorded days, weighted by recency.
    It adds kernel noise on scale by the shrunk (variance-preserving) smoothed bootstrap of Silverman and
    Young (1987), "The bootstrap: to smooth or not to smooth?", Biometrika 74(3), 469–479 (also Silverman

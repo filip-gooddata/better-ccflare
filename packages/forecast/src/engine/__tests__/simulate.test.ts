@@ -520,3 +520,77 @@ describe("simulate", () => {
 		expect(longestMs).toBeLessThan(50);
 	});
 });
+
+describe("simulate: the weekly cap on the day line (spec section 3)", () => {
+	test("a five-hour reset of an account with 7 % weekly left jumps by weeklyLeft × k5/kW", async () => {
+		const now = prague(12, 8);
+		const fiveReset = now + HOUR;
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({
+					id: "acct-a",
+					fiveUsed: 100,
+					fiveReset,
+					weekUsed: 93,
+					weekReset: now + 50 * HOUR,
+				}),
+			],
+			k5: { "acct-a": 2 },
+			kW: { "acct-a": 0.2 },
+			rate: () => 0,
+		});
+		const { axis, traces } = await simulate(ctx, onDemandPlan(ctx));
+		const [t] = traces;
+		expect(t.day[0]).toBe(0);
+		const f = indexAt(axis.times, fiveReset);
+		expect(axis.times[f + 1]).toBe(fiveReset);
+		expect(t.day[f]).toBe(0);
+		expect(t.day[f + 1]).toBeCloseTo(70, 9);
+	});
+
+	test("the capped share reaches 0 when the weekly limit fills, as the account stops serving", async () => {
+		const now = prague(12, 8);
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({ id: "acct-a", weekUsed: 95, weekReset: now + 50 * HOUR }),
+			],
+			k5: { "acct-a": 10 },
+			kW: { "acct-a": 1 },
+			rate: (_m, _w, at) => (at < now + HOUR ? 0.1 : 0),
+		});
+		const { axis, traces } = await simulate(ctx, onDemandPlan(ctx));
+		const [t] = traces;
+		// 5 weekly points left are worth 50 five-hour points: the cap, not the open window.
+		expect(t.day[0]).toBeCloseTo(50, 9);
+		expect(t.day[indexAt(axis.times, now + 25 * MIN)]).toBeCloseTo(25, 6);
+		// After 5 units (50 minutes) the weekly limit is full: line 0, the rest unserved.
+		expect(t.day[indexAt(axis.times, now + 50 * MIN)]).toBeCloseTo(0, 6);
+		expect(t.day[indexAt(axis.times, now + HOUR)]).toBe(0);
+		const unservedUnits = t.unserved.reduce((s, v) => s + v, 0);
+		expect(unservedUnits).toBeCloseTo(1, 4);
+	});
+
+	test("a weekly reset inside the projection lifts the cap", async () => {
+		const now = prague(12, 8);
+		const weekReset = now + 2 * HOUR;
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [account({ id: "acct-a", weekUsed: 95, weekReset })],
+			k5: { "acct-a": 10 },
+			kW: { "acct-a": 1 },
+			rate: () => 0,
+		});
+		const { axis, traces } = await simulate(ctx, onDemandPlan(ctx));
+		const [t] = traces;
+		expect(t.day[0]).toBeCloseTo(50, 9);
+		const w = indexAt(axis.times, weekReset);
+		expect(axis.times[w + 1]).toBe(weekReset);
+		expect(t.day[w]).toBeCloseTo(50, 9);
+		expect(t.day[w + 1]).toBe(100);
+	});
+});

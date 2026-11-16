@@ -309,6 +309,21 @@ export interface InputsLimitDetail {
 	source: "own" | "borrowed" | "none";
 	instances: number;
 	points: number;
+	/**
+	 * Hours before the computation of the first and of the last reading of the window
+	 * instances the account's own k counted; null with none counted.
+	 */
+	oldestHoursAgo: number | null;
+	newestHoursAgo: number | null;
+}
+
+/** The day line's weekly cap of one counted account at the computation (spec section 3). */
+export interface InputsCapDetail {
+	accountId: AccountId;
+	/** Five-hour points per weekly point, k5 / kW; null when there is no cap. */
+	ratio: number | null;
+	/** Whether the cap lowers the account's share of the pooled 5-hour quota left now. */
+	binds: boolean;
 }
 
 /**
@@ -329,6 +344,7 @@ export interface ForecastInputsDetail {
 	};
 	workStartMinute: number | null;
 	limits: InputsLimitDetail[];
+	caps: InputsCapDetail[];
 }
 
 export type ForecastResult =

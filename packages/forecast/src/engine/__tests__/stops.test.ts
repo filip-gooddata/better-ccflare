@@ -259,14 +259,53 @@ describe("fill for the spill rule", () => {
 				NOW,
 			),
 		).toBe(0);
-		// A used-up weekly limit does not make a closed window full.
+		// A used-up weekly limit leaves no 5-hour quota: the fill is 100 (spec section 6).
 		expect(
 			fillAtNow(
 				account("a", { weekly: { usedPct: 100, resetsAt: MONDAY_NEXT } }),
 				"day",
 				NOW,
 			),
-		).toBe(0);
+		).toBe(100);
+	});
+	test("day: 100 minus the capped quota left, the weekly cap included", () => {
+		// 93 % weekly used at r = 6: 7 weekly points are worth 42 five-hour points.
+		const weekly = { usedPct: 93, resetsAt: MONDAY_NEXT };
+		expect(
+			fillAtNow(
+				account("a", { fiveHour: { usedPct: 0, resetsAt: RESET_A }, weekly }),
+				"day",
+				NOW,
+				6,
+			),
+		).toBeCloseTo(58, 9);
+		expect(fillAtNow(account("a", { weekly }), "day", NOW, 6)).toBeCloseTo(
+			58,
+			9,
+		);
+		// The cap does not bind: the open window's use, as before.
+		expect(
+			fillAtNow(
+				account("a", { fiveHour: { usedPct: 94, resetsAt: RESET_A }, weekly }),
+				"day",
+				NOW,
+				6,
+			),
+		).toBe(94);
+		// No ratio (impossible calibration): no cap.
+		expect(fillAtNow(account("a", { weekly }), "day", NOW, null)).toBe(0);
+		// A running cooldown does not enter the fill.
+		expect(
+			fillAtNow(
+				account("a", {
+					fiveHour: { usedPct: 30, resetsAt: RESET_A },
+					blockedUntil: RESET_A,
+				}),
+				"day",
+				NOW,
+				6,
+			),
+		).toBe(30);
 	});
 	test("week: weekly use", () => {
 		expect(

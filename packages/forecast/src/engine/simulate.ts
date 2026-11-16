@@ -13,6 +13,7 @@ import type {
 	SimulationResult,
 } from "./model";
 import { moveCostUnits } from "./move-cost";
+import { capRatio } from "./past";
 import { yieldToEventLoop } from "./yield";
 
 const MINUTE_MS = 60_000;
@@ -184,6 +185,8 @@ interface Prepared {
 	n: number;
 	k5: Float64Array;
 	kW: Float64Array;
+	/** 5-hour points per weekly point (capRatio); NaN = no weekly cap on the day line. */
+	ratio: Float64Array;
 	/** NaN = no Fable tracking for that account. */
 	kF: Float64Array;
 	prewarm: boolean;
@@ -200,10 +203,12 @@ function prepare(ctx: EngineContext, plan: SimPlan): Prepared {
 	const k5 = new Float64Array(n);
 	const kW = new Float64Array(n);
 	const kF = new Float64Array(n);
+	const ratio = new Float64Array(n);
 	ctx.accounts.forEach((account, j) => {
 		const id = account.accountId;
 		k5[j] = ctx.calibration.fiveHour[id] ?? 0;
 		kW[j] = ctx.calibration.weekly[id] ?? 0;
+		ratio[j] = capRatio(ctx.calibration, id) ?? Number.NaN;
 		const fable = ctx.calibration.fable[id];
 		kF[j] = account.fable && fable != null ? fable : Number.NaN;
 	});
@@ -225,6 +230,7 @@ function prepare(ctx: EngineContext, plan: SimPlan): Prepared {
 		n,
 		k5,
 		kW,
+		ratio,
 		kF,
 		prewarm: ctx.input.settings.prewarm,
 		sessionShare: Float64Array.from(warm, (s) => s.recentUnits / total),
@@ -552,13 +558,21 @@ class DayRun {
 		if (t < b) this.unserved += rate * (b - t);
 	}
 
-	/** Pooled 5-hour quota left at t; `before` is the value just before a jump at t. */
+	/**
+	 * Pooled 5-hour quota left at t; `before` is the value just before a jump at t. Each account
+	 * counts the lower of its 5-hour quota left and its weekly quota left times k5 / kW, the
+	 * 5-hour points it can still serve before its weekly limit fills (spec section 3).
+	 */
 	day(t: EpochMs, before = false): number {
 		let sum = 0;
 		for (let j = 0; j < this.n; j++) {
 			if (this.usedW[j] >= FULL_POINTS) continue;
 			if (before ? this.blocked[j] >= t : this.blocked[j] > t) continue;
-			sum += this.isOpen(j) ? 100 - this.used5[j] : 100;
+			const five = this.isOpen(j) ? 100 - this.used5[j] : 100;
+			const ratio = this.p.ratio[j];
+			sum += Number.isNaN(ratio)
+				? five
+				: Math.min(five, (100 - this.usedW[j]) * ratio);
 		}
 		return sum;
 	}
