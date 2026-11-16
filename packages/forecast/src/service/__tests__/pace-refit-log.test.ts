@@ -50,6 +50,24 @@ describe("pace refit log line", () => {
 		expect(line.endsWith(" daytypes=none")).toBe(true);
 	});
 
+	it("masks characters outside the id alphabet in partition ids", () => {
+		const line = paceRefitLine(
+			{
+				status: "ok",
+				state: {
+					...state,
+					dayTypeComparison: [
+						{ partition: "merged:Mon Tue=x", groups: 2, loss: 1, se: 0.5 },
+					],
+				},
+				ms: 1,
+			},
+			null,
+			T0,
+		);
+		expect(line.endsWith(" daytypes merged=Mon_Tue_x:1/0.5")).toBe(true);
+	});
+
 	it("reports a timeout with the reason and the age of the state kept", () => {
 		expect(
 			paceRefitLine(

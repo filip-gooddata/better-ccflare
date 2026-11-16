@@ -79,6 +79,48 @@ describe("forecast worker runner: the refit job", () => {
 		expect((await first).status).toBe("ok");
 	});
 
+	it("starts no worker when the signal aborts while the code loads", async () => {
+		const abort = new AbortController();
+		let started = false;
+		const runner = createForecastWorkerRunner({
+			workerUrl: FIXTURE,
+			embeddedCode: async () => {
+				abort.abort();
+				started = true;
+				return "";
+			},
+		});
+		const started0 = performance.now();
+		const outcome = await createPaceRefitRunner(runner).run(
+			series("hang"),
+			T0,
+			{
+				timeoutMs: 60_000,
+				signal: abort.signal,
+			},
+		);
+		expect(started).toBe(true);
+		expect(outcome).toMatchObject({ status: "error", reason: "stopped" });
+		expect(performance.now() - started0).toBeLessThan(1_000);
+	});
+
+	it("runs embedded code from a blob when the build embedded a worker", async () => {
+		const source = `self.onmessage = (e) => self.postMessage({ id: e.data.id, ok: true, result: { fittedAt: e.data.payload.now, days: -1 } });`;
+		const runner = createForecastWorkerRunner({
+			workerUrl: new URL("./fixtures/no-such-worker.ts", import.meta.url).href,
+			embeddedCode: async () => Buffer.from(source).toString("base64"),
+		});
+		const outcome = await createPaceRefitRunner(runner).run(
+			series("Europe/Prague"),
+			T0,
+			{ timeoutMs: 10_000 },
+		);
+		expect(outcome).toMatchObject({
+			status: "ok",
+			state: { fittedAt: T0, days: -1 },
+		});
+	});
+
 	it("reports a missing worker module as worker-error", async () => {
 		const runner = createForecastWorkerRunner({
 			workerUrl: new URL("./fixtures/no-such-worker.ts", import.meta.url).href,

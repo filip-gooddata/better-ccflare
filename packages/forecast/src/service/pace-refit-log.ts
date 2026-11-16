@@ -13,9 +13,11 @@ function dayTypes(state: PaceFitState): string {
 	if (rows.length === 0) return "daytypes=none";
 	const parts = rows.map(({ partition, loss, se }) => {
 		const value = `${num(loss)}/${num(se)}`;
-		return partition.startsWith("merged:")
-			? `merged=${partition.slice("merged:".length)}:${value}`
-			: `${partition}=${value}`;
+		// Partition ids are the model's own; anything else is masked, never logged as text.
+		const id = partition.replace(/[^A-Za-z0-9|:-]/g, "_");
+		return id.startsWith("merged:")
+			? `merged=${id.slice("merged:".length)}:${value}`
+			: `${id}=${value}`;
 	});
 	return `daytypes ${parts.join(" ")}`;
 }

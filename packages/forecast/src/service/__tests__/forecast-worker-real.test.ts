@@ -28,6 +28,24 @@ describe("forecast worker: the real worker module", () => {
 	});
 });
 
+describe("forecast worker: the default loader", () => {
+	it("starts the built-in worker (embedded after a CLI build, else the source module)", async () => {
+		const n = 12;
+		const outcome = await createPaceRefitRunner().run(
+			{
+				start: T0 - n * BUCKET,
+				units: new Float64Array(n),
+				censored: new Uint8Array(n),
+				timeZone: "Europe/Prague",
+			},
+			T0,
+			{ timeoutMs: 60_000 },
+		);
+		if (outcome.status === "error") expect(outcome.reason).toBe("fit-error");
+		else expect(outcome.status).toBe("ok");
+	});
+});
+
 /**
  * Off-main-thread proof with the real fit. Needs the fitted pace model, so it
  * is off until the model part is integrated: run with PACE_REFIT_REAL_WORKER=1.

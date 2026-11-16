@@ -117,6 +117,9 @@ export function createForecastWorkerRunner(
 		let onAbort: (() => void) | undefined;
 		try {
 			const code = await embeddedCode();
+			// An abort while the code loaded starts no worker.
+			if (opts.signal?.aborted)
+				return { status: "error", reason: "stopped", ms: ms() };
 			if (code) {
 				const source = Buffer.from(code, "base64").toString("utf8");
 				blobUrl = URL.createObjectURL(
