@@ -58,8 +58,10 @@ export interface PaceFitState {
 	 * Bands without a selection whose best candidate passed every screening test but the evidence
 	 * floor (BH at q and positive out-of-fold R^2, with fewer independent units than the floor),
 	 * one entry per hour cell of the band that passes the per-cell gate (positive out-of-fold
-	 * R^2) with that candidate: the cells that would switch on by themselves once enough units
-	 * accrue with the same result; that is not a promise.
+	 * R^2) with that best screening candidate. `units` is the band's pooled count for the
+	 * candidate, the same in every entry of the band. These are the cells that could switch on
+	 * by themselves once enough units accrue; selection would still have to pick the candidate
+	 * (its pooled gain test), so this is not a promise.
 	 */
 	belowFloor: {
 		band: string;

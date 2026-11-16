@@ -8,8 +8,8 @@
  * accounts' readings and calibration are the fixture's own (K_FIVE_HOUR, K_WEEKLY) with no open
  * 5-hour window, so no bucket is censored here; the fitted states saw the record's censoring.
  * Rest of today: per simulated day the units from the bucket holding now to local midnight;
- * light, typical and heavy are its 10th, 50th and 90th percentiles (nearest rank on the sorted
- * simulated days), noise on as served.
+ * light, typical and heavy are levelOf at 90, 50 and 10 (the engine's own level rule, as the
+ * sandbox prototype e4engine.ts read them), noise on as served.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -18,6 +18,7 @@ import type { DemandBucket, ForecastInput } from "../../types";
 import { prepareEngineContext } from "../engine";
 import type { EngineContext } from "../model";
 import type { PaceFitState } from "../pace";
+import { levelOf } from "../percentile";
 import {
 	buildInput,
 	defaultSettings,
@@ -64,23 +65,23 @@ const FROZEN: Record<
 	{ fitted: number[]; plain: number[]; m: number[] }
 > = {
 	"Thu 2026-11-12 10:00": {
-		fitted: [23.8, 111.7, 176.7],
-		plain: [22, 70.2, 111.1],
+		fitted: [24.2, 111.9, 176.8],
+		plain: [22.7, 70.2, 111.2],
 		m: [2.2893, 1.8116, 2.3568, 1, 1, 1, 1, 1, 1],
 	},
 	"Thu 2026-11-12 13:00": {
-		fitted: [21.4, 97, 157],
-		plain: [19.9, 44, 69.5],
+		fitted: [22.3, 97, 157],
+		plain: [20.1, 44.1, 69.5],
 		m: [2.4421, 2.0164, 2.8638, 1, 1, 1, 1, 1, 1],
 	},
 	"Fri 2026-11-13 10:40": {
-		fitted: [30.3, 95.4, 174],
-		plain: [29.6, 67.1, 121.9],
+		fitted: [46.2, 95.4, 174.3],
+		plain: [30.6, 67.3, 122],
 		m: [1.0517, 1.7644, 2.2183, 1, 1, 1, 1, 1, 1],
 	},
 	"Fri 2026-11-13 12:06": {
-		fitted: [30.1, 124.9, 217.3],
-		plain: [23.9, 55, 91.9],
+		fitted: [49, 125.3, 217.6],
+		plain: [24, 55, 92.1],
 		m: [4.2369, 2.1552, 3.0683, 1, 1, 1, 1, 1, 1],
 	},
 };
@@ -119,18 +120,14 @@ const round1 = (x: number) => Math.round(x * 10) / 10;
 
 function lines(ctx: EngineContext, midnight: number): number[] {
 	const n = Math.round((midnight - ctx.scenarios.start) / BUCKET);
-	const totals = ctx.scenarios.units
-		.map((u) => {
-			let t = 0;
-			for (let j = 0; j < n; j++) t += u[j] as number;
-			return t;
-		})
-		.sort((a, b) => a - b);
-	const at = (q: number) =>
-		totals[
-			Math.min(totals.length - 1, Math.ceil(q * totals.length) - 1)
-		] as number;
-	return [at(0.1), at(0.5), at(0.9)].map(round1);
+	const totals = ctx.scenarios.units.map((u) => {
+		let t = 0;
+		for (let j = 0; j < n; j++) t += u[j] as number;
+		return t;
+	});
+	return [levelOf(totals, 90), levelOf(totals, 50), levelOf(totals, 10)].map(
+		round1,
+	);
 }
 
 describe("frozen instants through the engine", () => {
