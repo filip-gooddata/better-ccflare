@@ -65,6 +65,12 @@ import {
 import { SearchProviderRepository } from "./repositories/search-provider.repository";
 import { StatsRepository } from "./repositories/stats.repository";
 import { StrategyRepository } from "./repositories/strategy.repository";
+import {
+	type SessionRequestRow,
+	UsageDetailRepository,
+	type UsageDetailSource,
+	type UsageTokenRow,
+} from "./repositories/usage-detail.repository";
 import { UsageHistoryRepository } from "./repositories/usage-history.repository";
 import { WebToolCallRepository } from "./repositories/web-tool-call.repository";
 import { withDatabaseRetry } from "./retry";
@@ -503,6 +509,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 	private combo: ComboRepository;
 	private usageHistory: UsageHistoryRepository;
 	private forecastDemand: ForecastDemandRepository;
+	private usageDetail: UsageDetailRepository;
 	private searchProviders: SearchProviderRepository;
 	private webToolCalls: WebToolCallRepository;
 
@@ -647,6 +654,7 @@ export class DatabaseOperations implements StrategyStore, Disposable {
 		this.combo = new ComboRepository(this.adapter);
 		this.usageHistory = new UsageHistoryRepository(this.adapter);
 		this.forecastDemand = new ForecastDemandRepository(this.adapter);
+		this.usageDetail = new UsageDetailRepository(this.adapter);
 		this.searchProviders = new SearchProviderRepository(this.adapter);
 		this.webToolCalls = new WebToolCallRepository(this.adapter);
 	}
@@ -1326,6 +1334,54 @@ OAuth tokens will need to be re-authenticated.
 		to: number,
 	): Promise<ClaudeOAuthRequestUsage[]> {
 		return this.forecastDemand.claudeOAuthUsage(from, to);
+	}
+
+	// ── Forecast usage detail (token categories, session requests) ──────────
+
+	async upsertUsageTokens(rows: UsageTokenRow[]): Promise<void> {
+		await this.usageDetail.upsertTokens(rows);
+	}
+
+	async replaceUsageTokens(
+		source: UsageDetailSource,
+		from: number,
+		to: number,
+		rows: UsageTokenRow[],
+	): Promise<void> {
+		await this.usageDetail.replaceTokens(source, from, to, rows);
+	}
+
+	async getUsageTokens(
+		source: UsageDetailSource,
+		from: number,
+		to: number,
+	): Promise<UsageTokenRow[]> {
+		return this.usageDetail.getTokens(source, from, to);
+	}
+
+	async upsertSessionRequests(rows: SessionRequestRow[]): Promise<void> {
+		await this.usageDetail.upsertSessionRequests(rows);
+	}
+
+	async replaceSessionRequests(
+		source: UsageDetailSource,
+		from: number,
+		to: number,
+		rows: SessionRequestRow[],
+	): Promise<void> {
+		await this.usageDetail.replaceSessionRequests(source, from, to, rows);
+	}
+
+	async getSessionRequests(
+		source: UsageDetailSource,
+		from: number,
+		to: number,
+	): Promise<SessionRequestRow[]> {
+		return this.usageDetail.getSessionRequests(source, from, to);
+	}
+
+	async pruneUsageDetail(before: number): Promise<void> {
+		await this.usageDetail.prune(before);
 	}
 
 	// ── Web tool call analytics ───────────────────────────────────────────────

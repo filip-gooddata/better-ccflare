@@ -176,6 +176,9 @@ describe("ForecastDemandRepository", () => {
 				outputTokens: 2,
 				cacheReadTokens: 3,
 				cacheWriteTokens: 4,
+				clientSessionId: null,
+				cacheWrite5mTokens: null,
+				cacheWrite1hTokens: null,
 			},
 			{
 				timestamp: 2000,
@@ -185,6 +188,9 @@ describe("ForecastDemandRepository", () => {
 				outputTokens: 5,
 				cacheReadTokens: 0,
 				cacheWriteTokens: 0,
+				clientSessionId: null,
+				cacheWrite5mTokens: null,
+				cacheWrite1hTokens: null,
 			},
 		]);
 	});

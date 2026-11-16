@@ -345,6 +345,29 @@ describe("SQLite <-> PostgreSQL migration schema parity (static)", () => {
 		});
 	});
 
+	it("spot check: forecast usage-detail tables and request cache split columns in both backends", () => {
+		for (const table of [
+			"forecast_usage_tokens",
+			"forecast_session_requests",
+		]) {
+			expect(sqliteInventory.tables.get(table)?.size ?? 0).toBeGreaterThan(0);
+			expect(pgInventory.tables.get(table)).toEqual(
+				sqliteInventory.tables.get(table),
+			);
+		}
+		for (const column of [
+			"cache_creation_5m_input_tokens",
+			"cache_creation_1h_input_tokens",
+		]) {
+			expect(sqliteInventory.tables.get("requests")?.has(column)).toBe(true);
+			expect(pgInventory.tables.get("requests")?.has(column)).toBe(true);
+			expect(parsePgColumnsToAdd(pgSource)).toContainEqual({
+				table: "requests",
+				column,
+			});
+		}
+	});
+
 	describe("redundant requests indexes", () => {
 		const dropped = [
 			"idx_requests_timestamp",
