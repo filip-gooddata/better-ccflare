@@ -58,6 +58,12 @@ export interface PaceFitState {
 	belowFloor: { band: string; feature: string; units: number }[];
 	/** One selection per band, pooled over day types; null = plain line. */
 	selected: { band: string; feature: string | null }[];
+	dayTypeComparison: {
+		partition: string;
+		groups: number;
+		loss: number;
+		se: number;
+	}[];
 }
 
 /** E4 applied at an instant. */

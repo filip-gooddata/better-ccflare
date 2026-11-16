@@ -6,6 +6,8 @@
  * through the orchestrator.
  */
 
+import type { PaceFitState } from "./engine/pace/types";
+
 export type AccountId = string;
 export type EpochMs = number;
 
@@ -214,6 +216,7 @@ export interface ForecastInput {
 	/** Recorded readings, ascending: at least since Monday 00:00 local, and as far back as calibration looks. */
 	readings: LimitReading[];
 	sessions: LiveSession[];
+	demandModel?: PaceFitState | null;
 }
 
 export interface PlacementAdvice {

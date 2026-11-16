@@ -49,4 +49,5 @@ test_*.sh
 docs/superpowers/
 docs/plans/
 packages/database/src/inline-integrity-check-worker.ts
+packages/forecast/src/service/embedded-forecast-worker.ts
 .tmp/
