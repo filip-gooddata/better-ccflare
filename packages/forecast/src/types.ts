@@ -89,12 +89,12 @@ export interface AccountLimits {
 	/** End of an upstream refusal cooldown, when one is running. */
 	blockedUntil: EpochMs | null;
 	/**
-	 * Start of the running refusal cooldown (`rate_limited_at`). Null when
-	 * `blockedUntil` is null, when the start is unknown, or when the stamp lies
-	 * after now; absent counts as null. The engine ignores a value after now or at
+	 * Start of the running refusal cooldown (the first `rate_limited_at` seen
+	 * for it). Null when `blockedUntil` is null, when the start is unknown, or
+	 * when the stamp lies after now. The engine ignores a value after now or at
 	 * or after `blockedUntil`.
 	 */
-	blockedSince?: EpochMs | null;
+	blockedSince: EpochMs | null;
 	readAt: EpochMs;
 }
 

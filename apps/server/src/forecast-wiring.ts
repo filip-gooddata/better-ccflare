@@ -182,21 +182,48 @@ function fableInput(
 }
 
 /**
+ * The running cooldown of each account as last seen by `loadClaudeLimits`:
+ * the first refusal stamp seen for it (`since`) and its last seen end
+ * (`until`). Kept in memory only, so a restart starts empty.
+ */
+export type CooldownStarts = Map<string, { since: EpochMs; until: EpochMs }>;
+
+/**
  * Current limits of every Claude OAuth account from the accounts table and
  * the usage cache. Counted = not paused and no re-authentication pending; an
  * account without a cached reading has both windows closed. `readAt` is
  * when the account's reading arrived, else `now`.
+ *
+ * `blockedUntil` is `rate_limited_until` while it lies after now.
+ * `blockedSince` is when that cooldown began: `rate_limited_at` holds only
+ * the latest refusal that set or extended it, so `starts` keeps the first
+ * stamp seen while the cooldown runs unbroken. A stamp after the remembered
+ * end starts a new cooldown; an account seen unblocked is forgotten. With
+ * empty memory (a fresh start) it is the stored stamp. Null when the account
+ * is not blocked or the stamp is missing or after now.
  */
 export async function loadClaudeLimits(
 	dbOps: Pick<DatabaseOperations, "getAllAccounts">,
 	usage: { get(accountId: string): AnyUsageData | null },
 	now: EpochMs,
 	readAt: (accountId: string) => EpochMs | null = () => null,
+	starts: CooldownStarts = new Map(),
 ): Promise<AccountLimits[]> {
 	const accounts = await dbOps.getAllAccounts();
 	return accounts.filter(isClaudeOAuthAccount).map((account) => {
 		const data = usage.get(account.id);
 		const cooldown = account.rate_limited_until;
+		const blockedUntil = cooldown != null && cooldown > now ? cooldown : null;
+		const stamp = account.rate_limited_at;
+		let blockedSince: EpochMs | null = null;
+		if (blockedUntil === null) {
+			starts.delete(account.id);
+		} else if (stamp != null && stamp <= now) {
+			const kept = starts.get(account.id);
+			const since = kept && stamp <= kept.until ? kept.since : stamp;
+			starts.set(account.id, { since, until: blockedUntil });
+			blockedSince = since;
+		}
 		return {
 			accountId: account.id as AccountId,
 			name: account.name,
@@ -208,7 +235,8 @@ export async function loadClaudeLimits(
 				? limitState(extractWeeklyWindow(data, "anthropic"), now)
 				: CLOSED,
 			fable: fableInput(account.id, data, now),
-			blockedUntil: cooldown != null && cooldown > now ? cooldown : null,
+			blockedUntil,
+			blockedSince,
 			readAt: readAt(account.id) ?? now,
 		};
 	});
@@ -287,6 +315,7 @@ export function createForecastWiring(
 	// When each account's reading arrived, so the scheduler judges a pre-warm
 	// by a reading taken after it rather than by the time limits were loaded.
 	const readTimes = new Map<string, EpochMs>();
+	const cooldownStarts: CooldownStarts = new Map();
 	let service: ForecastService | null = null;
 	const scheduler = createPrewarmScheduler({
 		runner,
@@ -317,6 +346,7 @@ export function createForecastWiring(
 				ports.usage,
 				now,
 				(id) => readTimes.get(id) ?? null,
+				cooldownStarts,
 			),
 		scheduler,
 		clock,
