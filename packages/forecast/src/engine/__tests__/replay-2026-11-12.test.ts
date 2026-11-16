@@ -9,8 +9,9 @@
  * opens at 07:00; the planner scores the unfloored heavy low point S (E2) and may hold an idle
  * account closed when S gains at least openMinGainPoints (E3). The assertions state what the engine
  * achieves on this day, measured, not a wanted number. The sandbox prototype
- * (line-options-2) gave the same values: S +13.8 on demand, +59.9 holding acct-b to 08:00, −3.3
- * for the old 10:00 opening, reason low-point+46.1.
+ * (line-options-2), with the day factor and the last-hour mix since removed, gave S +13.8 on
+ * demand, +59.9 holding acct-b to 08:00, −3.3 for the old 10:00 opening, reason low-point+46.1;
+ * on the plain lines the engine gives the values below.
  */
 import { describe, expect, test } from "bun:test";
 import type { EpochMs, ForecastBlock, ForecastInput } from "../../types";

@@ -5,9 +5,9 @@
  * and no shortfall. Recorded days are the pooled hourly units of the days up to then
  * (fixtures-engine.ts); readings follow the fixture's own calibration (K_FIVE_HOUR, K_WEEKLY), so
  * the figures below are what the engine gives on this fixture, measured, not the live response.
- * The light line comes down to 0.5 at 17:00 but does not reach 0, so light has no stop. The
- * shortfall's spill gives acct-a its 79-point fill although acct-a cannot serve: the spill rule
- * (spec section 6) reads the 5-hour use, not the cooldown.
+ * The light line comes down to 47.8 but does not reach 0, so light has no stop. The recorded
+ * days are not scaled by today's pace here (no fitted demand model: the plain lines), so the
+ * stops start later than they did with the day factor, and the shortfall falls on acct-b.
  */
 import { describe, expect, test } from "bun:test";
 import { validateForecastResponse } from "../../contract";
@@ -38,25 +38,24 @@ describe("2026-11-13 12:06 replay: acct-a in a refusal cooldown", () => {
 		expect(day.pastStops).toEqual([]);
 	});
 
-	test("typical stop 13:21–17:00 with the shortfall on it; heavy stops 12:56–17:00 and 17:52–22:05; light low 0.5", async () => {
+	test("typical stop 16:39–17:00 with the shortfall on it; heavy stop 14:38–17:00; light low 47.8", async () => {
 		const { response } = await compute();
 		const day = response.day as ForecastBlock;
-		expect(Math.min(...day.light)).toBeCloseTo(0.5, 5);
+		expect(Math.min(...day.light)).toBeCloseTo(47.8, 5);
 		expect(Math.min(...day.typical)).toBe(0);
 		expect(Math.min(...day.heavy)).toBe(0);
 		expect(day.stops.light).toEqual([]);
 		expect(day.stops.typical).toEqual([
-			{ start: prague(13, 13, 21), end: B_RESET },
+			{ start: prague(13, 16, 39), end: B_RESET },
 		]);
 		expect(day.stops.heavy).toEqual([
-			{ start: prague(13, 12, 56), end: B_RESET },
-			{ start: prague(13, 17, 52), end: prague(13, 22, 5) },
+			{ start: prague(13, 14, 38), end: B_RESET },
 		]);
 		expect(day.shortfall).toEqual({
-			stop: { start: prague(13, 13, 21), end: B_RESET },
-			points: 259.5,
+			stop: { start: prague(13, 16, 39), end: B_RESET },
+			points: 4.2,
 			lastAccount: "acct-b",
-			perAccount: { "acct-a": 79, "acct-b": 180.5 },
+			perAccount: { "acct-a": 0, "acct-b": 4.2 },
 		});
 	});
 
