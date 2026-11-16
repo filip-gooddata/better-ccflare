@@ -22,7 +22,7 @@ import {
 	projectedStops,
 	shortfall,
 	stopNow,
-	ZERO_POINTS,
+	zeroPoints,
 } from "./stops";
 
 const HOUR_MS = 3_600_000;
@@ -87,6 +87,15 @@ function hourFloor(at: EpochMs, timeZone: string): EpochMs {
 /** One decimal, after the percentiles. Rounding is monotone, so the ordering of the lines survives it. */
 function round1(value: number): number {
 	return Math.max(0, Math.round(value * 10) / 10);
+}
+
+/**
+ * A level line to one decimal, with 0.0 kept for 0: a value above the zero
+ * cutoff prints at least 0.1, so a stop starts and ends where its printed line
+ * leaves 0. Still monotone, so the ordering of the lines survives.
+ */
+function roundLevel(value: number, cutoff: number): number {
+	return value <= cutoff ? 0 : Math.max(0.1, round1(value));
 }
 
 function roundSeries(series: Series): Series {
@@ -156,6 +165,7 @@ function blockLines(
 	const series = sim.traces.map((t) => (quantity === "day" ? t.day : t.week));
 	const lines = levelLines(series, lastIndex + 1, levels);
 	const need = levels.map((l) => daysAtZeroForLevel(series.length, l));
+	const cutoff = zeroPoints(ctx.accounts.length);
 
 	const stepCache = new Map<number, { atZero: number; hits: EpochMs[] }>();
 	const stepHits = (j: number) => {
@@ -164,9 +174,9 @@ function blockLines(
 		let atZero = 0;
 		const hits: EpochMs[] = [];
 		sim.traces.forEach((trace, s) => {
-			const zeroNow = series[s][j] < ZERO_POINTS;
+			const zeroNow = series[s][j] <= cutoff;
 			if (!zeroNow) return;
-			if (series[s][j - 1] < ZERO_POINTS) {
+			if (series[s][j - 1] <= cutoff) {
 				atZero++;
 				return;
 			}
@@ -191,7 +201,7 @@ function blockLines(
 	};
 	/** When level l reaches 0 in step j; t[j] when the days give no earlier time. */
 	const zeroTime = (j: number, l: number): EpochMs => {
-		if (lines[l][j - 1] < ZERO_POINTS) return times[j - 1];
+		if (lines[l][j - 1] <= cutoff) return times[j - 1];
 		const { atZero, hits } = stepHits(j);
 		const k = need[l] - atZero - 1;
 		if (k < 0) return times[j - 1];
@@ -215,9 +225,9 @@ function blockLines(
 		if (times[a] < times[b]) {
 			const inserts = new Map<EpochMs, number>();
 			levels.forEach((_, l) => {
-				if (lines[l][a] < ZERO_POINTS || lines[l][b] >= ZERO_POINTS) return;
+				if (lines[l][a] <= cutoff || lines[l][b] > cutoff) return;
 				let j = a + 1;
-				while (lines[l][j] >= ZERO_POINTS) j++;
+				while (lines[l][j] > cutoff) j++;
 				const tau = zeroTime(j, l);
 				// A zero exactly on a sample the block leaves out (week: between
 				// full hours) is kept too, so the stop starts where the line does.
@@ -227,7 +237,7 @@ function blockLines(
 			for (const [tau, j] of [...inserts].sort((x, y) => x[0] - y[0])) {
 				const w = (tau - times[j - 1]) / (times[j] - times[j - 1]);
 				push(tau, (l) =>
-					lines[l][j] < ZERO_POINTS && zeroTime(j, l) <= tau
+					lines[l][j] <= cutoff && zeroTime(j, l) <= tau
 						? 0
 						: lines[l][j - 1] + w * (lines[l][j] - lines[l][j - 1]),
 				);
@@ -251,7 +261,10 @@ function buildBlock(
 		typical: projectedStops(ctx, sim, quantity, block, TYPICAL),
 		heavy: projectedStops(ctx, sim, quantity, block, HEAVY),
 	};
-	const rounded = block.values.map((line) => line.map(round1));
+	const cutoff = zeroPoints(ctx.accounts.length);
+	const rounded = block.values.map((line) =>
+		line.map((v) => roundLevel(v, cutoff)),
+	);
 	const line = (level: number) => rounded[levels.indexOf(level)];
 	const fan: Record<string, number[]> = {};
 	levels.forEach((level, l) => {
