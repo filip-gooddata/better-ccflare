@@ -1,8 +1,20 @@
 import { unavailableResponse } from "../engine/response";
-import { runTranscriptBackfill } from "../history/backfill";
+import {
+	runTranscriptBackfill,
+	TRANSCRIPT_BACKFILL_META_KEY,
+} from "../history/backfill";
 import type { ForecastDb } from "../history/ports";
-import { earliestProxyBucket, syncProxyDemand } from "../history/proxy-demand";
+import {
+	earliestProxyBucket,
+	errorName,
+	syncProxyDemand,
+} from "../history/proxy-demand";
+import {
+	usageDetailCutoff,
+	usageDetailMeta,
+} from "../history/proxy-usage-detail";
 import { loadReadings } from "../history/readings";
+import { runUsageDetailBackfill } from "../history/usage-detail-backfill";
 import {
 	type PrewarmForecastView,
 	type PrewarmScheduler,
@@ -26,6 +38,7 @@ import {
 	backfillLine,
 	createAvailabilityLog,
 	createInputsLog,
+	usageDetailBackfillLine,
 } from "./log-lines";
 
 /** A kept result older than this many usage poll intervals is stale. */
@@ -62,6 +75,17 @@ export interface ForecastServiceDeps {
 	scheduler: PrewarmScheduler | null;
 	/** Defaults to runTranscriptBackfill over `store` and `db`. */
 	backfill?(transcriptsDir: string): Promise<unknown>;
+	/**
+	 * Runs once per service, from creation. Before the `backfill` marker is set,
+	 * creation passes `earliestProxyBucket`: the cut-over that backfill will
+	 * take once the first sync has stored every Claude OAuth request. Defaults
+	 * to runUsageDetailBackfill over `db`, with usageDetailMeta(db) as the meta
+	 * store.
+	 */
+	usageDetailBackfill?(
+		transcriptsDir: string,
+		earliestProxyBucket?: () => Promise<EpochMs | null>,
+	): Promise<unknown>;
 	clock: { now(): EpochMs };
 	/** The server passes unref'd timers so none keeps the process alive. */
 	timer: ForecastServiceTimer;
@@ -84,7 +108,7 @@ export interface ForecastService {
 	forecastView(): PrewarmForecastView | null;
 	/** Resolves when no computation is running or queued and the scheduler is idle. */
 	idle(): Promise<void>;
-	/** Clears timers, stops the scheduler, awaits the running computation and pre-warm runs in flight; later notifies do nothing. */
+	/** Clears timers, stops the scheduler, awaits the running computation, the usage-detail pass and pre-warm runs in flight; later notifies do nothing. */
 	stop(): Promise<void>;
 }
 
@@ -110,6 +134,7 @@ export function createForecastService(
 	let pendingHandle: unknown = null;
 	let stopped = false;
 	let backfillStarted = false;
+	let usageDetailRun: Promise<void> | null = null;
 	let quietWaiters: (() => void)[] = [];
 
 	const backfill =
@@ -121,6 +146,21 @@ export function createForecastService(
 				earliestProxyBucket: () => earliestProxyBucket({ db }),
 				now: () => clock.now(),
 				timeZone: deps.pace().timeZone,
+			}));
+	const usageDetailBackfill =
+		deps.usageDetailBackfill ??
+		((
+			transcriptsDir: string,
+			earliest: () => Promise<EpochMs | null> = () =>
+				earliestProxyBucket({ db }),
+		) =>
+			runUsageDetailBackfill({
+				db,
+				meta: usageDetailMeta(db),
+				transcriptsDir,
+				earliestProxyBucket: earliest,
+				now: () => clock.now(),
+				historyLookbackDays: deps.settings().historyLookbackDays,
 			}));
 	const availability = createAvailabilityLog((msg) => logger.info(msg));
 	const inputsLog = createInputsLog((msg) => logger.info(msg));
@@ -137,14 +177,83 @@ export function createForecastService(
 			.then(
 				(result) => {
 					logger.info(backfillLine(result, clock.now() - startedAt));
+					return true;
 				},
 				(error: unknown) => {
-					// The error's name only: a message could carry a transcript path.
-					const name = error instanceof Error ? error.name : typeof error;
-					logger.warn(`forecast backfill failed error=${name}`);
+					logger.warn(`forecast backfill failed error=${errorName(error)}`);
+					return false;
+				},
+			)
+			.then((succeeded) => {
+				// Sequential: it reads the cut-over the demand backfill settled on.
+				if (succeeded) return startUsageDetailBackfill(dir);
+			});
+	};
+
+	/** At most once per service, from creation or from the first cycle; never after stop. */
+	const startUsageDetailBackfill = (
+		dir: string,
+		earliest?: () => Promise<EpochMs | null>,
+	): Promise<void> => {
+		if (usageDetailRun) return usageDetailRun;
+		if (stopped) return Promise.resolve();
+		const startedAt = clock.now();
+		usageDetailRun = Promise.resolve()
+			.then(() =>
+				earliest
+					? usageDetailBackfill(dir, earliest)
+					: usageDetailBackfill(dir),
+			)
+			.then(
+				(result) => {
+					logger.info(usageDetailBackfillLine(result, clock.now() - startedAt));
+				},
+				(error: unknown) => {
+					logger.warn(
+						`forecast usage detail backfill failed error=${errorName(error)}`,
+					);
 				},
 			);
+		return usageDetailRun;
 	};
+
+	/**
+	 * The demand backfill's cut-over before its first run: the first sync starts
+	 * at 0 and stores a proxy bucket for every Claude OAuth request, so the
+	 * earliest of those and of the proxy buckets already stored.
+	 */
+	const earliestAfterFirstSync = async (): Promise<EpochMs | null> => {
+		let earliest = await earliestProxyBucket({ db });
+		for (const request of await db.getClaudeOAuthRequestUsage(
+			0,
+			clock.now() + 1,
+		)) {
+			if (earliest === null || request.timestamp < earliest) {
+				earliest = request.timestamp;
+			}
+		}
+		return earliest;
+	};
+
+	// The pass starts at creation, without waiting for a usage snapshot that may
+	// never come. Before the demand backfill has run, it gets the cut-over that
+	// backfill will take.
+	const startupDir = deps.settings().transcriptsDir;
+	const startupCheck: Promise<unknown> = startupDir
+		? Promise.resolve()
+				.then(() => store.getMeta(TRANSCRIPT_BACKFILL_META_KEY))
+				.then(
+					(marker) =>
+						marker !== null
+							? startUsageDetailBackfill(startupDir)
+							: startUsageDetailBackfill(startupDir, earliestAfterFirstSync),
+					(error: unknown) => {
+						logger.warn(
+							`forecast usage detail backfill check failed error=${errorName(error)}`,
+						);
+					},
+				)
+		: Promise.resolve();
 
 	const fresh = (now: EpochMs) =>
 		kept !== null &&
@@ -159,10 +268,22 @@ export function createForecastService(
 		const now = clock.now();
 		const failures: string[] = [];
 		try {
-			await syncProxyDemand({ db }, now);
+			const synced = await syncProxyDemand({ db }, now);
+			if (synced.detailError !== undefined) {
+				logger.warn(
+					`forecast usage detail sync failed error=${synced.detailError}`,
+				);
+			}
 			startBackfill();
 		} catch (error) {
 			failures.push(`sync=${message(error)}`);
+		}
+		try {
+			await db.pruneUsageDetail(
+				usageDetailCutoff(now, deps.settings().historyLookbackDays),
+			);
+		} catch (error) {
+			failures.push(`prune=${errorName(error)}`);
 		}
 		try {
 			const settings = deps.settings();
@@ -387,6 +508,8 @@ export function createForecastService(
 			clearPending();
 			deps.scheduler?.stop();
 			if (running) await running;
+			await startupCheck;
+			if (usageDetailRun) await usageDetailRun;
 			settleQuiet();
 			// pre-warm runs in flight finish and record before the database closes
 			await deps.scheduler?.idle();

@@ -4,6 +4,7 @@
  * not import the database at runtime.
  */
 import type { EpochMs } from "../types";
+import type { UsageDetailDb } from "./usage-detail";
 
 export interface ForecastDemandDbRow {
 	bucketStart: EpochMs;
@@ -30,6 +31,11 @@ export interface ClaudeRequestUsageRow {
 	outputTokens: number;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
+	/** Raw client session id: only hashed into a session key, never stored or logged. */
+	clientSessionId: string | null;
+	/** Null when upstream did not report the 5-minute / 1-hour split. */
+	cacheWrite5mTokens: number | null;
+	cacheWrite1hTokens: number | null;
 }
 
 export interface UsageSnapshotDbRow {
@@ -40,7 +46,7 @@ export interface UsageSnapshotDbRow {
 	resetsAt: EpochMs | null;
 }
 
-export interface ForecastDb {
+export interface ForecastDb extends UsageDetailDb {
 	upsertForecastDemand(rows: ForecastDemandDbRow[]): Promise<void>;
 	/** Replace every row of `source` with bucketStart in [from, to) by `rows`. */
 	replaceForecastDemand(

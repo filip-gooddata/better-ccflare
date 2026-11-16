@@ -1062,6 +1062,10 @@ export class UsageCollector {
 								outputTokens: state.usage.outputTokens,
 								cacheReadInputTokens: state.usage.cacheReadInputTokens,
 								cacheCreationInputTokens: state.usage.cacheCreationInputTokens,
+								cacheCreation5mInputTokens:
+									state.usage.cacheCreation5mInputTokens,
+								cacheCreation1hInputTokens:
+									state.usage.cacheCreation1hInputTokens,
 								tokensPerSecond: state.usage.tokensPerSecond,
 								providerServed: state.usage.providerServed,
 								completionTier: state.usage.completionTier,
