@@ -564,6 +564,14 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
 		expect(logged(`account=${GD} family_refusal_unclassified`)).toEqual([]);
+
+		// The next mapped Opus request must not reach gooddata while the Fable
+		// block it would run into stands.
+		await send(ctx, makeRequest(OPUS));
+		expect(calls.filter((c) => c.account === GD)).toHaveLength(2);
+		expect(
+			logged(`family_blocked: excluding ${GD} for fable`).length,
+		).toBeGreaterThan(0);
 	});
 
 	it("still benches the account when the model list spans families", async () => {

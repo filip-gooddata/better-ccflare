@@ -1,7 +1,9 @@
 import {
 	getModelFamily,
+	getModelList,
 	isUsageExhausted,
 	isUseExtraUsageEnabled,
+	splitModelRouting,
 } from "@better-ccflare/core";
 import {
 	extractFiveHourWindow,
@@ -158,8 +160,16 @@ function familyLimitInForce(
 	capacityRoutingEnabled: boolean,
 	now: number,
 ): AccountLimit | null {
-	const block = getFamilyBlock(account.id, family, now);
-	if (block) return { kind: "family", family, resetAt: block.until };
+	// Blocks are recorded for the family upstream refused: the family of the
+	// account's mapped primary model when it maps the client's model.
+	const mappedPrimary = getModelList(model, account)?.[0];
+	const upstreamFamily =
+		(mappedPrimary
+			? getModelFamily(splitModelRouting(mappedPrimary).model)
+			: null) ?? family;
+	const block = getFamilyBlock(account.id, upstreamFamily, now);
+	if (block)
+		return { kind: "family", family: upstreamFamily, resetAt: block.until };
 	if (!capacityRoutingEnabled) return null;
 
 	const usage = usageCache.get(account.id);

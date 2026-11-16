@@ -1,9 +1,11 @@
 import type { AccountUsageSnapshot } from "@better-ccflare/core";
 import {
 	getModelFamily,
+	getModelList,
 	isAccountAvailable,
 	isUsageExhausted,
 	providerAcceptsClientModel,
+	splitModelRouting,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -466,18 +468,27 @@ function isAccountCapacityExcluded(
 	origin: FamilyExhaustionOrigin | null;
 } {
 	const family = getModelFamily(model);
-	if (!family) return { excluded: false, resetAt: null, origin: null };
+	// A block is recorded for the family upstream refused, which is the family
+	// of the model this account actually sends: its mapped primary model when
+	// the account maps the client's model, else the client's model.
+	const mappedPrimary = getModelList(model, account)?.[0];
+	const upstreamFamily =
+		(mappedPrimary
+			? getModelFamily(splitModelRouting(mappedPrimary).model)
+			: null) ?? family;
+	if (!upstreamFamily) return { excluded: false, resetAt: null, origin: null };
 
 	// A standing family block is an observed upstream refusal of this family
 	// on this account: it excludes whatever MODEL_SCOPED_CAPACITY_ROUTING and
 	// the overage signal say, until the family's limit resets.
-	const block = getFamilyBlock(account.id, family, now);
+	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block) {
 		log.info(
-			`family_blocked: excluding ${account.name} for ${family} until ${new Date(block.until).toISOString()} (source=${block.source})`,
+			`family_blocked: excluding ${account.name} for ${upstreamFamily} until ${new Date(block.until).toISOString()} (source=${block.source})`,
 		);
 		return { excluded: true, resetAt: block.until, origin: "family_blocked" };
 	}
+	if (!family) return { excluded: false, resetAt: null, origin: null };
 	if (!capacityRoutingEnabled) {
 		return { excluded: false, resetAt: null, origin: null };
 	}
