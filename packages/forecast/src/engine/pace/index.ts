@@ -28,7 +28,4 @@ export function applyPace(
 	throw new Error("pace: applyPace not implemented");
 }
 
-/** Multiplier at a distance ahead: the log multiplier interpolated linearly between band centres. */
-export function paceMultiplierAt(_pace: PaceNow, _aheadMin: number): number {
-	throw new Error("pace: paceMultiplierAt not implemented");
-}
+export { PACE_BANDS, paceMultiplierAt, plainPace } from "./bands";
