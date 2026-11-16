@@ -132,6 +132,8 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
 | `workStartSharePct` | `FORECAST_WORK_START_SHARE_PCT` | `forecast_work_start_share_pct` | `5` | 1–50 |
 
+`historyLookbackDays` and `historyHalfLifeDays` also set how fast the calibrations follow a change of a limit by the provider: both calibrations, and the weekly cap ratio r = k5 ÷ kW, are recomputed at every computation from the stored readings of the last 56 days with a 14-day half-life. After a step change they have moved half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (measured by `packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way 240–246 h, 90 % 822–828 h; kW 318–324 h and 924–942 h; k5 312 h and 906 h).
+
 How the values are read:
 
 - The environment variable wins over the config file key, which wins over the default. An empty environment variable counts as unset.

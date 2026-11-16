@@ -1,11 +1,11 @@
-> This is a copy of spec revision 5 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 6 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 5 · 2026-11-13 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 6 · 2026-11-13 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -43,12 +43,26 @@ Clients must ignore fields they do not know.
   0 to 200 with two accounts.
 - **Counted accounts** (`accounts`): the Claude accounts that can take work now: not paused, not logged out (no
   re-authentication pending). Ids are the ids of `/api/accounts`.
-- **Pooled 5-hour quota left** (the `day` quantity): per counted account, 100 minus its 5-hour utilisation; an
-  account with no open 5-hour window counts 100. An account that cannot take work for a reason other than its
-  5-hour limit counts 0 here until that reason ends, because its 5-hour quota cannot be used. There are two such
-  reasons: its WEEKLY limit is used up (until its weekly reset), or it is refused by upstream with a cooldown
-  running (until the cooldown ends). So this line at 0 means "no counted account can take work", whichever limit
-  caused it.
+- **Pooled 5-hour quota left** (the `day` quantity): per counted account, the LOWER of two amounts. The first is
+  its 5-hour quota left: 100 minus its 5-hour utilisation; an account with no open 5-hour window counts 100. The
+  second is its weekly quota left expressed in 5-hour points: 100 minus its weekly utilisation, times the
+  account's 5-hour points per weekly point. The proxy calibrates that ratio per account from the account's own
+  usage (about 6 on both accounts in November 2026, so the weekly limit lowers the value only when less than
+  about a sixth of it is left). So 100 is one account's full 5-hour window, and each account counts only as much
+  of it as its weekly limit still allows. An account whose WEEKLY limit is used up therefore counts 0 until its
+  weekly reset. An account that is refused by upstream with a cooldown running also counts 0 until the cooldown
+  ends, because its quota cannot be used. So this line at 0 means "no counted account can take work", whichever
+  limit caused it. The pooled maximum stays 100 times the number of counted accounts. The rule holds at the
+  current point, in `day.past` and at every projected point, a 5-hour reset included: after a reset the account
+  rises to the lower of 100 and what its weekly limit allows, not to 100. The limit of the Fable model family
+  does not enter this line; it is reported in `fable`.
+  The ratio is not a constant. It is the quotient of two calibrations (5-hour points per demand unit and weekly
+  points per demand unit) that the proxy recomputes at every computation from its stored readings of the last
+  56 days, weighted by recency with a half-life of 14 days. It therefore follows a change of a limit by the
+  provider, but slowly: after a step change it has moved half-way in about 10 to 13 days and 90 % of the way in
+  about 5 weeks (measured by the test `calibration-step.test.ts`). The two calibrations follow separately: a
+  change of one limit leaves the other calibration unchanged. Until the calibration has caught up, every value
+  that depends on it (this line, the projections, `shortfall`) is off in proportion.
 - **Pooled weekly quota left** (the `week` quantity): per counted account, 100 minus its weekly utilisation. The
   5-hour state does not enter.
 - **Series shape**: one shared time axis per block (`times`) and one value array per level, all the same length.
@@ -132,7 +146,7 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `day.stops` | `{ light, typical, heavy }`, each a list of `{ start, end }` in time order (section 5). |
 | `day.stopNow` | `{ start, end }` or `null` (section 5). |
 | `day.pastStops` | List of `{ start, end }`, today's ended stops. |
-| `day.shortfall` | `null`, or `{ stop, points, lastAccount, perAccount }` for one stop: `stopNow` if there is one, else the first `typical` stop. `stop` = that stop's `{ start, end }`. `points` = the demand expected inside it that cannot be served (median over the simulated days; for `stopNow`, counted from `computedAt`). `lastAccount` = the account that runs out last before the stop (for `stopNow`: the one that did). `perAccount` = `{ "<id>": points }`, the spill rule: `lastAccount` gets as much as fits its fill (its used share at `computedAt`: 100 minus its quota left, 0 with no open window), the rest goes to the other accounts in reverse order of running out, each capped the same way; anything still left over is added to `lastAccount`, so the parts always sum to `points`. |
+| `day.shortfall` | `null`, or `{ stop, points, lastAccount, perAccount }` for one stop: `stopNow` if there is one, else the first `typical` stop. `stop` = that stop's `{ start, end }`. `points` = the demand expected inside it that cannot be served (median over the simulated days; for `stopNow`, counted from `computedAt`). `lastAccount` = the account that runs out last before the stop (for `stopNow`: the one that did). `perAccount` = `{ "<id>": points }`, the spill rule: `lastAccount` gets as much as fits its fill (its used share at `computedAt`: 100 minus the lower of its 5-hour quota left and its weekly quota left in 5-hour points, as in section 3; 0 when no 5-hour window is open and the weekly limit does not lower the value; a running cooldown does not enter the fill), the rest goes to the other accounts in reverse order of running out, each capped the same way; anything still left over is added to `lastAccount`, so the parts always sum to `points`. |
 | `week.past` | As `day.past` for the pooled weekly quota left, from Monday 00:00 local, at most one entry per 30 minutes plus jumps. |
 | `week.times` | `computedAt`, then every full hour, to the later of Friday 24:00 local and the last weekly reset of a counted account (at most 7 days ahead), plus exact jumps and zero points. |
 | `week.light`, `week.typical`, `week.heavy`, `week.fan` | As for `day`, for the weekly quantity. |
@@ -267,6 +281,15 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 6, 2026-11-13: values only; no field added, removed, renamed or retyped. Section 3: the `day`
+  quantity counts each account at the lower of its 5-hour quota left and its weekly quota left in 5-hour points
+  (weekly quota left times the account's calibrated 5-hour points per weekly point), at the current point, in
+  `day.past` and at every projected point. Before, an account counted its full 5-hour quota until its weekly
+  limit was completely used up, so the line rose by 100 at a 5-hour reset even when the weekly limit allowed far
+  less. The `perAccount` fill of `shortfall` follows the same lower value. The Fable limit stays out of the
+  line. Section 3 also states how the ratio is obtained and how fast it follows a change of a limit by the
+  provider (half-way in about 10 to 13 days, 90 % in about 5 weeks). `contractVersion` stays 1.
 
 - Revision 5, 2026-11-13: one rule widened; no field added, removed, renamed or retyped. Section 3: an account
   that is refused by upstream with a cooldown running counts 0 in the pooled 5-hour line until the cooldown ends,
