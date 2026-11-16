@@ -19,9 +19,16 @@ import {
 	type Quantity,
 } from "./past";
 import { levelOf } from "./percentile";
+import { FULL_POINTS } from "./simulate";
 
-/** A level value below this is 0: it is what the response rounds to 0.0. */
-export const ZERO_POINTS = 0.05;
+/**
+ * Pooled quota left at or below this is 0. An account is full from FULL_POINTS
+ * used, so each full account may still hold up to 100 − FULL_POINTS of float
+ * residue; the pool of all accounts holds at most their sum.
+ */
+export function zeroPoints(accounts: number): number {
+	return accounts * (100 - FULL_POINTS);
+}
 
 /** Points are reported to one decimal; spill arithmetic runs in tenths so the parts sum exactly. */
 const TENTHS = 10;
@@ -130,10 +137,11 @@ export function projectedStops(
 	level: number,
 ): Interval[] {
 	const values = block.values[block.levels.indexOf(level)];
+	const cutoff = zeroPoints(ctx.accounts.length);
 	const runs: { first: number; end: EpochMs }[] = [];
 	let first: number | null = null;
 	for (let i = 0; i < values.length; i++) {
-		const zero = values[i] < ZERO_POINTS;
+		const zero = values[i] <= cutoff;
 		if (zero && first === null) first = i;
 		if (!zero && first !== null) {
 			runs.push({ first, end: block.times[i] });
@@ -221,13 +229,14 @@ function projectedOuts(
 ): { last: number; outAt: number[] } {
 	const times = sim.axis.times;
 	const n = ctx.accounts.length;
+	const cutoff = zeroPoints(n);
 	const lastCount = new Array<number>(n).fill(0);
 	const outTimes: number[][] = Array.from({ length: n }, () => []);
 	for (const trace of sim.traces) {
 		const series = quantity === "day" ? trace.day : trace.week;
 		let zeroAt: EpochMs | null = null;
 		for (let i = 0; i < times.length && times[i] <= stop.end; i++)
-			if (times[i] >= stop.start && series[i] < ZERO_POINTS) {
+			if (times[i] >= stop.start && series[i] <= cutoff) {
 				zeroAt = times[i];
 				break;
 			}

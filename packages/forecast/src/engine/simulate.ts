@@ -27,7 +27,7 @@ const COARSE_STEP_MS = HOUR_MS;
 /** Simulated days run between two yields: about 5 ms per slice at a week horizon on this machine. */
 const DAYS_PER_SLICE = 20;
 /** Use at or above 100 points is full; the tiny slack absorbs float rounding of k·u sums. */
-const FULL_POINTS = 100 - 1e-9;
+export const FULL_POINTS = 100 - 1e-9;
 
 /** One candidate plan as the simulation applies it. Account index = position in EngineContext.accounts. */
 export interface SimPlan {

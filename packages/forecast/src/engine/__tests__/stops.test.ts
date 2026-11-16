@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
+import { validateForecastResponse } from "../../contract";
 import type { EpochMs, LimitReading } from "../../types";
 import type { SampleAxis } from "../model";
 import { buildResponse } from "../response";
+import { FULL_POINTS } from "../simulate";
 import { fillAtNow, spill } from "../stops";
 import {
 	account,
@@ -109,6 +111,106 @@ describe("projected stops", () => {
 		const night = buildResponse(ctx, makeSim(ctx, axis, traces)).day;
 		expect(night?.heavy[night.heavy.length - 1]).toBe(0);
 		expect(night?.stops).toEqual({ light: [], typical: [], heavy: [] });
+	});
+});
+
+/**
+ * The exampleRun state with every simulated day alike: the line falls from its
+ * value at NOW to `after(t)` from `fill`, both accounts out by `fill`, and
+ * `units` unserved per step from `fill` to acct-a's reset.
+ */
+function alikeRun(
+	fill: EpochMs,
+	after: (t: EpochMs) => number,
+	units = 1,
+): ReturnType<typeof buildResponse> {
+	const ctx = makeCtx({
+		accounts: [
+			account("acct-a", { fiveHour: { usedPct: 94, resetsAt: RESET_A } }),
+			account("acct-b", { fiveHour: { usedPct: 6, resetsAt: RESET_B } }),
+		],
+		calibration: { fiveHour: { "acct-a": 2, "acct-b": 2 } },
+	});
+	const axis = defaultAxis(ctx, [RESET_A, RESET_B]);
+	const traces = Array.from({ length: 50 }, () =>
+		makeTrace(axis, {
+			day: (t, i) => {
+				if (afterJump(axis, RESET_A, i)) return 100;
+				if (t >= fill) return after(t);
+				return (100 * (fill - t)) / (fill - NOW);
+			},
+			unserved: (t, i) =>
+				t > fill && t <= RESET_A && !afterJump(axis, RESET_A, i) ? units : 0,
+			outs: [
+				{ account: 0, at: fill - HOUR, limit: "five_hour" },
+				{ account: 1, at: fill, limit: "five_hour" },
+			],
+		}),
+	);
+	return buildResponse(ctx, makeSim(ctx, axis, traces));
+}
+
+/** Quota left of an account filled to 100 − residue by many small additions, as the simulation fills it. */
+function filledLeft(residue: number, additions: number): number {
+	const step = (100 - residue) / additions;
+	let used = 0;
+	for (let i = 0; i < additions; i++) used = Math.min(100, used + step);
+	return 100 - used;
+}
+
+describe("zero cutoff: accounts × (100 − FULL_POINTS)", () => {
+	const stopAt = (start: EpochMs) => ({
+		light: [{ start, end: RESET_A }],
+		typical: [{ start, end: RESET_A }],
+		heavy: [{ start, end: RESET_A }],
+	});
+
+	test("a fill that leaves float residue on both accounts is one stop from the fill time", () => {
+		const leftA = filledLeft(5e-10, 4000);
+		const leftB = filledLeft(5e-10, 7000);
+		// Both accounts are full by the simulation's own test, yet not at exactly 0.
+		expect(100 - leftA).toBeGreaterThanOrEqual(FULL_POINTS);
+		expect(100 - leftB).toBeGreaterThanOrEqual(FULL_POINTS);
+		expect(leftA + leftB).toBeGreaterThan(0);
+		const day = alikeRun(at(14), () => leftA + leftB).day;
+		expect(day?.stops).toEqual(stopAt(at(14)));
+		expect(day?.heavy[day.times.indexOf(at(14))]).toBe(0);
+		expect(
+			validateForecastResponse(alikeRun(at(14), () => leftA + leftB)),
+		).toEqual([]);
+	});
+
+	test("two accounts each exactly at the full threshold are 0; more left than that is not", () => {
+		const full = 100 - FULL_POINTS;
+		expect(alikeRun(at(14), () => full + full).day?.stops).toEqual(
+			stopAt(at(14)),
+		);
+		expect(alikeRun(at(14), () => 3 * full).day?.stops).toEqual({
+			light: [],
+			typical: [],
+			heavy: [],
+		});
+	});
+
+	test("a quiet line at 1e-12 with no demand lists no stop", () => {
+		const ctx = makeCtx();
+		const axis = defaultAxis(ctx);
+		const traces = Array.from({ length: 50 }, () =>
+			makeTrace(axis, { day: (t) => (t >= at(22) ? 1e-12 : 150) }),
+		);
+		const night = buildResponse(ctx, makeSim(ctx, axis, traces)).day;
+		expect(night?.heavy[night.heavy.length - 1]).toBe(0);
+		expect(night?.stops).toEqual({ light: [], typical: [], heavy: [] });
+	});
+
+	test("a line above the cutoff that would round to 0.0 is not a stop and prints 0.1", () => {
+		const response = alikeRun(at(13, 30), (t) => (t < at(14) ? 0.03 : 0));
+		const day = response.day;
+		expect(day?.stops).toEqual(stopAt(at(14)));
+		expect(day?.heavy[day.times.indexOf(at(13, 30))]).toBe(0.1);
+		expect(day?.heavy[day.times.indexOf(at(13, 55))]).toBe(0.1);
+		expect(day?.heavy[day.times.indexOf(at(14))]).toBe(0);
+		expect(validateForecastResponse(response)).toEqual([]);
 	});
 });
 
