@@ -128,12 +128,12 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `moveMinGainPoints` | `FORECAST_MOVE_MIN_GAIN_POINTS` | `forecast_move_min_gain_points` | `2` | 0–100 |
 | `openMinGainPoints` | `FORECAST_OPEN_MIN_GAIN_POINTS` | `forecast_open_min_gain_points` | `1` | 0–100 |
 | `historyHalfLifeDays` | `FORECAST_HISTORY_HALF_LIFE_DAYS` | `forecast_history_half_life_days` | `14` | 1–365 |
-| `historyLookbackDays` | `FORECAST_HISTORY_LOOKBACK_DAYS` | `forecast_history_lookback_days` | `56` | integer 7–365 |
+| `historyLookbackDays` | `FORECAST_HISTORY_LOOKBACK_DAYS` | `forecast_history_lookback_days` | `84` | integer 7–365 |
 | `recentTauMin` | `FORECAST_RECENT_TAU_MIN` | `forecast_recent_tau_min` | `45` | 1–720 |
 | `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
 | `workStartSharePct` | `FORECAST_WORK_START_SHARE_PCT` | `forecast_work_start_share_pct` | `5` | 1–50 |
 
-`historyLookbackDays` and `historyHalfLifeDays` also set how fast the calibrations follow a change of a limit by the provider: both calibrations, and the weekly cap ratio r = k5 ÷ kW, are recomputed at every computation from the stored readings of the last 56 days with a 14-day half-life. After a step change they have moved half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (measured by `packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way 240–246 h, 90 % 822–828 h; kW 318–324 h and 924–942 h; k5 312 h and 906 h).
+`historyLookbackDays` and `historyHalfLifeDays` also set how fast the calibrations follow a change of a limit by the provider: both calibrations, and the weekly cap ratio r = k5 ÷ kW, are recomputed at every computation from the stored readings of the last 84 days with a 14-day half-life. After a step change they have moved half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (measured by `packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way 240–246 h, 90 % 822–828 h; kW 318–324 h and 924–942 h; k5 312 h and 906 h).
 
 How the values are read:
 

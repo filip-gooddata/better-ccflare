@@ -43,7 +43,7 @@ const DEFAULTS = {
 	moveMinGainPoints: 2,
 	openMinGainPoints: 1,
 	historyHalfLifeDays: 14,
-	historyLookbackDays: 56,
+	historyLookbackDays: 84,
 	recentTauMin: 45,
 	sessionTurnoverMin: 60,
 	workStartSharePct: 5,
