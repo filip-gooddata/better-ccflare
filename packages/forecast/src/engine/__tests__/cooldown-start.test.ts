@@ -124,6 +124,38 @@ describe("stopNow starts when the last account went out, a cooldown included (sp
 		});
 	});
 
+	test("out on its limit from 12:00, refused from 13:00, its five-hour reset at 14:00 while the cooldown runs: it counts from 12:00", () => {
+		const limitFrom = NOW - 50 * MIN;
+		const since = NOW - 40 * MIN;
+		const reset = NOW - 30 * MIN;
+		const nextReset = reset + 5 * HOUR;
+		const rs = readings({}).map((r) => {
+			if (r.accountId !== "A" || r.window !== "five_hour") return r;
+			if (r.at >= reset) return { ...r, usedPct: 4, resetsAt: nextReset };
+			return { ...r, usedPct: r.at >= limitFrom ? 100 : 82, resetsAt: reset };
+		});
+		const lastRead = rs[rs.length - 1].at;
+		const a = account("A", {
+			fiveHour: { usedPct: 4, resetsAt: nextReset },
+			weekly: { usedPct: 90, resetsAt: NOW + 50 * HOUR },
+			blockedUntil: NOW + 50 * HOUR,
+			blockedSince: since,
+			readAt: lastRead,
+		});
+		const b = account("B", {
+			fiveHour: { usedPct: 100, resetsAt: B_RESET },
+			weekly: { usedPct: 50, resetsAt: NOW + 100 * HOUR },
+			blockedUntil: null,
+			blockedSince: null,
+			readAt: lastRead,
+		});
+		const ctx = makeCtx({ accounts: [a, b], readings: rs });
+		expect(stopNow(ctx, "day")).toEqual({
+			start: firstReadingFrom(limitFrom),
+			end: B_RESET,
+		});
+	});
+
 	test("a cooldown that began before the first reading: start = blockedSince, not the first reading", () => {
 		const since = FROM - 2 * HOUR;
 		const { ctx: two } = scenario({ blockedSince: since });
