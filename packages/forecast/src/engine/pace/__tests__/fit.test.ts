@@ -178,8 +178,19 @@ describe("fitPaceModel", () => {
 		() => {
 			const state = fitPaceModel(weekly(6), at(42, 0));
 			expect(bandOf(state, "1-2d")).toBeNull();
-			const below = state.belowFloor.find((b) => b.band === "1-2d");
-			expect(below).toBeDefined();
+		},
+		LONG,
+	);
+	test(
+		"below the floor: a relation that holds in every unit so far is reported with its units",
+		() => {
+			// 8 days of the planted predictor: every day gains, 8 day units < 10
+			const s = makeSeries(9, plantedLevels(9, 11));
+			const state = fitPaceModel(s, at(8, 0));
+			expect(bandOf(state, "0-1h")).toBeNull();
+			const below = state.belowFloor.find((b) => b.band === "0-1h");
+			expect(below?.feature as string).toMatch(/^R:/);
+			expect(below?.units as number).toBeGreaterThanOrEqual(2);
 			expect(below?.units as number).toBeLessThan(10);
 		},
 		LONG,

@@ -7,8 +7,11 @@ import type { PaceFitState, PaceNow } from "../types";
 /**
  * The four instants of DESIGN-E4 §12 (Europe/Prague local time) as frozen regression fixtures.
  * Each fixture holds the state fitted on .toolchain/forecast/e4-design/out/series-r3.json cut at
- * the instant (product backfill usage numbers), the last 16 days of that series, and the band
- * multipliers applyPace gave when the fixture was frozen. The generator and its log:
+ * the instant (product backfill usage numbers, series from the local midnight before the first
+ * bucket), the last 16 days of that series, and the expected band multipliers and features from an
+ * independent oracle: the sandbox itself (e4-design/sandbox model3b.ts grammar3 {lags, cal},
+ * cells3 pooled, folds3, screen3, select3 with one feature pooled, e4Bands3 at the instant). The
+ * product matched it to 2e-16 when frozen; clipped comes from the product. The generator and its log:
  * .toolchain/forecast/e4-build/logs/model-fit-gen-instants.*.
  */
 type Fixture = {

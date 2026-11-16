@@ -243,6 +243,8 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 interface Stat {
 	cand: number;
 	nUnits: number;
+	/** Units whose out-of-fold gain is positive. */
+	nPos: number;
 	r2: number;
 	p: number;
 	pass: boolean;
@@ -353,6 +355,7 @@ function fitBand(
 		return {
 			cand: j,
 			nUnits: d.length,
+			nPos: d.filter((v) => v > 0).length,
 			r2: sse0 > 0 ? 1 - sse1 / sse0 : 0,
 			p: signFlipP(d),
 			pass: false,
@@ -532,9 +535,14 @@ function fitBand(
 			: null;
 	let below: PaceFitState["belowFloor"][number] | null = null;
 	if (!feature) {
-		// the best-scoring candidate whose independent units are still below the floor
+		// Passed every test but the floor: positive out-of-fold R^2 and a gain in every unit so far.
+		// Below the floor BH cannot pass at m = 101 (p >= 2^-n > q / m), so a perfect sign
+		// pattern is the case where only the unit count stands in the way.
 		const cand = stats
-			.filter((s) => s.r2 > 0 && s.p < 1 && s.nUnits < floor)
+			.filter(
+				(s) =>
+					s.r2 > 0 && s.nUnits >= 2 && s.nUnits < floor && s.nPos === s.nUnits,
+			)
 			.sort((a, b) => a.p - b.p || b.r2 - a.r2)[0];
 		if (cand)
 			below = {

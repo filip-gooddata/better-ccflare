@@ -12,7 +12,7 @@ import { type BandRows, kernelW } from "./rows";
 import type { PaceCandidate, PaceFitState } from "./types";
 
 /**
- * Day-type comparison at each refit (learned-inputs DESIGN row 1). Reports
+ * Day-type comparison at each refit (learned-inputs DESIGN row 1): a diagnostic, not a validation for switching. Reports
  * only; the served model keeps the present day types. Each weekday partition
  * is scored by the out-of-fold loss of the E4 model under that segmentation,
  * on the same leave-one-ISO-week-out folds: the baseline per (group, slot)

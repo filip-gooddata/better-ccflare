@@ -54,7 +54,12 @@ export interface PaceFitState {
 	/** Selection cells (band x hour per day type) with an established feature, and all cells. */
 	cellsEstablished: number;
 	cellsTotal: number;
-	/** Cells whose best candidate passed every test except the evidence floor: they switch on by themselves as units accrue. */
+	/**
+	 * Bands without a selection whose best candidate passed every test but the evidence floor:
+	 * positive out-of-fold R^2 and a gain in every independent unit so far, with fewer units than
+	 * the floor (below it BH cannot pass at m = 101). It would qualify if the next units also gain;
+	 * that is not a promise it will.
+	 */
 	belowFloor: { band: string; feature: string; units: number }[];
 	/** Slot means (288 local five-minute slots) per served day type, from the complete days before the fit. */
 	baseline: Record<PaceDayTypeName, number[]>;
