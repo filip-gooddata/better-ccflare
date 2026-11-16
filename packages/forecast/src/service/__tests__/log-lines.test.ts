@@ -175,7 +175,7 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		}
 	});
 
-	it("lists at most 12 cells below the floor after their count", () => {
+	it("lists every cell below the floor after their count", () => {
 		const many = Array.from({ length: 15 }, (_, i) => ({
 			band: "1-2d",
 			feature: `C:day-${i}`,
@@ -190,8 +190,9 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 			NOW,
 		);
 		expect(line).toContain("e4floor count=15 1-2d:C:day-0:0 ");
-		expect(line).toContain(" 1-2d:C:day-11:11 more=3 pool=");
-		expect(line).not.toContain("C:day-12");
+		expect(line).toContain(" 1-2d:C:day-11:11 1-2d:C:day-12:12 ");
+		expect(line).toContain(" 1-2d:C:day-14:14 pool=");
+		expect(line).not.toContain("more=");
 	});
 
 	it("ends with the planner's S for the chosen plan and for on demand (amendment 5, E5)", () => {

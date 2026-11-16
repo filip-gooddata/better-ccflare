@@ -95,8 +95,6 @@ const SOURCES = new Set(["own", "borrowed", "none"]);
 const PACE_STATUSES = new Set(["fitted", "unfitted", "off"]);
 const BAND_IDS = new Set(PACE_BANDS.map((b) => b.id));
 const FEATURE_ID = /^[A-Za-z0-9:_.+-]{1,64}$/;
-/** Cells below the evidence floor listed by name after their count; the rest are counted only. */
-const BELOW_FLOOR_LISTED = 12;
 
 function fixed(v: unknown, digits: number): string {
 	return typeof v === "number" && Number.isFinite(v) ? v.toFixed(digits) : "?";
@@ -146,13 +144,9 @@ function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 				`${word(b.band, BAND_IDS)}:${featureId(b.feature)}=${fixed(b.ratio, 2)}x/b${fixed(b.coef, 2)}/lambda${fixed(b.lambda, 2)}${b.clipped ? "/clip" : ""}`,
 		);
 	const below = model?.belowFloor ?? [];
-	const listed = below
-		.slice(0, BELOW_FLOOR_LISTED)
-		.map(
-			(c) =>
-				`${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
-		);
-	const more = below.length - listed.length;
+	const listed = below.map(
+		(c) => `${word(c.band, BAND_IDS)}:${featureId(c.feature)}:${num(c.units)}`,
+	);
 	return [
 		`e4=${word(d.pace.status, PACE_STATUSES)}`,
 		`fitAge=${model ? num(Math.round((now - model.fittedAt) / 60_000)) : "none"}`,
@@ -166,7 +160,6 @@ function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 		"e4floor",
 		`count=${below.length}`,
 		...listed,
-		...(more > 0 ? [`more=${more}`] : []),
 	];
 }
 
