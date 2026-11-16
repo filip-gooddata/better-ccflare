@@ -293,7 +293,7 @@ for the record.
 
 ## Change log
 
-- Revision 7 (PROPOSED, ships with the build that carries it): values only; no field added, removed, renamed
+- Revision 7, 2026-11-16 (ships in pace.9): values only; no field added, removed, renamed
   or retyped. Section 5: `stopNow.start` for a stop that a refusal cooldown made complete is the cooldown's start
   (it was the blocked account's last reading, about one poll before `computedAt`, so the stop appeared to begin
   at the present). `day.past` counts such an account 0 from that start (it stepped down only at `computedAt`).
