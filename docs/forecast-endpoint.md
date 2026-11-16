@@ -1,11 +1,11 @@
-> This is a copy of spec revision 7 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 8 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 7 · 2026-11-16 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 8 · 2026-11-16 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -58,7 +58,7 @@ Clients must ignore fields they do not know.
   does not enter this line; it is reported in `fable`.
   The ratio is not a constant. It is the quotient of two calibrations (5-hour points per demand unit and weekly
   points per demand unit) that the proxy recomputes at every computation from its stored readings of the last
-  56 days, weighted by recency with a half-life of 14 days. It therefore follows a change of a limit by the
+  84 days, weighted by recency with a half-life of 14 days. It therefore follows a change of a limit by the
   provider, but slowly: after a step change it has moved half-way in about 10 to 13 days and 90 % of the way in
   about 5 weeks (measured by the test `calibration-step.test.ts`). The two calibrations follow separately: a
   change of one limit leaves the other calibration unchanged. Until the calibration has caught up, every value
@@ -292,6 +292,12 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 8, 2026-11-16 (ships in pace.11): values only; no field added, removed, renamed or retyped. The
+  default history window is 84 days instead of 56 (`historyLookbackDays`): section 3 now says the calibrations
+  behind the weekly cap are recomputed from the stored readings of the last 84 days. The same build replaces
+  the projection's day factor and recent-rate mix by a pace model learned from history; the served lines keep
+  their shape and meaning. `contractVersion` stays 1.
 
 - Revision 7, 2026-11-16 (ships in pace.9): values only; no field added, removed, renamed
   or retyped. Section 5: `stopNow.start` for a stop that a refusal cooldown made complete is the cooldown's start
