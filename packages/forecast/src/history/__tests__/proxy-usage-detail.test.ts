@@ -11,12 +11,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseOperations } from "@better-ccflare/database";
 import type { ForecastDb } from "../ports";
-import { syncProxyDemand } from "../proxy-demand";
+import {
+	PROXY_SYNC_LAST,
+	PROXY_SYNC_MARKER,
+	syncProxyDemand,
+} from "../proxy-demand";
 import { sessionKey } from "../session-key";
 import {
 	SESSION_SALT_META_KEY,
 	type SessionRequestRow,
 	USAGE_DETAIL_PROXY_SINCE_META_KEY,
+	USAGE_DETAIL_PROXY_THROUGH_META_KEY,
 	type UsageTokenRow,
 } from "../usage-detail";
 
@@ -400,5 +405,213 @@ describe("proxy usage detail", () => {
 		expect(a.length).toBeGreaterThan(0);
 		expect(JSON.stringify(a)).toBe(JSON.stringify(await dump(plain)));
 		expect((await stored(withDetail)).sessions.length).toBeGreaterThan(0);
+	});
+});
+
+const DAY = 24 * 60 * MIN;
+
+/** Records each getClaudeOAuthRequestUsage range the sync asks for. */
+function recording(db: ForecastDb, ranges: [number, number][]): ForecastDb {
+	return new Proxy(db, {
+		get(target, prop, receiver) {
+			const value = Reflect.get(target, prop, receiver);
+			if (typeof value !== "function") return value;
+			if (prop === "getClaudeOAuthRequestUsage") {
+				return (from: number, to: number) => {
+					ranges.push([from, to]);
+					return value.call(target, from, to);
+				};
+			}
+			return value.bind(target);
+		},
+	});
+}
+
+class DiskFullError extends Error {
+	override name = "DiskFullError";
+}
+
+/** Throws from `method` while `failing.on`, with a message that must never surface. */
+function failingDetail(
+	db: ForecastDb,
+	method: string,
+	failing: { on: boolean },
+): ForecastDb {
+	return new Proxy(db, {
+		get(target, prop, receiver) {
+			const value = Reflect.get(target, prop, receiver);
+			if (typeof value !== "function") return value;
+			if (prop === method) {
+				return async (...args: unknown[]) => {
+					if (failing.on) throw new DiskFullError("/private/secret path");
+					return value.apply(target, args);
+				};
+			}
+			return value.bind(target);
+		},
+	});
+}
+
+/** Drops every usage-detail write: the demand sync as it was before usage detail. */
+function noDetail(db: ForecastDb): ForecastDb {
+	return new Proxy(db, {
+		get(target, prop, receiver) {
+			const value = Reflect.get(target, prop, receiver);
+			if (typeof value !== "function") return value;
+			if (
+				["replaceUsageTokens", "replaceSessionRequests"].includes(String(prop))
+			) {
+				return async () => [];
+			}
+			return value.bind(target);
+		},
+	});
+}
+
+const demandDump = (o: DatabaseOperations) =>
+	o
+		.getAdapter()
+		.query(
+			"SELECT * FROM forecast_demand ORDER BY bucket_start, account_id, source",
+		);
+
+async function fullRecompute(all: Req[], now: number) {
+	const full = await openDb();
+	for (const r of all) await insert(full, r);
+	await syncProxyDemand({ db: full }, now);
+	return stored(full);
+}
+
+describe("proxy usage detail: catching up the history", () => {
+	let ops: DatabaseOperations;
+
+	beforeEach(async () => {
+		ops = await openDb();
+	});
+
+	afterEach(() => {
+		for (const o of opened.splice(0)) o.dispose?.();
+	});
+
+	it("fills all retained requests once on an install whose first demand sync ran long ago", async () => {
+		const all = [
+			req("s1", T0 - 3 * DAY),
+			req("s1", T0 - 3 * DAY + 40_000, { split: [5, 6] }),
+			req(null, T0 - 2 * DAY, { account: "acct-b" }),
+			req("s2", T0 - 1 * DAY, { model: "claude-sonnet-4-5" }),
+			req("s3", T0 - 20 * MIN),
+		];
+		for (const r of all) await insert(ops, r);
+		await ops.setForecastMeta(PROXY_SYNC_MARKER, String(T0 - 4 * DAY));
+		await ops.setForecastMeta(PROXY_SYNC_LAST, String(T0 - 5 * MIN));
+
+		const ranges: [number, number][] = [];
+		const db = recording(ops, ranges);
+		const first = await syncProxyDemand({ db }, T0);
+		expect(first.firstRun).toBe(false);
+		expect(ranges).toEqual([
+			[T0 - 65 * MIN, T0 + B],
+			[0, T0 + B],
+		]);
+		expect(first.detailError).toBeUndefined();
+		expect(await ops.getForecastMeta(USAGE_DETAIL_PROXY_THROUGH_META_KEY)).toBe(
+			String(T0 + B),
+		);
+		expect(await stored(ops)).toEqual(await fullRecompute(all, T0));
+		expect((await stored(ops)).sessions).toHaveLength(4);
+
+		const later = req("s1", T0 + 7 * MIN);
+		all.push(later);
+		await insert(ops, later);
+		ranges.length = 0;
+		await syncProxyDemand({ db }, T0 + 10 * MIN);
+		expect(ranges).toEqual([[T0 - 60 * MIN, T0 + 15 * MIN]]);
+		expect(await ops.getForecastMeta(USAGE_DETAIL_PROXY_THROUGH_META_KEY)).toBe(
+			String(T0 + 15 * MIN),
+		);
+		expect(await stored(ops)).toEqual(await fullRecompute(all, T0 + 10 * MIN));
+	});
+
+	for (const method of ["replaceUsageTokens", "replaceSessionRequests"]) {
+		it(`a failing ${method} leaves the demand sync as without usage detail and is caught up later`, async () => {
+			const plain = await openDb();
+			const all: Req[] = [];
+			const add = async (r: Req) => {
+				all.push(r);
+				await insert(ops, r);
+				await insert(plain, r);
+			};
+			const failing = { on: false };
+			const db = failingDetail(ops, method, failing);
+			const bare = noDetail(plain);
+			const meta = async (o: DatabaseOperations) => [
+				await o.getForecastMeta(PROXY_SYNC_MARKER),
+				await o.getForecastMeta(PROXY_SYNC_LAST),
+			];
+			const through = () =>
+				ops.getForecastMeta(USAGE_DETAIL_PROXY_THROUGH_META_KEY);
+
+			await add(req("s1", T0 - 2 * DAY));
+			await add(req("s1", T0 - 10 * MIN));
+			await syncProxyDemand({ db }, T0);
+			await syncProxyDemand({ db: bare }, T0);
+			expect(await through()).toBe(String(T0 + B));
+
+			// usage detail fails over several syncs, long enough that the next
+			// sync demand window no longer reaches the missed requests
+			failing.on = true;
+			await add(req("s2", T0 + 50 * MIN, { account: "acct-b" }));
+			await add(req(null, T0 + 51 * MIN));
+			for (const now of [T0 + 100 * MIN, T0 + 200 * MIN]) {
+				const result = await syncProxyDemand({ db }, now);
+				await syncProxyDemand({ db: bare }, now);
+				expect(result.detailError).toBe("DiskFullError");
+				expect(JSON.stringify(result)).not.toContain("secret");
+				expect(await through()).toBe(String(T0 + B));
+				expect(JSON.stringify(await demandDump(ops))).toBe(
+					JSON.stringify(await demandDump(plain)),
+				);
+				expect(await meta(ops)).toEqual(await meta(plain));
+			}
+
+			failing.on = false;
+			await add(req("s1", T0 + 290 * MIN));
+			const ranges: [number, number][] = [];
+			const ok = await syncProxyDemand(
+				{ db: recording(db, ranges) },
+				T0 + 300 * MIN,
+			);
+			expect(ok.detailError).toBeUndefined();
+			expect(ranges).toEqual([
+				[T0 + 140 * MIN, T0 + 305 * MIN],
+				[T0 + B, T0 + 305 * MIN],
+			]);
+			expect(await through()).toBe(String(T0 + 305 * MIN));
+			expect(await stored(ops)).toEqual(
+				await fullRecompute(all, T0 + 300 * MIN),
+			);
+		});
+	}
+
+	it("a failure on the very first sync leaves through unset, so the next sync rebuilds everything", async () => {
+		const all = [req("s1", T0 - 2 * DAY), req("s2", T0 - 1 * MIN)];
+		for (const r of all) await insert(ops, r);
+		const failing = { on: true };
+		const db = failingDetail(ops, "replaceUsageTokens", failing);
+		const result = await syncProxyDemand({ db }, T0);
+		expect(result.detailError).toBe("DiskFullError");
+		expect(await ops.getForecastMeta(PROXY_SYNC_MARKER)).toBe(String(T0));
+		expect(
+			await ops.getForecastMeta(USAGE_DETAIL_PROXY_THROUGH_META_KEY),
+		).toBeNull();
+
+		failing.on = false;
+		const ranges: [number, number][] = [];
+		await syncProxyDemand({ db: recording(db, ranges) }, T0 + 10 * MIN);
+		expect(ranges).toEqual([
+			[T0 - 60 * MIN, T0 + 15 * MIN],
+			[0, T0 + 15 * MIN],
+		]);
+		expect(await stored(ops)).toEqual(await fullRecompute(all, T0 + 10 * MIN));
 	});
 });

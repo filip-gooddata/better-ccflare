@@ -15,7 +15,10 @@ import {
 } from "../../history/backfill";
 import { createDemandStore } from "../../history/demand-store";
 import type { ForecastDb } from "../../history/ports";
-import { earliestProxyBucket } from "../../history/proxy-demand";
+import {
+	earliestProxyBucket,
+	PROXY_SYNC_MARKER,
+} from "../../history/proxy-demand";
 import {
 	SESSION_SALT_META_KEY,
 	type SessionRequestRow,
@@ -484,6 +487,34 @@ describe("forecast service: one cycle", () => {
 		expect(h.warns.length).toBe(1);
 		expect(h.warns[0]).toContain("sync=db locked");
 		expect(serve(h).available).toBe(true);
+	});
+
+	it("a usage-detail failure is logged by name only and the demand sync still counts as done", async () => {
+		const real = tempDb() as unknown as ForecastDb;
+		const db = new Proxy(real, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (typeof value !== "function") return value;
+				if (prop === "replaceUsageTokens") {
+					return async () => {
+						const error = new Error("/private/conversation/path secret");
+						error.name = "DiskFullError";
+						throw error;
+					};
+				}
+				return value.bind(target);
+			},
+		});
+		const h = harness({ db, settings: { transcriptsDir: "/tmp/transcripts" } });
+		await h.service.runOnce();
+		await flush();
+		expect(h.warns).toEqual([
+			"forecast usage detail sync failed error=DiskFullError",
+		]);
+		expect(h.warns.join("\n")).not.toContain("secret");
+		expect(h.backfills).toEqual(["/tmp/transcripts"]);
+		expect(h.engine.inputs.length).toBe(1);
+		expect(await real.getForecastMeta(PROXY_SYNC_MARKER)).not.toBeNull();
 	});
 });
 
