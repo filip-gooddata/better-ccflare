@@ -14,8 +14,6 @@ import type { DayTable, DayType, RecordedDay, TodaySoFar } from "./model";
 export const MIN_RECORDED_DAYS = 5;
 /** A day type's pool needs this many days; below it monday and workday pool together (design 4.1). */
 export const MIN_POOL_DAYS = 3;
-/** "The last hour" whose mean rate per bucket the blend starts from (design 4.4). */
-export const RECENT_WINDOW_MS = 60 * 60_000;
 /** Work start = median over this many most recent recorded work days with demand: two working weeks, recent enough to follow a changed routine. */
 export const WORK_START_RECENT_DAYS = 10;
 /** Work start = the minute by which this percent of a work day's demand is used, unless settings say otherwise (design amendment A3). */
@@ -31,7 +29,7 @@ export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
 
 /**
  * Complete local days inside [historyFrom, today 00:00) and the lookback, from the
- * pooled history, plus today so far. Every such calendar day is a recorded day:
+ * pooled history, plus today's key and day type. Every such calendar day is a recorded day:
  * a missing bucket is zero demand (ForecastInput.history), so a day with no
  * buckets at all is recorded with total 0 (a weekend without work stays in the
  * weekend pool).
@@ -62,22 +60,10 @@ export function buildDayTable(input: ForecastInput): DayTable {
 		ends.push(end);
 	}
 
-	let unitsSoFar = 0;
-	let recent = 0;
-	let recentFable = 0;
-	// Bucket approximation of the trailing hour: buckets that start in [now − 1 h, now),
-	// the current partial bucket included, divided by the 12 buckets of an hour.
-	const recentFrom = now - RECENT_WINDOW_MS;
 	for (const b of input.history) {
-		if (b.start >= now || b.start < input.historyFrom) continue;
-		if (b.start >= recentFrom) {
-			recent += b.units;
-			recentFable += b.fableUnits;
-		}
-		if (b.start >= todayStart) {
-			unitsSoFar += b.units;
+		// today is incomplete and never in a pool
+		if (b.start >= now || b.start < input.historyFrom || b.start >= todayStart)
 			continue;
-		}
 		let lo = 0;
 		let hi = days.length;
 		while (lo < hi) {
@@ -102,14 +88,10 @@ export function buildDayTable(input: ForecastInput): DayTable {
 		d.fableTotal = fableTotal;
 	}
 
-	const perBucket = RECENT_WINDOW_MS / BUCKET_MS;
 	const today: TodaySoFar = {
 		key: localDayKey(todayStart, tz),
 		start: todayStart,
 		type: dayTypeOf(todayStart, pace),
-		unitsSoFar,
-		recentRate: recent / perBucket,
-		recentFableRate: recentFable / perBucket,
 	};
 	return { days, today };
 }

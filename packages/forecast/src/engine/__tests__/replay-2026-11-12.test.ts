@@ -9,8 +9,9 @@
  * opens at 07:00; the planner scores the unfloored heavy low point S (E2) and may hold an idle
  * account closed when S gains at least openMinGainPoints (E3). The assertions state what the engine
  * achieves on this day, measured, not a wanted number. The sandbox prototype
- * (line-options-2) gave the same values: S +13.8 on demand, +59.9 holding acct-b to 08:00, −3.3
- * for the old 10:00 opening, reason low-point+46.1.
+ * (line-options-2), with the day factor and the last-hour mix since removed, gave S +13.8 on
+ * demand, +59.9 holding acct-b to 08:00, −3.3 for the old 10:00 opening, reason low-point+46.1;
+ * on the plain lines the engine gives the values below.
  */
 import { describe, expect, test } from "bun:test";
 import type { EpochMs, ForecastBlock, ForecastInput } from "../../types";
@@ -69,7 +70,7 @@ const openAtOf = (at: EpochMs | null) => [null, at];
 
 describe("2026-11-12 replay through compute()", () => {
 	test(
-		"on demand the idle acct-b opens at 07:00 on every simulated day (amendment 5, E1); S +13.8, no stop",
+		"on demand the idle acct-b opens at 07:00 on every simulated day (amendment 5, E1); S +13.7, no stop",
 		async () => {
 			const ctx = await contextOf(buildInput(replayFixture()));
 			const { baseline } = await planForecast(ctx);
@@ -78,19 +79,19 @@ describe("2026-11-12 replay through compute()", () => {
 			const opens = firstOpensOfB(baseline.result);
 			expect(opens).toHaveLength(400);
 			for (const at of opens) expect(at).toBe(prague(12, 7));
-			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
-			expect(baseline.score.dayLowPoints).toBeCloseTo(13.77, 1);
-			expect(baseline.score.weekLowPoints).toBeCloseTo(80.6, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
+			expect(baseline.score.dayLowPoints).toBeCloseTo(13.67, 1);
+			expect(baseline.score.weekLowPoints).toBeCloseTo(80.3, 1);
 			expect(base.stops.heavy).toEqual([]);
 			expect(base.stops.typical).toEqual([]);
-			expect(Math.min(...base.heavy)).toBeCloseTo(13.8, 1);
-			expect(Math.min(...base.typical)).toBeCloseTo(27.7, 1);
+			expect(Math.min(...base.heavy)).toBeCloseTo(13.7, 1);
+			expect(Math.min(...base.typical)).toBeCloseTo(27.6, 1);
 		},
 		REPLAY_TIMEOUT_MS,
 	);
 
 	test(
-		"pre-warm off: the plan holds acct-b closed until 08:00 (E3), S +59.9 against +13.8 on demand; no stop is left",
+		"pre-warm off: the plan holds acct-b closed until 08:00 (E3), S +59.8 against +13.7 on demand; no stop is left",
 		async () => {
 			const input = buildInput(replayFixture());
 			const result = await createForecastEngine().compute(input);
@@ -116,12 +117,12 @@ describe("2026-11-12 replay through compute()", () => {
 			});
 			expect(plan.placement).toEqual(result.plan.placement);
 			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8));
-			expect(score.lowPoint).toBeCloseTo(59.88, 1);
-			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
+			expect(score.lowPoint).toBeCloseTo(59.82, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
 			expect(score.lowPoint - baseline.score.lowPoint).toBeCloseTo(46.1, 1);
 			expect(day.stops.heavy).toEqual([]);
 			expect(day.stops.typical).toEqual([]);
-			expect(Math.min(...day.typical)).toBeCloseTo(72.9, 1);
+			expect(Math.min(...day.typical)).toBeCloseTo(72.8, 1);
 
 			// Every opening time searched, the baseline first. Opening at 07:00 is on demand itself; the
 			// old 10:00 opening now scores −3.3 (its heavy stops count below zero).
@@ -132,12 +133,12 @@ describe("2026-11-12 replay through compute()", () => {
 						s.plan.preferred === null &&
 						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
 				)?.score.lowPoint;
-			expect(sOf(prague(12, 7))).toBeCloseTo(13.77, 1);
-			expect(sOf(prague(12, 7, 30))).toBeCloseTo(37.29, 1);
-			expect(sOf(prague(12, 8))).toBeCloseTo(59.88, 1);
-			expect(sOf(prague(12, 9))).toBeCloseTo(52.69, 1);
-			expect(sOf(prague(12, 10))).toBeCloseTo(-3.27, 1);
-			expect(sOf(prague(12, 11))).toBeCloseTo(-24.99, 1);
+			expect(sOf(prague(12, 7))).toBeCloseTo(13.67, 1);
+			expect(sOf(prague(12, 7, 30))).toBeCloseTo(37.22, 1);
+			expect(sOf(prague(12, 8))).toBeCloseTo(59.82, 1);
+			expect(sOf(prague(12, 9))).toBeCloseTo(52.5, 1);
+			expect(sOf(prague(12, 10))).toBeCloseTo(-3.49, 1);
+			expect(sOf(prague(12, 11))).toBeCloseTo(-25.2, 1);
 		},
 		REPLAY_TIMEOUT_MS,
 	);
@@ -224,7 +225,7 @@ describe("2026-11-12 replay through compute()", () => {
 	);
 
 	test(
-		"pre-warm on: the same plan as pre-warm off (hold acct-b to 08:00, S +59.9); the extra pre-warm openings do not win",
+		"pre-warm on: the same plan as pre-warm off (hold acct-b to 08:00, S +59.8); the extra pre-warm openings do not win",
 		async () => {
 			const input = buildInput(
 				replayFixture({ settings: defaultSettings({ prewarm: true }) }),
@@ -246,8 +247,8 @@ describe("2026-11-12 replay through compute()", () => {
 				candidates,
 				result: sim,
 			} = await planForecast(ctx);
-			expect(score.lowPoint).toBeCloseTo(59.88, 1);
-			expect(baseline.score.lowPoint).toBeCloseTo(13.77, 1);
+			expect(score.lowPoint).toBeCloseTo(59.82, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
 			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8));
 			// pre-warm adds openings before work start: 07:15 today and 03:15 to 06:15 tomorrow
 			expect(candidates).toBe(14);
@@ -257,8 +258,8 @@ describe("2026-11-12 replay through compute()", () => {
 						s.plan.preferred === null &&
 						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
 				)?.score.lowPoint;
-			expect(sOf(prague(12, 7, 15))).toBeCloseTo(25.66, 1);
-			expect(sOf(prague(13, 3, 15))).toBeCloseTo(-22.26, 1);
+			expect(sOf(prague(12, 7, 15))).toBeCloseTo(25.56, 1);
+			expect(sOf(prague(13, 3, 15))).toBeCloseTo(-22.45, 1);
 			const day = result.response.day as ForecastBlock;
 			expect(day.stops.heavy).toEqual([]);
 			expect(day.stops.typical).toEqual([]);

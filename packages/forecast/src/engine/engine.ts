@@ -13,6 +13,7 @@ import type {
 	ForecastBlock,
 	ForecastEngine,
 	ForecastInput,
+	ForecastInputsDetail,
 	ForecastResult,
 	InputsCapDetail,
 	InputsLimitDetail,
@@ -20,7 +21,6 @@ import type {
 	UnavailableDetail,
 	UnavailableReason,
 } from "../types";
-import { BUCKET_MS } from "../types";
 import {
 	calibrateWithEvidence,
 	type LimitEvidence,
@@ -43,6 +43,7 @@ import type {
 	PlanLowPoints,
 	RecordedDay,
 } from "./model";
+import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
@@ -70,6 +71,53 @@ export function createForecastEngine(
 				return unavailable(input, "error");
 			}
 		},
+	};
+}
+
+/** The pace model's two steps at a computation; a parameter so tests can plant them. */
+export interface PaceFit {
+	buildPaceSeries: typeof buildPaceSeries;
+	applyPace: typeof applyPace;
+}
+
+/**
+ * Today's pace (E4) for this computation. Off: the plain lines, whatever state was passed.
+ * No state yet: the plain lines, unfitted. Otherwise the state applied to the pooled
+ * demand series up to now, with censoring read from every account's readings (also an
+ * account that cannot take work now: censoring concerns past buckets it may have served).
+ * Neither pace step runs when off or unfitted.
+ */
+export function currentPace(
+	input: ForecastInput,
+	fit: PaceFit = { buildPaceSeries, applyPace },
+): PaceNow {
+	if (!input.settings.paceConditioning) return plainPace("off");
+	const state = input.demandModel;
+	if (!state) return plainPace("unfitted");
+	const series = fit.buildPaceSeries({
+		history: input.history,
+		historyFrom: input.historyFrom,
+		now: input.now,
+		readings: input.readings,
+		accounts: input.accounts.map((a) => a.accountId),
+		timeZone: input.pace.timeZone,
+	});
+	return fit.applyPace(state, series, input.now, true);
+}
+
+/** The demand model's summary for the log line; null without one. */
+function paceModelDetail(
+	input: ForecastInput,
+): ForecastInputsDetail["paceModel"] {
+	const s = input.demandModel;
+	if (!s) return null;
+	return {
+		fittedAt: s.fittedAt,
+		days: s.days,
+		weeks: s.weeks,
+		cellsEstablished: s.cellsEstablished,
+		cellsTotal: s.cellsTotal,
+		belowFloor: s.belowFloor,
 	};
 }
 
@@ -105,7 +153,8 @@ async function prepare(
 	const horizon = computeHorizon(input.now, counted, timeZone);
 	await yieldToEventLoop();
 
-	const scenarios = await buildScenarios(input, table, horizon, options);
+	const pace = currentPace(input);
+	const scenarios = await buildScenarios(input, table, horizon, options, pace);
 	await yieldToEventLoop();
 	const workStart = workStartMinute(
 		table,
@@ -124,9 +173,8 @@ async function prepare(
 		scenarios,
 		workStartMinute: workStart,
 		inputs: {
-			dayFactor: scenarios.diagnostics.day,
-			recentRatePerHour:
-				(scenarios.diagnostics.recentRate * HOUR_MS) / BUCKET_MS,
+			pace: scenarios.diagnostics.pace,
+			paceModel: paceModelDetail(input),
 			pool: {
 				name: poolName(table),
 				days: pool.length,

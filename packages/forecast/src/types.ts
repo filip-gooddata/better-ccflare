@@ -6,6 +6,8 @@
  * through the orchestrator.
  */
 
+import type { PaceFitState } from "./engine/pace/types";
+
 export type AccountId = string;
 export type EpochMs = number;
 
@@ -189,6 +191,8 @@ export interface ForecastSettings {
 	sessionTurnoverMin: number;
 	/** Work start: the local minute by which this percent of a work day's demand has been used (median over recent work days). */
 	workStartSharePct: number;
+	/** E4: scale the projection by today's pace from the fitted demand model; false = the plain lines (multiplier 1). */
+	paceConditioning: boolean;
 }
 
 /** The session-pace values the forecast shares. */
@@ -214,6 +218,7 @@ export interface ForecastInput {
 	/** Recorded readings, ascending: at least since Monday 00:00 local, and as far back as calibration looks. */
 	readings: LimitReading[];
 	sessions: LiveSession[];
+	demandModel?: PaceFitState | null;
 }
 
 export interface PlacementAdvice {
@@ -289,24 +294,6 @@ export type UnavailableDetail =
 	  }
 	| { rule: "calibration"; limits: CalibrationLimitDetail[] };
 
-/** The day factor of design amendment 4 (D1) with its inputs. */
-export interface DayFactorDetail {
-	/** The factor the simulation uses: 1 + (clamped − 1) × weight. */
-	a: number;
-	/** (Y + c) ÷ (M + c). */
-	raw: number;
-	/** raw clamped to [DAY_FACTOR_MIN, DAY_FACTOR_MAX]. */
-	clamped: number;
-	/** Evidence weight min(1, M ÷ c). */
-	weight: number;
-	/** Today's units since local midnight. */
-	y: number;
-	/** The pool's weighted mean units over the same clock span. */
-	m: number;
-	/** DAY_FACTOR_PRIOR_SHARE × the pool's weighted mean daily total. */
-	c: number;
-}
-
 /** One counted account's limit as the forecast-inputs log line names it. */
 export interface InputsLimitDetail {
 	accountId: AccountId;
@@ -338,9 +325,18 @@ export interface InputsCapDetail {
  * For the service's log only: never part of the response.
  */
 export interface ForecastInputsDetail {
-	dayFactor: DayFactorDetail;
-	/** Demand over the last hour, units per hour. */
-	recentRatePerHour: number;
+	/** Today's pace (E4) as the projection used it: status and the multiplier per band. */
+	pace: import("./engine/pace/types").PaceNow;
+	/** The demand model the service passed in, for the log; null without one. */
+	paceModel: Pick<
+		PaceFitState,
+		| "fittedAt"
+		| "days"
+		| "weeks"
+		| "cellsEstablished"
+		| "cellsTotal"
+		| "belowFloor"
+	> | null;
 	/** Today's pool: its own day type, or "weekdays" when monday and workday pool together. */
 	pool: {
 		name: "workday" | "monday" | "weekend" | "weekdays";

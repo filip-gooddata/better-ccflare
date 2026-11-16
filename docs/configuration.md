@@ -132,6 +132,9 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `recentTauMin` | `FORECAST_RECENT_TAU_MIN` | `forecast_recent_tau_min` | `45` | 1–720 |
 | `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
 | `workStartSharePct` | `FORECAST_WORK_START_SHARE_PCT` | `forecast_work_start_share_pct` | `5` | 1–50 |
+| `paceConditioning` | `FORECAST_PACE_CONDITIONING` | `forecast_pace_conditioning` | `true` | boolean |
+
+`paceConditioning` scales the projected demand by today's pace, as learned from the demand history (one multiplier per distance band ahead, 1 where nothing is established). With `false`, or before the first fit, the projection uses the plain lines: recorded days as they were, multiplier 1.
 
 `historyLookbackDays` and `historyHalfLifeDays` also set how fast the calibrations follow a change of a limit by the provider: both calibrations, and the weekly cap ratio r = k5 ÷ kW, are recomputed at every computation from the stored readings of the last 84 days with a 14-day half-life. After a step change they have moved half-way in about 10 to 13 days and 90 % of the way in about 5 weeks, each limit on its own (measured by `packages/forecast/src/engine/__tests__/calibration-step.test.ts`: r half-way 240–246 h, 90 % 822–828 h; kW 318–324 h and 924–942 h; k5 312 h and 906 h).
 
@@ -574,7 +577,7 @@ Response:
 - While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
 - The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
 
-`forecastSettings` is always present. It holds the 19 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`).
+`forecastSettings` is always present. It holds the 20 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`).
 
 `forecast` is present only while the forecast setting `enabled` is `true`:
 
