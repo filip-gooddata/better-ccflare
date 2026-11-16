@@ -4,6 +4,7 @@
  * not import the database at runtime.
  */
 import type { EpochMs } from "../types";
+import type { UsageDetailDb } from "./usage-detail";
 
 export interface ForecastDemandDbRow {
 	bucketStart: EpochMs;
@@ -40,7 +41,7 @@ export interface UsageSnapshotDbRow {
 	resetsAt: EpochMs | null;
 }
 
-export interface ForecastDb {
+export interface ForecastDb extends UsageDetailDb {
 	upsertForecastDemand(rows: ForecastDemandDbRow[]): Promise<void>;
 	/** Replace every row of `source` with bucketStart in [from, to) by `rows`. */
 	replaceForecastDemand(
