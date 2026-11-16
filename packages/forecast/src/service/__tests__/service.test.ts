@@ -34,6 +34,7 @@ import type {
 	PrewarmStatus,
 	SessionTrackerLike,
 } from "../../types";
+import { bucketStart } from "../../units";
 import {
 	createForecastService,
 	FORECAST_MIN_SPACING_MS,
@@ -1153,5 +1154,101 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 			"forecast backfill finished status=unknown files=? unreadable=? lines=? stored=4 skipped: noUsage=? duplicate=? afterCutover=? malformed=? unkeyed=? rows=? cleared=? days=? first=none last=none cutover=none ms=0",
 		);
 		expect(h.infos.join("\n")).not.toMatch(/[\\/]|jsonl|session|Users/);
+	});
+});
+
+describe("forecast service: usage-detail retention", () => {
+	const DAY = 24 * 60 * MIN;
+
+	/** A real database that records each pruneUsageDetail cutoff in order with the sync. */
+	function pruningDb(calls: string[], cutoffs: number[]): ForecastDb {
+		const real = tempDb() as unknown as ForecastDb;
+		return new Proxy(real, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					calls.push(String(prop));
+					if (prop === "pruneUsageDetail") cutoffs.push(args[0] as number);
+					return value.apply(target, args);
+				};
+			},
+		});
+	}
+
+	it("prunes usage detail after the sync to the configured history window", async () => {
+		const calls: string[] = [];
+		const cutoffs: number[] = [];
+		const db = pruningDb(calls, cutoffs);
+		const h = harness({ db, settings: { historyLookbackDays: 7 } });
+		const now = T0 + 2 * MIN + 17;
+		h.time.now = now;
+		await h.service.runOnce();
+
+		expect(cutoffs).toEqual([bucketStart(now - 7 * DAY)]);
+		expect(calls.indexOf("pruneUsageDetail")).toBeGreaterThan(
+			calls.lastIndexOf("replaceForecastDemand"),
+		);
+
+		h.settings.current = settings({ historyLookbackDays: 30 });
+		h.time.now = now + 10 * MIN;
+		await h.service.runOnce();
+		expect(cutoffs[1]).toBe(bucketStart(now + 10 * MIN - 30 * DAY));
+	});
+
+	it("keeps old forecast_demand rows while pruning usage detail", async () => {
+		const calls: string[] = [];
+		const cutoffs: number[] = [];
+		const db = pruningDb(calls, cutoffs);
+		const old = bucketStart(T0 - 400 * DAY);
+		await db.upsertForecastDemand([
+			{
+				bucketStart: old,
+				accountId: "",
+				source: "transcript",
+				units: 1,
+				fableUnits: 0,
+				requestCount: 1,
+			},
+		]);
+		const tokenRow = {
+			bucketStart: old,
+			accountId: "",
+			source: "transcript" as const,
+			family: "opus" as const,
+			requestCount: 1,
+			inputTokens: 1,
+			outputTokens: 1,
+			cacheReadTokens: 0,
+			cacheWriteTokens: 0,
+			cacheWrite5mTokens: 0,
+			cacheWrite1hTokens: 0,
+		};
+		await db.upsertUsageTokens([tokenRow]);
+		const h = harness({ db });
+		await h.service.runOnce();
+
+		expect(
+			await db.getForecastDemandByAccount("transcript", old, old + 1),
+		).toHaveLength(1);
+		expect(await db.getUsageTokens("transcript", old, old + 1)).toEqual([]);
+	});
+
+	it("a failing prune is reported and does not stop the cycle", async () => {
+		const real = tempDb() as unknown as ForecastDb;
+		const db = new Proxy(real, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (prop === "pruneUsageDetail")
+					return async () => {
+						throw new Error("db locked");
+					};
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const h = harness({ db });
+		await h.service.runOnce();
+		expect(h.engine.inputs).toHaveLength(1);
+		expect(h.warns.join("\n")).toContain("prune=");
 	});
 });
