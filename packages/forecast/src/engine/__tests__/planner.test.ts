@@ -1,18 +1,19 @@
 import { describe, expect, test } from "bun:test";
+import type { SimulationResult } from "../model";
 import {
 	compareScores,
 	decidingReason,
 	dueRoutingOpening,
-	OPEN_MIN_STOP_GAIN_MIN,
 	openingBeam,
 	openingEarns,
 	openingGrid,
 	openingReason,
 	type PlanScore,
+	placementOf,
 	planForecast,
 	scorePlan,
 } from "../planner";
-import { onDemandPlan, simulate } from "../simulate";
+import { onDemandPlan, type SimPlan, simulate } from "../simulate";
 import {
 	account,
 	HOUR,
@@ -62,7 +63,7 @@ describe("planForecast: 2026-11-12 shape", () => {
 			`planForecast 400 days: wall ${wallMs.toFixed(0)} ms, ${candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
 		);
 		console.log(
-			`baseline: day low ${baseline.score.dayLowPoints.toFixed(1)}, stop ${baseline.score.stopMinutes} min; plan: day low ${score.dayLowPoints.toFixed(1)}, stop ${score.stopMinutes} min, openAt ${JSON.stringify(
+			`baseline: low point ${baseline.score.lowPoint.toFixed(1)}; plan: low point ${score.lowPoint.toFixed(1)}, openAt ${JSON.stringify(
 				Object.fromEntries(
 					Object.entries(plan.openAt).map(([k, v]) => [
 						k,
@@ -73,25 +74,27 @@ describe("planForecast: 2026-11-12 shape", () => {
 		);
 		// On demand: the first account fills about 13:17, the second about 14:55 → stop to 16:00.
 		const baseOuts = baseline.result.traces[360].outs;
-		// Day 360 of 400 is the heavy (p90) day: first account full 13:16, second 14:54.
+		// Day 360 of 400 is the heavy (p90) day: first account full 13:19, second 14:54. The idle
+		// acct-b opens at the second demand step, 11:05 (amendment 5, E1), so acct-a fills later.
 		expect(baseOuts.slice(0, 2)).toEqual([
-			{ account: 0, at: prague(12, 13, 16), limit: "five_hour" },
+			{ account: 0, at: prague(12, 13, 19), limit: "five_hour" },
 			{ account: 1, at: prague(12, 14, 54), limit: "five_hour" },
 		]);
-		expect(baseline.score.dayLowPoints).toBe(0);
-		expect(baseline.score.stopMinutes).toBe(60);
+		// The heavy day is 62.4 points short (unserved demand counted below zero, amendment 5 E2).
+		expect(baseline.score.lowPoint).toBeCloseTo(-62.4, 1);
 		// The plan opens both windows ahead of work: acct-a at 08:30, acct-b at 09:30 (resets 13:30, 14:30).
 		expect(plan.openAt).toEqual({
 			"acct-a": prague(12, 8, 30),
 			"acct-b": prague(12, 9, 30),
 		});
 		expect(score.dayLowPoints).toBeCloseTo(85.5, 1);
-		expect(score.stopMinutes).toBe(0);
+		expect(score.lowPoint).toBeCloseTo(85.5, 1);
 		expect(plan.placement).toEqual({
 			tiers: [["acct-a"], ["acct-b"]],
 			// New sessions now (07:30) go to acct-a, whose window the plan opens at 08:30, not now.
 			rule: "forecast-lookahead",
-			reason: "open-ahead+85.5",
+			// The gain of S over on demand: 85.5 - (-62.4).
+			reason: "open-ahead+148.0",
 		});
 		expect(plan.computedAt).toBe(ctx.now);
 		expect(plan.workStartMinute).toBe(660);
@@ -129,11 +132,11 @@ describe("planForecast: 2026-11-12 shape", () => {
 	});
 });
 
-describe("planForecast: an early opening for a shorter heavy stop (amendment A2)", () => {
-	test("opens ahead when the heavy low point stays 0 but the heavy stop gets shorter", async () => {
+describe("planForecast: an early opening that serves more of the day (amendment A2, scored by S)", () => {
+	test("opens ahead when the earlier window leaves less demand unserved", async () => {
 		// One closed account; work 09:00–16:00 needs twice what a window holds (a window fills in an hour).
 		// On demand the window opens at 09:00; opened at 05:00 instead, it resets at 10:00 and serves a
-		// third hour of the day. The heavy lowest point is 0 either way; the weekly line barely moves.
+		// third hour of the day: 100 points less unserved, so S rises from -500 to -400.
 		const ctx = makeCtx({
 			now: prague(12, 4),
 			days: 20,
@@ -145,84 +148,47 @@ describe("planForecast: an early opening for a shorter heavy stop (amendment A2)
 			workStartMinute: 540,
 		});
 		const { plan, score, baseline } = await planForecast(ctx);
-		expect(baseline.score.dayLowPoints).toBe(0);
-		expect(score.dayLowPoints).toBe(0);
-		expect(score.item1).toBe(baseline.score.item1);
-		// Amendment 2 (B2): fewer stop minutes outrank the weekly share, which moves by hundredths of a point.
-		expect(
-			Math.abs(score.item2 - baseline.score.item2) * score.poolPoints,
-		).toBeLessThan(0.5);
-		expect(baseline.score.stopMinutes).toBe(830);
-		expect(score.stopMinutes).toBe(595);
+		expect(baseline.score.lowPoint).toBeCloseTo(-500, 3);
+		expect(score.lowPoint).toBeCloseTo(-400, 3);
 		expect(plan.openAt).toEqual({ "acct-a": prague(12, 5) });
 	}, 30_000);
 
 	const base: PlanScore = {
-		item1: 0,
-		item2: 0.9,
-		stopMinutes: 120,
-		typicalShare: 0.2,
+		lowPoint: 0,
+		otherLow: 180,
 		dayLowPoints: 0,
 		weekLowPoints: 180,
+		typicalLow: 40,
+		departures: 0,
 		poolPoints: 200,
 	};
 
-	test("a tie on item 1 earns the opening when the stop falls by one 5-minute step", () => {
-		expect(OPEN_MIN_STOP_GAIN_MIN).toBe(5);
-		expect(openingEarns({ ...base, stopMinutes: 115 }, base, 1)).toBe(true);
-		// Item 1 equal and the other share within the tier tolerance (0.5 points of a 200-point pool).
-		expect(
-			openingEarns(
-				{ ...base, item2: base.item2 - 0.4 / 200, stopMinutes: 100 },
-				base,
-				1,
-			),
-		).toBe(true);
-	});
-
-	test("a tie on item 1 does not earn the opening when the stop falls by less than a step", () => {
-		expect(openingEarns({ ...base, stopMinutes: 116 }, base, 1)).toBe(false);
-		expect(openingEarns(base, base, 1)).toBe(false);
-	});
-
-	test("rule (b) needs a tie: a gain of item 1 above the tolerance but below openMinGainPoints does not earn the opening", () => {
-		// Literal amendment A2: 0.6 points is outside the 0.5-point tolerance and below 1 point.
-		expect(
-			openingEarns(
-				{ ...base, item1: base.item1 + 0.6 / 200, stopMinutes: 60 },
-				base,
-				1,
-			),
-		).toBe(false);
-	});
-
 	test("the beam keeps an opening that earns its place alone when the best-scored ones do not", () => {
-		const up = (at: number, points: number) => ({
+		const up = (at: number, points: number, typical = 40) => ({
 			at,
-			score: { ...base, item1: base.item1 + points / 200 },
+			score: { ...base, lowPoint: points, typicalLow: typical },
 		});
-		const shorter = { at: 5, score: { ...base, stopMinutes: 60 } };
-		const singles = [up(1, 0.9), up(2, 0.8), up(3, 0.7), up(4, 0.6), shorter];
-		expect(openingBeam(singles, base, 1)).toEqual([1, 2, 5]);
+		// Within 0.5 points of S the typical low ranks first, so openings 1 to 4 outrank opening 5,
+		// which alone gains openMinGainPoints (0.45 against 0.4 and less); all five share S's 0.5 bin.
+		const singles = [
+			up(1, 0.4, 90),
+			up(2, 0.3, 80),
+			up(3, 0.2, 70),
+			up(4, 0.1, 60),
+			up(5, 0.45),
+		];
+		expect(openingBeam(singles, base, 0.45)).toEqual([1, 2, 5]);
 		// When one of the best already earns its place, the beam is the best three.
-		expect(openingBeam([up(0, 1.5), ...singles], base, 1)).toEqual([0, 1, 2]);
+		expect(openingBeam([up(0, 1.5), ...singles], base, 0.45)).toEqual([
+			0, 1, 2,
+		]);
 	});
 
-	test("a gain of item 1 by openMinGainPoints earns the opening as before", () => {
-		const up = { ...base, item1: base.item1 + 1 / 200, stopMinutes: 130 };
-		expect(openingEarns(up, base, 1)).toBe(true);
-		expect(openingEarns(up, base, 2)).toBe(false);
-	});
-
-	test("reason tokens: an item 1 gain of openMinGainPoints first, else the stop minutes cut", () => {
-		expect(openingReason(85.46, 60, 1)).toBe("open-ahead+85.5");
-		expect(openingReason(0, 175, 1)).toBe("open-ahead-stop-175min");
-		expect(openingReason(0.01, 5, 1)).toBe("open-ahead-stop-5min");
-		// A gain below openMinGainPoints names the stop minutes when rule (b) is what holds.
-		expect(openingReason(0.3, 25, 1)).toBe("open-ahead-stop-25min");
-		// Otherwise a gain still worth naming is named as before.
-		expect(openingReason(0.3, 0, 1)).toBe("open-ahead+0.3");
-		expect(openingReason(0.01, 4, 1)).toBeNull();
+	test("reason tokens: the gain of S, when worth naming", () => {
+		expect(openingReason(85.46)).toBe("open-ahead+85.5");
+		expect(openingReason(0.3)).toBe("open-ahead+0.3");
+		expect(openingReason(0.01)).toBeNull();
+		expect(openingReason(-2)).toBeNull();
 	});
 });
 
@@ -262,14 +228,18 @@ describe("planForecast: pre-warm off, a routing-opening whose time has come", ()
 		});
 	}
 
-	test("the plan opens acct-b now and the placement sends new sessions there (forecast-open)", async () => {
+	test("on demand already opens acct-b now (amendment 5, E1); the placement sends new sessions there (forecast-open)", async () => {
 		const ctx = at10();
-		const { plan, score, baseline } = await planForecast(ctx);
-		expect(plan.openAt).toEqual({ "acct-b": ctx.now });
-		expect(score.stopMinutes).toBeLessThan(baseline.score.stopMinutes);
-		expect(plan.placement?.rule).toBe("forecast-open");
-		expect(plan.placement?.tiers[0]).toEqual(["acct-b"]);
-		expect(plan.placement?.tiers.flat().sort()).toEqual(["acct-a", "acct-b"]);
+		const { plan, score, baseline, result } = await planForecast(ctx);
+		expect(plan.openAt).toEqual({ "acct-b": null });
+		expect(score.lowPoint).toBe(baseline.score.lowPoint);
+		for (const trace of result.traces)
+			expect(trace.opens[0]).toEqual({ account: 1, at: ctx.now });
+		expect(plan.placement).toEqual({
+			tiers: [["acct-b"], ["acct-a"]],
+			rule: "forecast-open",
+			reason: "no-preference",
+		});
 	}, 30_000);
 
 	test("only an account that can take work now is a due routing-opening, and only with pre-warm off", () => {
@@ -296,122 +266,66 @@ describe("planForecast: pre-warm off, a routing-opening whose time has come", ()
 	});
 });
 
-describe("score order and opening rule (amendment 2)", () => {
+describe("placement reason tokens (amendment 2 B4, scored by S)", () => {
 	const score = (over: Partial<PlanScore>): PlanScore => ({
-		item1: 0.4,
-		item2: 0.8,
-		stopMinutes: 0,
-		typicalShare: 0.5,
+		lowPoint: 80,
+		otherLow: 160,
 		dayLowPoints: 80,
 		weekLowPoints: 160,
+		typicalLow: 100,
+		departures: 0,
 		poolPoints: 200,
 		...over,
 	});
 
-	test("B2: the smaller low-point share decides first", () => {
-		const a = score({ item1: 0.41, stopMinutes: 60, item2: 0.5 });
-		const b = score({ item1: 0.4 });
-		expect(compareScores(a, b)).toBeLessThan(0);
-		expect(compareScores(b, a)).toBeGreaterThan(0);
-	});
-
-	test("B2: on a tie of item 1, fewer heavy stop minutes win over a higher other share", () => {
-		const shorter = score({ item1: 0, stopMinutes: 30, item2: 0.4 });
-		const longer = score({ item1: 0, stopMinutes: 120, item2: 0.9 });
-		expect(compareScores(shorter, longer)).toBeLessThan(0);
-		expect(compareScores(longer, shorter)).toBeGreaterThan(0);
-	});
-
-	test("B2: the other share decides on equal stop minutes, then the typical share", () => {
-		expect(
-			compareScores(score({ item2: 0.9, typicalShare: 0.1 }), score({})),
-		).toBeLessThan(0);
-		expect(compareScores(score({ typicalShare: 0.6 }), score({}))).toBeLessThan(
-			0,
-		);
-		expect(compareScores(score({}), score({}))).toBe(0);
-	});
-
-	test("B3(a): an opening earns when item 1 rises by openMinGainPoints", () => {
-		const base = score({ item1: 0.2 });
-		expect(openingEarns(score({ item1: 0.2 + 1 / 200 }), base, 1)).toBe(true);
-		expect(openingEarns(score({ item1: 0.2 + 0.9 / 200 }), base, 1)).toBe(
-			false,
-		);
-	});
-
-	test("B3(b): a tie of item 1 earns the opening when the stop falls by a step, even with a lower other share", () => {
-		const base = score({ item1: 0, stopMinutes: 120, item2: 0.9 });
-		// Serving more demand lowers the other share far beyond the tolerance; that no longer counts against the opening.
-		expect(
-			openingEarns(
-				score({ item1: 0, stopMinutes: 0, item2: 0.9 - 2.34 / 200 }),
-				base,
-				1,
-			),
-		).toBe(true);
-		expect(
-			openingEarns(
-				score({ item1: 0.4 / 200, stopMinutes: 115, item2: 0.5 }),
-				base,
-				1,
-			),
-		).toBe(true);
-		// Item 1 lower beyond the tolerance: no tie, no opening.
-		expect(
-			openingEarns(
-				score({ item1: 0.4, stopMinutes: 0 }),
-				score({ item1: 0.4 + 0.6 / 200, stopMinutes: 120 }),
-				1,
-			),
-		).toBe(false);
-	});
-
-	test("B3: never for items 3 or 4 alone", () => {
-		const base = score({});
-		expect(openingEarns(score({ item2: 0.95 }), base, 1)).toBe(false);
-		expect(openingEarns(score({ typicalShare: 0.9 }), base, 1)).toBe(false);
-		expect(
-			openingEarns(score({ item2: 0.95, typicalShare: 0.9 }), base, 1),
-		).toBe(false);
-	});
-
 	test("B4: the placement reason names the deciding score item and its gain", () => {
-		const next = score({ item1: 0, stopMinutes: 60 });
-		expect(decidingReason(score({ item1: 12.4 / 200 }), next)).toBe(
+		expect(decidingReason(score({ lowPoint: 92.4 }), score({}))).toBe(
 			"low-point+12.4",
 		);
-		expect(decidingReason(score({ item1: 0, stopMinutes: 25 }), next)).toBe(
-			"stop-shorter+35min",
-		);
-		// Item 3 is the weekly low point when that is the larger share.
-		expect(decidingReason(score({ item2: 0.8 + 0.4 / 200 }), score({}))).toBe(
-			"weekly-low+0.4",
+		// The other limit is the weekly low point when that is the larger.
+		expect(decidingReason(score({ otherLow: 160.6 }), score({}))).toBe(
+			"weekly-low+0.6",
 		);
 		expect(
 			decidingReason(
 				score({
-					item1: 0.3,
-					item2: 0.6 + 0.4 / 200,
-					dayLowPoints: 120.4,
+					lowPoint: 60,
+					otherLow: 120.6,
+					dayLowPoints: 120.6,
 					weekLowPoints: 60,
 				}),
-				score({ item1: 0.3, item2: 0.6, dayLowPoints: 120, weekLowPoints: 60 }),
+				score({
+					lowPoint: 60,
+					otherLow: 120,
+					dayLowPoints: 120,
+					weekLowPoints: 60,
+				}),
 			),
-		).toBe("five-hour-low+0.4");
+		).toBe("five-hour-low+0.6");
+		expect(decidingReason(score({ typicalLow: 101.2 }), score({}))).toBe(
+			"typical-low+1.2",
+		);
+		// Within the tolerance the order holds too: a small S gain is named before a larger typical one.
 		expect(
-			decidingReason(score({ typicalShare: 0.5 + 1.2 / 200 }), score({})),
-		).toBe("typical-low+1.2");
+			decidingReason(score({ lowPoint: 80.3, typicalLow: 100.4 }), score({})),
+		).toBe("low-point+0.3");
+		// Departures alone name nothing.
+		expect(decidingReason(score({}), score({ departures: 1 }))).toBeNull();
 		expect(decidingReason(score({}), score({}))).toBeNull();
 	});
 
 	test("B4: a gain too small for one decimal keeps one significant digit instead of +0.0", () => {
-		expect(decidingReason(score({ item1: 0.4 + 0.004 / 200 }), score({}))).toBe(
+		expect(decidingReason(score({ lowPoint: 80.004 }), score({}))).toBe(
 			"low-point+0.004",
 		);
-		expect(
-			decidingReason(score({ typicalShare: 0.5 + 0.03 / 200 }), score({})),
-		).toBe("typical-low+0.03");
+		expect(decidingReason(score({ typicalLow: 100.03 }), score({}))).toBe(
+			"typical-low+0.03",
+		);
+	});
+
+	test("equal scores compare equal", () => {
+		expect(compareScores(score({}), score({}))).toBe(0);
+		expect(openingEarns(score({}), score({}), 1)).toBe(false);
 	});
 });
 
@@ -442,7 +356,7 @@ describe("planForecast: quota about to reset", () => {
 });
 
 describe("scorePlan", () => {
-	test("no stop minutes for zero quota without demand", async () => {
+	test("zero quota without demand scores 0, not below", async () => {
 		const now = prague(12, 20);
 		const ctx = makeCtx({
 			now,
@@ -454,7 +368,7 @@ describe("scorePlan", () => {
 		});
 		const s = scorePlan(ctx, await simulate(ctx, onDemandPlan(ctx)));
 		expect(s.dayLowPoints).toBe(0);
-		expect(s.stopMinutes).toBe(0);
+		expect(s.lowPoint).toBe(0);
 	});
 });
 
@@ -483,4 +397,113 @@ describe("planForecast cost", () => {
 		expect(longestMs).toBeLessThan(60);
 		expect(wallMs).toBeLessThan(5000);
 	}, 30_000);
+});
+
+describe("placement: a held account goes behind every unheld one (amendment 5, E3)", () => {
+	test("idle acct-a heads, open acct-c follows, held acct-b is last although its plan scores better", () => {
+		const now = prague(12, 7);
+		const ctx = makeCtx({
+			now,
+			accounts: [
+				account({ id: "acct-a" }),
+				account({ id: "acct-b" }),
+				account({ id: "acct-c", fiveUsed: 20, fiveReset: prague(12, 9) }),
+			],
+			rate: () => 0,
+			settings: { prewarm: false },
+		});
+		const score = (lowPoint: number): PlanScore => ({
+			lowPoint,
+			otherLow: 100,
+			dayLowPoints: lowPoint,
+			weekLowPoints: 100,
+			typicalLow: 50,
+			departures: 0,
+			poolPoints: 300,
+		});
+		const plan: SimPlan = {
+			openAt: [null, now + 60 * MIN, null],
+			preferred: null,
+			move: null,
+		};
+		const evaluated = (lowPoint: number) => ({
+			plan,
+			result: null as unknown as SimulationResult,
+			score: score(lowPoint),
+		});
+		const advice = placementOf(
+			ctx,
+			[evaluated(30), evaluated(40), evaluated(20)],
+			evaluated(30),
+			evaluated(30),
+		);
+		expect(advice?.tiers).toEqual([["acct-a"], ["acct-c"], ["acct-b"]]);
+		expect(advice?.rule).toBe("forecast-open");
+	});
+
+	test("with the held account moved out from between them, the reason names the item that dropped the second account", () => {
+		const now = prague(12, 7);
+		const ctx = makeCtx({
+			now,
+			accounts: [
+				account({ id: "acct-a", fiveUsed: 20, fiveReset: prague(12, 10) }),
+				account({ id: "acct-b" }),
+				account({ id: "acct-c", fiveUsed: 20, fiveReset: prague(12, 9) }),
+			],
+			rate: () => 0,
+			settings: { prewarm: false },
+		});
+		const plan: SimPlan = {
+			openAt: [null, now + 60 * MIN, null],
+			preferred: null,
+			move: null,
+		};
+		const evaluated = (
+			lowPoint: number,
+			otherLow: number,
+			typicalLow: number,
+		) => ({
+			plan,
+			result: null as unknown as SimulationResult,
+			score: {
+				lowPoint,
+				otherLow,
+				dayLowPoints: lowPoint,
+				weekLowPoints: otherLow,
+				typicalLow,
+				departures: 0,
+				poolPoints: 300,
+			},
+		});
+		// Tiers by score: a (10.1, 50, 100); b (10.4, 50.4, 90), dropped on the typical low; c (10.3,
+		// 49.8, 100), dropped on the weekly low against a and b. b is held, so c comes second; a ranks
+		// ahead of c by the weekly low (0.2), not by S, where c is 0.2 higher.
+		const a = evaluated(10.1, 50, 100);
+		const advice = placementOf(
+			ctx,
+			[a, evaluated(10.4, 50.4, 90), evaluated(10.3, 49.8, 100)],
+			a,
+			a,
+		);
+		expect(advice?.tiers).toEqual([["acct-a"], ["acct-c"], ["acct-b"]]);
+		expect(advice?.reason).toBe("weekly-low+0.2");
+	});
+});
+
+describe("reason within one tier follows the exact order", () => {
+	test("an S advantage below SCORE_EPS that ranks first is the one named", () => {
+		const s = (over: Partial<PlanScore>): PlanScore => ({
+			lowPoint: 80,
+			otherLow: 160,
+			dayLowPoints: 80,
+			weekLowPoints: 160,
+			typicalLow: 100,
+			departures: 0,
+			poolPoints: 200,
+			...over,
+		});
+		expect(
+			decidingReason(s({ lowPoint: 80 + 5e-10 }), s({ typicalLow: 100.3 })),
+		).toBe("low-point+5e-10");
+	});
 });

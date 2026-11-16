@@ -4,6 +4,7 @@
  * (amendment 4, D2). All are built only from numbers, dates, fixed words and account ids,
  * never from text a transcript or a path could have supplied.
  */
+import type { PlanLowPoints } from "../engine/model";
 import type {
 	EpochMs,
 	ForecastInputsDetail,
@@ -125,7 +126,9 @@ function orNone(v: number | null, digits: number): string {
  * oldest and newest reading it counted, and each account's weekly cap on the day line
  * (r = k5 / kW, and whether it binds now). Numbers, fixed words and account ids only.
  */
-export function inputsLine(d: ForecastInputsDetail): string {
+export function inputsLine(
+	d: ForecastInputsDetail & Partial<PlanLowPoints>,
+): string {
 	const f = d.dayFactor;
 	const limits = d.limits.map(
 		(l) =>
@@ -151,7 +154,24 @@ export function inputsLine(d: ForecastInputsDetail): string {
 		`workStart=${clock(d.workStartMinute)}`,
 		`k: ${limits.join("; ")}`,
 		`cap: ${caps.join("; ")}`,
+		...lowPointFields(d),
 	].join(" ");
+}
+
+/** The planner's S for the chosen plan and for on demand (amendment 5, E5), when the engine gave them. */
+function lowPointFields(d: Partial<PlanLowPoints>): string[] {
+	const { lowPoint, lowPointOnDemand } = d;
+	if (
+		typeof lowPoint !== "number" ||
+		typeof lowPointOnDemand !== "number" ||
+		!Number.isFinite(lowPoint) ||
+		!Number.isFinite(lowPointOnDemand)
+	)
+		return [];
+	return [
+		`lowPoint=${fixed(lowPoint, 1)}`,
+		`lowPointOnDemand=${fixed(lowPointOnDemand, 1)}`,
+	];
 }
 
 /**

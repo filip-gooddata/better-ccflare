@@ -1,14 +1,14 @@
 /**
- * Scenario-based receding-horizon search scored by the lowest point (design 4.7): candidate plans
- * are simulated over all simulated days and ranked leximin on the heavy lines; the first step of
- * the best plan is applied and the search runs again at the next usage poll.
+ * Scenario-based receding-horizon search scored by the lowest point (design 4.7, amendment 5 E2):
+ * candidate plans are simulated over all simulated days and ranked by how low the heavy day sinks,
+ * unserved demand counted below zero; the first step of the best plan is applied and the search runs
+ * again at the next usage poll.
  */
-import { quantileSorted } from "simple-statistics";
 import { addLocalDays, atLocalMinute, localDayStart } from "../time";
 import type { EpochMs, MoveAdvice, PlacementAdvice, Plan } from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { moveCostUnits } from "./move-cost";
-import { levelLines } from "./percentile";
+import { levelOf } from "./percentile";
 import {
 	isOpenNow,
 	onDemandPlan,
@@ -21,11 +21,9 @@ import { yieldToEventLoop } from "./yield";
 const MINUTE_MS = 60_000;
 /** The planner plans against the heavy day: 90th percentile of demand (settled decision 3). */
 const HEAVY_LEVEL = 90;
-/** Typical day: 50th percentile of demand (score item 4). */
+/** Typical day: 50th percentile of demand (tie-break 2). */
 const TYPICAL_LEVEL = 50;
-/** A level line at or below this many points counts as zero (it rounds to 0.0 in the response). */
-const ZERO_LINE_POINTS = 0.05;
-/** Scores closer than this (shares of the pool) are equal: float noise, not a difference. */
+/** Scores closer than this (points) are equal: float noise, not a difference. */
 const SCORE_EPS = 1e-9;
 /** Openings tried, minutes after now: now and the next few hours, enough to place a 5-hour window across a work day. */
 const OPEN_AHEAD_MIN = [0, 30, 60, 120, 180, 240] as const;
@@ -37,227 +35,296 @@ const OPENING_BEAM = 3;
 const MAX_OPENING_COMBOS = 64;
 /** Most live sessions tried as move candidates (largest recent use first): keeps the search bounded. */
 const MAX_MOVE_SESSIONS = 3;
-/** Placement tiers: accounts whose best plans differ by at most this many points on items 1, 3 and 4 share a tier. */
+/** Scores whose low points differ by at most this many points are tied (amendment 5, E2); also the placement tiers. */
 const TIER_TOLERANCE_POINTS = 0.5;
-/** Placement tiers: and by at most this many minutes of heavy stops (score item 2). */
-const TIER_TOLERANCE_STOP_MIN = 5;
-/**
- * Design amendment 2, B3(b): an opening that leaves score item 1 equal within the tier tolerance is
- * still chosen when it cuts the heavy stop minutes (item 2) by at least one 5-minute simulation step.
- */
-export const OPEN_MIN_STOP_GAIN_MIN = 5;
 /** Gains below this many points are not named in a placement reason. */
 const REASON_MIN_GAIN_POINTS = 0.05;
 
 /**
- * Score of one plan, compared in the order of design amendment 2 (B2): item1, stopMinutes, item2,
- * typicalShare. Shares are of the pool (100 × counted accounts).
+ * Score of one plan (design amendment 5, E2), in points of the pool (100 × counted accounts). Higher
+ * is better. Ranked by rankTiers: lowPoint, otherLow and typicalLow each kept within
+ * TIER_TOLERANCE_POINTS of the best value still in play, then fewer departures.
  */
 export interface PlanScore {
-	/** Item 1: the smaller of the heavy 5-hour (next 24 h) and heavy weekly (week horizon) low-point shares. */
-	item1: number;
-	/** Item 3: the other low-point share (the field keeps its old name). */
-	item2: number;
-	/** Item 2: minutes of heavy stops in which demand goes unserved. */
-	stopMinutes: number;
-	/** Item 4: the smaller low-point share on the typical lines. */
-	typicalShare: number;
-	/** Heavy 5-hour low point over the next 24 h, in points. */
+	/** S: the smaller of dayLowPoints and weekLowPoints. */
+	lowPoint: number;
+	/** The larger of the two: the other limit's low. */
+	otherLow: number;
+	/**
+	 * Heavy 5-hour low over the next 24 h: the 10th percentile over simulated days of each day's own
+	 * minimum of the pooled 5-hour line minus k5 × the demand unserved so far (below zero allowed).
+	 */
 	dayLowPoints: number;
-	/** Heavy weekly low point over the week horizon, in points. */
+	/** The same for the weekly line up to the week horizon, with kW. */
 	weekLowPoints: number;
+	/** The smaller of the two lows on the typical day (50th percentile over days). */
+	typicalLow: number;
+	/** Changes from on demand: planned openings or holds, a preference, a move. */
+	departures: number;
 	/** 100 × counted accounts. */
 	poolPoints: number;
 }
 
+/** Mean k of the counted accounts in one calibration table. */
+function meanK(ctx: EngineContext, table: Record<string, number>): number {
+	const ks = ctx.accounts.map((a) => table[a.accountId] ?? 0);
+	return ks.length ? ks.reduce((s, k) => s + k, 0) / ks.length : 0;
+}
+
 /**
  * Unserved demand units as points: units × the mean 5-hour k of the counted accounts (the points the
- * pool would have spent on them). Used for `minStopPoints`.
+ * pool would have spent on them).
  */
 export function unservedPoints(ctx: EngineContext, units: number): number {
-	const ks = ctx.accounts.map(
-		(a) => ctx.calibration.fiveHour[a.accountId] ?? 0,
-	);
-	const mean = ks.length ? ks.reduce((s, k) => s + k, 0) / ks.length : 0;
-	return units * mean;
+	return units * meanK(ctx, ctx.calibration.fiveHour);
 }
 
-function lowestUntil(
-	line: Float64Array,
-	times: EpochMs[],
-	until: EpochMs,
-): number {
-	let low = Number.POSITIVE_INFINITY;
-	for (let i = 0; i < times.length && times[i] <= until; i++)
-		if (line[i] < low) low = line[i];
-	return Number.isFinite(low) ? low : 0;
+/** Changes of a plan from on demand. */
+export function departuresOf(plan: SimPlan): number {
+	return (
+		plan.openAt.filter((at) => at != null).length +
+		(plan.preferred !== null ? 1 : 0) +
+		(plan.move !== null ? 1 : 0)
+	);
 }
 
 /**
- * Heavy unserved demand of a run of samples [from, to): each simulated day's unserved units summed
- * over the run, then the 90th percentile over the days (a pointwise percentile summed over the run
- * would add losses of different days).
+ * Per simulated day, the lowest point of line − k × cumulative unserved units over samples up to
+ * `until`: unserved demand is lost and stays counted below zero for the rest of the day.
  */
-function heavyRunUnserved(
+function dayLows(
 	result: SimulationResult,
-	from: number,
-	to: number,
-): number {
-	const days = result.traces.length;
-	if (days === 0) return 0;
-	const sums = new Float64Array(days);
-	for (let s = 0; s < days; s++) {
-		const unserved = result.traces[s].unserved;
-		let sum = 0;
-		for (let i = from; i < to; i++) sum += unserved[i];
-		sums[s] = sum;
-	}
-	sums.sort();
-	return quantileSorted(sums as unknown as number[], HEAVY_LEVEL / 100);
+	line: "day" | "week",
+	k: number,
+	until: EpochMs,
+): Float64Array {
+	const times = result.axis.times;
+	return Float64Array.from(result.traces, (trace) => {
+		const values = trace[line];
+		let lost = 0;
+		let low = Number.POSITIVE_INFINITY;
+		for (let i = 0; i < times.length && times[i] <= until; i++) {
+			if (i > 0) lost += trace.unserved[i];
+			const value = values[i] - k * lost;
+			if (value < low) low = value;
+		}
+		return Number.isFinite(low) ? low : 0;
+	});
 }
 
-/** Score items 1 to 4 (design 4.7, order of amendment 2 B2) for one simulated plan. */
+/** The score S and its tie-breaks (amendment 5, E2) for one simulated plan. */
 export function scorePlan(
 	ctx: EngineContext,
 	result: SimulationResult,
+	plan: SimPlan | null = null,
 ): PlanScore {
-	const times = result.axis.times;
-	const length = times.length;
-	const poolPoints = 100 * ctx.accounts.length;
-	const [heavyDay, typicalDay] = levelLines(
-		result.traces.map((t) => t.day),
-		length,
-		[HEAVY_LEVEL, TYPICAL_LEVEL],
-	);
-	const [heavyWeek, typicalWeek] = levelLines(
-		result.traces.map((t) => t.week),
-		length,
-		[HEAVY_LEVEL, TYPICAL_LEVEL],
-	);
 	const { fineEnd, weekEnd } = ctx.horizon;
-	const dayLowPoints = lowestUntil(heavyDay, times, fineEnd);
-	const weekLowPoints = lowestUntil(heavyWeek, times, weekEnd);
-	const share = (points: number) => (poolPoints > 0 ? points / poolPoints : 0);
-	const dayShare = share(dayLowPoints);
-	const weekShare = share(weekLowPoints);
-	const typicalShare = Math.min(
-		share(lowestUntil(typicalDay, times, fineEnd)),
-		share(lowestUntil(typicalWeek, times, weekEnd)),
+	const day = dayLows(
+		result,
+		"day",
+		meanK(ctx, ctx.calibration.fiveHour),
+		fineEnd,
 	);
-
-	// Heavy stops: maximal runs where the heavy 5-hour line is zero, counted only when the heavy
-	// unserved demand inside them reaches minStopPoints.
-	const minStop = ctx.input.settings.minStopPoints;
-	let stopMinutes = 0;
-	let i = 1;
-	while (i < length) {
-		if (heavyDay[i - 1] > ZERO_LINE_POINTS || heavyDay[i] > ZERO_LINE_POINTS) {
-			i++;
-			continue;
-		}
-		const runStart = times[i - 1];
-		const first = i;
-		while (
-			i < length &&
-			heavyDay[i - 1] <= ZERO_LINE_POINTS &&
-			heavyDay[i] <= ZERO_LINE_POINTS
-		) {
-			i++;
-		}
-		if (unservedPoints(ctx, heavyRunUnserved(result, first, i)) >= minStop)
-			stopMinutes += (times[i - 1] - runStart) / MINUTE_MS;
-	}
+	const week = dayLows(
+		result,
+		"week",
+		meanK(ctx, ctx.calibration.weekly),
+		weekEnd,
+	);
+	const dayLowPoints = levelOf(day, HEAVY_LEVEL);
+	const weekLowPoints = levelOf(week, HEAVY_LEVEL);
 	return {
-		item1: Math.min(dayShare, weekShare),
-		item2: Math.max(dayShare, weekShare),
-		stopMinutes,
-		typicalShare,
+		lowPoint: Math.min(dayLowPoints, weekLowPoints),
+		otherLow: Math.max(dayLowPoints, weekLowPoints),
 		dayLowPoints,
 		weekLowPoints,
-		poolPoints,
+		typicalLow: Math.min(
+			levelOf(day, TYPICAL_LEVEL),
+			levelOf(week, TYPICAL_LEVEL),
+		),
+		departures: plan ? departuresOf(plan) : 0,
+		poolPoints: 100 * ctx.accounts.length,
 	};
 }
 
+/** A score item compared with TIER_TOLERANCE_POINTS, in ranking order (amendment 5, E2). */
+export type ScoreStage = "low-point" | "other-low" | "typical-low";
+
+const TOLERANCE_STAGES: readonly [ScoreStage, (s: PlanScore) => number][] = [
+	["low-point", (s) => s.lowPoint],
+	["other-low", (s) => s.otherLow],
+	["typical-low", (s) => s.typicalLow],
+];
+
 /**
- * Score order (amendment 2, B2): negative when `a` is the better plan (sorts first), positive when `b`
- * is. Item 1 higher, then fewer heavy stop minutes, then item 3 (`item2`) higher, then the typical share.
+ * The best-anchored selection of one tier (amendment 5, E2): at each tolerance stage in turn, the
+ * plans whose value is within TIER_TOLERANCE_POINTS of the best value among the plans still kept
+ * stay; each other plan drops at that stage. Anchoring to the best value, not to bins or pairs, makes
+ * the result independent of where values sit and of the input order.
  */
-export function compareScores(a: PlanScore, b: PlanScore): number {
-	if (Math.abs(a.item1 - b.item1) > SCORE_EPS) return b.item1 - a.item1;
-	if (Math.abs(a.stopMinutes - b.stopMinutes) > SCORE_EPS)
-		return a.stopMinutes - b.stopMinutes;
-	if (Math.abs(a.item2 - b.item2) > SCORE_EPS) return b.item2 - a.item2;
-	if (Math.abs(a.typicalShare - b.typicalShare) > SCORE_EPS)
-		return b.typicalShare - a.typicalShare;
-	return 0;
+function selectTier<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+): { kept: T[]; dropped: { item: T; stage: ScoreStage }[] } {
+	let kept = [...items];
+	const dropped: { item: T; stage: ScoreStage }[] = [];
+	for (const [stage, value] of TOLERANCE_STAGES) {
+		const best = Math.max(...kept.map((x) => value(scoreOf(x))));
+		const next: T[] = [];
+		for (const x of kept) {
+			if (best - value(scoreOf(x)) <= TIER_TOLERANCE_POINTS + SCORE_EPS)
+				next.push(x);
+			else dropped.push({ item: x, stage });
+		}
+		kept = next;
+	}
+	return { kept, dropped };
 }
 
-function equalWithinTier(a: PlanScore, b: PlanScore): boolean {
-	const tol = TIER_TOLERANCE_POINTS / Math.max(1, a.poolPoints);
+/**
+ * Order inside a tier: fewer departures from on demand, then the exact S, other low and typical low
+ * (higher first), then the key ascending. A total order, so the order does not depend on the input.
+ */
+function compareInTier(
+	a: PlanScore,
+	b: PlanScore,
+	keyA: string | number,
+	keyB: string | number,
+): number {
 	return (
-		Math.abs(a.item1 - b.item1) <= tol &&
-		Math.abs(a.item2 - b.item2) <= tol &&
-		Math.abs(a.typicalShare - b.typicalShare) <= tol &&
-		Math.abs(a.stopMinutes - b.stopMinutes) <= TIER_TOLERANCE_STOP_MIN
+		a.departures - b.departures ||
+		b.lowPoint - a.lowPoint ||
+		b.otherLow - a.otherLow ||
+		b.typicalLow - a.typicalLow ||
+		(keyA < keyB ? -1 : keyA > keyB ? 1 : 0)
 	);
 }
 
-/** Gain of score item 1 from `base` to `next`, in points. */
-function item1GainPoints(next: PlanScore, base: PlanScore): number {
-	return (next.item1 - base.item1) * next.poolPoints;
+/**
+ * Plans ranked into tiers, best first (amendment 5, E2): the first tier is selectTier of all plans,
+ * the next selectTier of the rest, and so on; each tier is ordered by compareInTier. `drops[t]` is
+ * the stage on which a plan left the selection of tier t, for every tier before its own; `droppedAt`
+ * is the last of them (null in the first tier). `keyOf` must differ between distinct plans; it is the
+ * final tie-break.
+ */
+export function rankTiers<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+	keyOf: (item: T) => string | number,
+): RankedPlan<T>[][] {
+	const tiers: RankedPlan<T>[][] = [];
+	let rest: RankedPlan<T>[] = items.map((item) => ({
+		item,
+		droppedAt: null,
+		drops: [],
+	}));
+	while (rest.length > 0) {
+		const { kept, dropped } = selectTier(rest, (x) => scoreOf(x.item));
+		tiers.push(
+			kept.sort((a, b) =>
+				compareInTier(
+					scoreOf(a.item),
+					scoreOf(b.item),
+					keyOf(a.item),
+					keyOf(b.item),
+				),
+			),
+		);
+		rest = dropped.map(({ item, stage }) => ({
+			item: item.item,
+			droppedAt: stage,
+			drops: [...item.drops, stage],
+		}));
+	}
+	return tiers;
+}
+
+/** One plan in rankTiers' result. */
+export interface RankedPlan<T> {
+	item: T;
+	droppedAt: ScoreStage | null;
+	drops: ScoreStage[];
+}
+
+/** The best plan by rankTiers, or null for none. */
+export function selectBest<T>(
+	items: readonly T[],
+	scoreOf: (item: T) => PlanScore,
+	keyOf: (item: T) => string | number,
+): T | null {
+	if (items.length === 0) return null;
+	const { kept } = selectTier(items, scoreOf);
+	return kept.reduce((best, x) =>
+		compareInTier(scoreOf(x), scoreOf(best), keyOf(x), keyOf(best)) < 0
+			? x
+			: best,
+	);
 }
 
 /**
- * The opening rule (amendment 2, B3): a plan with openings ahead of need, `next`, earns them over the
- * same plan without them, `base`, when (a) score item 1 rises by at least `openMinGainPoints`, or
- * (b) item 1 is equal within the tier tolerance and the heavy stop minutes fall by at least
- * OPEN_MIN_STOP_GAIN_MIN. Items 3 and 4 never earn an opening.
+ * Two plans in the order rankTiers gives them: negative when `a` ranks first, positive when `b`
+ * does, 0 when nothing but a key would separate them. For two plans only: ranking more than two
+ * goes through rankTiers, since pairwise tolerance comparisons can cycle.
+ */
+export function compareScores(a: PlanScore, b: PlanScore): number {
+	const { dropped } = selectTier([a, b], (s) => s);
+	if (dropped.length > 0) return dropped[0].item === b ? -1 : 1;
+	return compareInTier(a, b, 0, 0);
+}
+
+/** The stage on which `next` drops against `top` when only the two are ranked; null within one tier. */
+function pairStage(top: PlanScore, next: PlanScore): ScoreStage | null {
+	const { dropped } = selectTier([top, next], (s) => s);
+	return dropped.find((d) => d.item === next)?.stage ?? null;
+}
+
+/** Gain of S from `base` to `next`, in points. */
+function lowPointGain(next: PlanScore, base: PlanScore): number {
+	return next.lowPoint - base.lowPoint;
+}
+
+/**
+ * The opening rule (amendment 5, E2 and E3): a plan whose opening times differ from on demand, `next`,
+ * earns them over the same plan without them, `base`, when S rises by at least `openMinGainPoints`. An
+ * earlier opening and a hold (a later one) are gated alike; the tie-breaks never earn one.
  */
 export function openingEarns(
 	next: PlanScore,
 	base: PlanScore,
 	openMinGainPoints: number,
 ): boolean {
-	if (item1GainPoints(next, base) >= openMinGainPoints) return true;
-	const tol = TIER_TOLERANCE_POINTS / Math.max(1, next.poolPoints);
-	return (
-		Math.abs(next.item1 - base.item1) <= tol &&
-		stopGainMinutes(next, base) >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS
-	);
+	return lowPointGain(next, base) >= openMinGainPoints - SCORE_EPS;
 }
 
 /**
- * Reason token (amendment 2, B4) naming the first score item, in compareScores order, on which `top`
- * differs from `next`, and its gain: `low-point+<points>`, `stop-shorter+<minutes>min`,
- * `weekly-low+<points>` or `five-hour-low+<points>` (item 3), `typical-low+<points>`. Null when the
- * scores are equal. `top` is expected to sort before `next`.
+ * Reason token (amendment 2, B4) naming the score item on which `top` ranks before `next`, and its
+ * gain: `low-point+<points>`, `weekly-low+<points>` or `five-hour-low+<points>` (the other limit),
+ * `typical-low+<points>`. `stage` is the item on which `next` dropped (rankTiers droppedAt); by
+ * default the stage of the two ranked alone. Within one tier: null when departures decide or nothing
+ * differs, else the first item, in stage order, whose exact values differ.
  */
-export function decidingReason(top: PlanScore, next: PlanScore): string | null {
-	const pool = top.poolPoints;
+export function decidingReason(
+	top: PlanScore,
+	next: PlanScore,
+	stage: ScoreStage | null = pairStage(top, next),
+): string | null {
 	// One decimal, or one significant digit for a gain that would show as 0.0.
-	const points = (gain: number) => {
-		const value = gain * pool;
-		return Math.abs(value) >= REASON_MIN_GAIN_POINTS
+	const points = (value: number) =>
+		Math.abs(value) >= REASON_MIN_GAIN_POINTS
 			? value.toFixed(1)
 			: String(Number(value.toPrecision(1)));
-	};
-	if (Math.abs(top.item1 - next.item1) > SCORE_EPS)
-		return `low-point+${points(top.item1 - next.item1)}`;
-	if (Math.abs(top.stopMinutes - next.stopMinutes) > SCORE_EPS)
-		return `stop-shorter+${Math.round(stopGainMinutes(top, next))}min`;
-	if (Math.abs(top.item2 - next.item2) > SCORE_EPS) {
-		const name =
-			top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
-		return `${name}+${points(top.item2 - next.item2)}`;
+	const other = () =>
+		top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
+	const token = (s: ScoreStage, value: (x: PlanScore) => number) =>
+		`${s === "other-low" ? other() : s}+${points(value(top) - value(next))}`;
+	if (stage) {
+		const found = TOLERANCE_STAGES.find(([s]) => s === stage);
+		return found ? token(stage, found[1]) : null;
 	}
-	if (Math.abs(top.typicalShare - next.typicalShare) > SCORE_EPS)
-		return `typical-low+${points(top.typicalShare - next.typicalShare)}`;
+	if (top.departures !== next.departures) return null;
+	for (const [s, value] of TOLERANCE_STAGES)
+		if (value(top) !== value(next)) return token(s, value);
 	return null;
-}
-
-/** Fall of score item 2 (heavy stop minutes) from `base` to `next`. */
-function stopGainMinutes(next: PlanScore, base: PlanScore): number {
-	return base.stopMinutes - next.stopMinutes;
 }
 
 /** Opening times tried for a closed window, ascending, inside [now, fineEnd). */
@@ -288,8 +355,13 @@ function planKey(plan: SimPlan): string {
 	return JSON.stringify(plan);
 }
 
-function better(a: Evaluated, b: Evaluated | null): boolean {
-	return b === null || compareScores(a.score, b.score) < 0;
+/** The best of the candidates by rankTiers, the plan key breaking exact ties. */
+function bestOf(candidates: Evaluated[]): Evaluated | null {
+	return selectBest(
+		candidates,
+		(x) => x.score,
+		(x) => planKey(x.plan),
+	);
 }
 
 export async function planForecast(ctx: EngineContext): Promise<{
@@ -299,6 +371,8 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	baseline: { result: SimulationResult; score: PlanScore };
 	/** Distinct candidate plans simulated, the baseline included. */
 	candidates: number;
+	/** Every candidate plan simulated with its score, in the order simulated (the baseline first). */
+	scored: { plan: SimPlan; score: PlanScore }[];
 }> {
 	const cache = new Map<string, Evaluated>();
 	const evaluate = async (plan: SimPlan): Promise<Evaluated> => {
@@ -307,7 +381,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		if (known) return known;
 		if (cache.size > 0) await yieldToEventLoop();
 		const result = await simulate(ctx, plan);
-		const evaluated = { plan, result, score: scorePlan(ctx, result) };
+		const evaluated = { plan, result, score: scorePlan(ctx, result, plan) };
 		cache.set(key, evaluated);
 		return evaluated;
 	};
@@ -345,26 +419,23 @@ export async function planForecast(ctx: EngineContext): Promise<{
 			),
 		]);
 	}
-	let bestOpening: Evaluated | null = null;
+	const earners: Evaluated[] = [];
 	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
 		const openAt = [...baseline.plan.openAt];
 		closed.forEach((j, x) => {
 			openAt[j] = combo[x];
 		});
 		const candidate = await evaluate({ ...baseline.plan, openAt });
-		if (
-			openingEarns(candidate.score, baseline.score, openMin) &&
-			better(candidate, bestOpening)
-		)
-			bestOpening = candidate;
+		if (openingEarns(candidate.score, baseline.score, openMin))
+			earners.push(candidate);
 	}
-	if (bestOpening) best = bestOpening;
+	best = bestOf(earners) ?? best;
 
-	// 2. Order for unattached demand now: each account preferred in turn.
-	for (let j = 0; j < n; j++) {
-		const candidate = await evaluate({ ...best.plan, preferred: j });
-		if (better(candidate, best)) best = candidate;
-	}
+	// 2. Order for unattached demand now: each account preferred in turn, ranked with the plan so far.
+	const preferences: Evaluated[] = [best];
+	for (let j = 0; j < n; j++)
+		preferences.push(await evaluate({ ...best.plan, preferred: j }));
+	best = bestOf(preferences) ?? best;
 
 	// An opening stays only while it still earns its place (openingEarns) in the final combination;
 	// dropping one can change what another earns, so repeat until nothing drops.
@@ -387,8 +458,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		.filter((s) => s.recentUnits > 0)
 		.sort((a, b) => b.recentUnits - a.recentUnits)
 		.slice(0, MAX_MOVE_SESSIONS);
-	let bestMove: Evaluated | null = null;
-	let bestMoveSession: (typeof movable)[number] | null = null;
+	const moves: Evaluated[] = [];
 	const noMove = best;
 	for (const session of movable) {
 		for (let to = 0; to < n; to++) {
@@ -398,20 +468,18 @@ export async function planForecast(ctx: EngineContext): Promise<{
 				...noMove.plan,
 				move: { sessionId: session.sessionId, to },
 			});
-			if (
-				item1GainPoints(candidate.score, noMove.score) >= moveMin &&
-				better(candidate, bestMove)
-			) {
-				bestMove = candidate;
-				bestMoveSession = session;
-			}
+			if (lowPointGain(candidate.score, noMove.score) >= moveMin)
+				moves.push(candidate);
 		}
 	}
+	const bestMove = bestOf(moves);
+	const bestMoveSession =
+		movable.find((s) => s.sessionId === bestMove?.plan.move?.sessionId) ?? null;
 	if (bestMove?.plan.move && bestMoveSession) {
 		best = bestMove;
 		const to = bestMove.plan.move.to;
 		const target = ctx.accounts[to].accountId;
-		const gain = item1GainPoints(bestMove.score, noMove.score);
+		const gain = lowPointGain(bestMove.score, noMove.score);
 		move = {
 			sessionId: bestMoveSession.sessionId,
 			from: bestMoveSession.accountId,
@@ -447,6 +515,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		score: best.score,
 		baseline: { result: baseline.result, score: baseline.score },
 		candidates: cache.size,
+		scored: [...cache.values()].map(({ plan, score }) => ({ plan, score })),
 	};
 }
 
@@ -454,21 +523,27 @@ function round1(value: number): number {
 	return Math.round(value * 10) / 10;
 }
 
-/** Accounts grouped into tiers of plan scores equal within the tier tolerance, best first. */
-function tiersOf(scored: { score: PlanScore; j: number }[]): number[][] {
-	const order = [...scored].sort(
-		(a, b) => compareScores(a.score, b.score) || a.j - b.j,
+/**
+ * Accounts grouped into the rankTiers tiers of their preference plans, best first, the account index
+ * breaking exact ties; with each account's tier number and the stages on which it dropped.
+ */
+function tiersOf(scored: { score: PlanScore; j: number }[]): {
+	tiers: number[][];
+	rankOf: Map<number, { tier: number; drops: ScoreStage[] }>;
+} {
+	const ranked = rankTiers(
+		scored,
+		(x) => x.score,
+		(x) => x.j,
 	);
-	const tiers: number[][] = [];
-	let head: PlanScore | null = null;
-	for (const { score, j } of order) {
-		if (head && equalWithinTier(head, score)) tiers[tiers.length - 1].push(j);
-		else {
-			tiers.push([j]);
-			head = score;
-		}
-	}
-	return tiers;
+	const rankOf = new Map<number, { tier: number; drops: ScoreStage[] }>();
+	ranked.forEach((tier, t) => {
+		for (const { item, drops } of tier) rankOf.set(item.j, { tier: t, drops });
+	});
+	return {
+		tiers: ranked.map((tier) => tier.map(({ item }) => item.j)),
+		rankOf,
+	};
 }
 
 /**
@@ -489,10 +564,40 @@ export function dueRoutingOpening(ctx: EngineContext, plan: SimPlan): number {
 }
 
 /**
- * Tiers from the plans that prefer each account; null when every account is in one tier. A due
- * routing-opening (dueRoutingOpening) heads the tiers with rule forecast-open.
+ * Closed accounts that can take work now and that the plan does not hold (no opening time, or one
+ * that has come): the simulation sends the next unattached demand to one of them (amendment 5, E1).
  */
-function placementOf(
+function idleUnheld(ctx: EngineContext, plan: SimPlan): number[] {
+	return ctx.accounts
+		.map((_, j) => j)
+		.filter((j) => {
+			const at = plan.openAt[j];
+			return (
+				!isOpenNow(ctx, j) &&
+				canTakeWorkNow(ctx, j) &&
+				(at == null || at <= ctx.now)
+			);
+		});
+}
+
+/** Closed accounts the plan holds until a later opening time (amendment 5, E3). */
+function heldClosed(ctx: EngineContext, plan: SimPlan): number[] {
+	return ctx.accounts
+		.map((_, j) => j)
+		.filter((j) => {
+			const at = plan.openAt[j];
+			return !isOpenNow(ctx, j) && at != null && at > ctx.now;
+		});
+}
+
+/**
+ * Tiers from the plans that prefer each account; null when every account is in one tier. The live
+ * router places a new session in the first tier that can take it, so the tiers carry the plan's
+ * routing (amendment 5, E1 and E3): a due routing-opening (dueRoutingOpening) heads them with rule
+ * forecast-open; else the idle accounts the plan does not hold head them, also forecast-open; an
+ * account the plan holds closed goes behind every other.
+ */
+export function placementOf(
 	ctx: EngineContext,
 	preferred: Evaluated[],
 	baseline: Evaluated,
@@ -500,80 +605,80 @@ function placementOf(
 ): PlacementAdvice | null {
 	if (preferred.length < 2) return null;
 	const plan = best.plan;
-	const tiers = tiersOf(
+	const { tiers, rankOf } = tiersOf(
 		preferred.map((evaluated, j) => ({ score: evaluated.score, j })),
 	);
 	const due = dueRoutingOpening(ctx, plan);
-	if (due >= 0) {
-		const gain = item1GainPoints(best.score, baseline.score);
+	const head = due >= 0 ? [due] : idleUnheld(ctx, plan);
+	const held = heldClosed(ctx, plan).filter((j) => !head.includes(j));
+	if (head.length > 0 && head.length < ctx.accounts.length) {
+		const gain = lowPointGain(best.score, baseline.score);
 		const reason =
-			openingReason(
-				gain,
-				stopGainMinutes(best.score, baseline.score),
-				ctx.input.settings.openMinGainPoints,
-			) ??
+			openingReason(gain) ??
 			decidingReason(best.score, baseline.score) ??
 			"no-preference";
 		const rest = tiers
-			.map((tier) => tier.filter((j) => j !== due))
+			.map((tier) => tier.filter((j) => !head.includes(j) && !held.includes(j)))
 			.filter((tier) => tier.length > 0);
 		return {
-			tiers: [[due], ...rest].map((tier) =>
+			tiers: [head, ...rest, ...(held.length > 0 ? [held] : [])].map((tier) =>
 				tier.map((j) => ctx.accounts[j].accountId),
 			),
 			rule: "forecast-open",
 			reason,
 		};
 	}
-	if (tiers.length < 2) return null;
-	const first = tiers[0][0];
+	const ordered = [
+		...tiers.map((tier) => tier.filter((j) => !held.includes(j))),
+		...tiers.map((tier) => tier.filter((j) => held.includes(j))),
+	].filter((tier) => tier.length > 0);
+	if (ordered.length < 2) return null;
+	const first = ordered[0][0];
 	const top = preferred[first].score;
-	const gain = item1GainPoints(top, baseline.score);
+	const gain = lowPointGain(top, baseline.score);
 	// forecast-open: new sessions go to a closed window that the plan opens now.
 	const plannedAt = plan.openAt[first];
 	const opens =
 		!isOpenNow(ctx, first) &&
 		(plan.preferred === first || (plannedAt != null && plannedAt <= ctx.now));
 	let reason: string;
-	const ahead =
-		plannedAt != null
-			? openingReason(
-					gain,
-					stopGainMinutes(top, baseline.score),
-					ctx.input.settings.openMinGainPoints,
-				)
-			: null;
+	const ahead = plannedAt != null ? openingReason(gain) : null;
 	if (ahead) reason = ahead;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
 		reason = `low-point+${gain.toFixed(1)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
-	else
+	else {
+		// The stage on which the second account dropped from the first account's tier (null inside
+		// one tier). A held second account that ranked above the first is behind it by the hold, not
+		// by score: no score item is named.
+		const second = ordered[1][0];
+		const firstTier = rankOf.get(first)?.tier ?? 0;
+		const rank = rankOf.get(second);
+		const tier = rank?.tier ?? firstTier;
 		reason =
-			decidingReason(top, preferred[tiers[1][0]].score) ?? "no-preference";
+			(tier < firstTier
+				? null
+				: decidingReason(
+						top,
+						preferred[second].score,
+						tier === firstTier ? null : (rank?.drops[firstTier] ?? null),
+					)) ?? "no-preference";
+	}
 	return {
-		tiers: tiers.map((tier) => tier.map((j) => ctx.accounts[j].accountId)),
+		tiers: ordered.map((tier) => tier.map((j) => ctx.accounts[j].accountId)),
 		rule: opens ? "forecast-open" : "forecast-lookahead",
 		reason,
 	};
 }
 
 /**
- * Reason token for a placement whose first account the plan opens ahead of need: `open-ahead+<points>`
- * when score item 1 gains `openMinGainPoints` (rule a), else `open-ahead-stop-<minutes>min` when the heavy
- * stop minutes fall by OPEN_MIN_STOP_GAIN_MIN (rule b), else `open-ahead+<points>` for a smaller gain
- * still worth naming; null otherwise.
+ * Reason token for a placement whose first account has a planned opening: `open-ahead+<points>`, the
+ * gain of S over on demand, when it is worth naming; null otherwise.
  */
-export function openingReason(
-	gainPoints: number,
-	stopGainMin: number,
-	openMinGainPoints: number,
-): string | null {
-	const points = `open-ahead+${gainPoints.toFixed(1)}`;
-	if (gainPoints >= openMinGainPoints && gainPoints >= REASON_MIN_GAIN_POINTS)
-		return points;
-	if (stopGainMin >= OPEN_MIN_STOP_GAIN_MIN - SCORE_EPS)
-		return `open-ahead-stop-${Math.round(stopGainMin)}min`;
-	return gainPoints >= REASON_MIN_GAIN_POINTS ? points : null;
+export function openingReason(gainPoints: number): string | null {
+	return gainPoints >= REASON_MIN_GAIN_POINTS
+		? `open-ahead+${gainPoints.toFixed(1)}`
+		: null;
 }
 
 /**
@@ -587,7 +692,11 @@ export function openingBeam(
 	baseline: PlanScore,
 	openMinGainPoints: number,
 ): EpochMs[] {
-	const sorted = [...singles].sort((x, y) => compareScores(x.score, y.score));
+	const sorted = rankTiers(
+		singles,
+		(x) => x.score,
+		(x) => x.at,
+	).flatMap((tier) => tier.map(({ item }) => item));
 	const beam = sorted.slice(0, OPENING_BEAM);
 	const earns = (x: { score: PlanScore }) =>
 		openingEarns(x.score, baseline, openMinGainPoints);

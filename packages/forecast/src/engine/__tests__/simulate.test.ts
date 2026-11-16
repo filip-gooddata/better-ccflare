@@ -248,10 +248,11 @@ describe("simulate", () => {
 			const [t] = traces;
 			const r = indexAt(axis.times, openAt + 5 * HOUR);
 			expect(axis.times[r + 1]).toBe(openAt + 5 * HOUR);
-			// acct-b took the demand from 08:00 (opening has come), filled at 09:40, reset at 12:00.
+			// acct-b opened at 07:00 (reset 12:00). At 08:00 the idle acct-a took the first 5-minute
+			// step (amendment 5, E1), then acct-b (resets first) the rest: full at 09:45, not 09:40.
 			expect(t.outs[0]).toEqual({
 				account: 1,
-				at: now + 3 * HOUR + 40 * MIN,
+				at: now + 3 * HOUR + 45 * MIN,
 				limit: "five_hour",
 			});
 			expect(t.day[r]).toBeCloseTo(100 + 0 - 20, 3);
@@ -266,15 +267,21 @@ describe("simulate", () => {
 			const r = indexAt(axis.times, openAt + 5 * HOUR);
 			expect(axis.times[r + 1]).toBe(openAt + 5 * HOUR);
 			expect(t.day[r]).toBe(t.day[r + 1]);
+			// At 08:00 the due opening opens acct-b; the idle acct-a then takes the demand (amendment 5,
+			// E1). Both windows run 08:00-13:00; acct-a (lower index on equal resets) fills at 09:40.
+			expect(t.opens).toEqual([
+				{ account: 1, at: now + 2 * HOUR },
+				{ account: 0, at: now + 2 * HOUR },
+			]);
 			expect(t.outs[0]).toEqual({
-				account: 1,
+				account: 0,
 				at: now + 3 * HOUR + 40 * MIN,
 				limit: "five_hour",
 			});
-			// acct-b opened at 08:00, so it is still full at 12:00 and resets at 13:00.
+			// acct-a is still full at 12:00 (acct-b took the last 20 points); both reset at 13:00.
 			expect(t.day[indexAt(axis.times, now + 6 * HOUR)]).toBeCloseTo(80, 3);
 			expect(t.day[indexAt(axis.times, now + 7 * HOUR + 5 * MIN)]).toBeCloseTo(
-				180,
+				200,
 				3,
 			);
 		});
@@ -312,9 +319,9 @@ describe("simulate", () => {
 			]);
 		});
 
-		test("on demand acct-b opens only when acct-a is full", async () => {
+		test("on demand the idle acct-b opens at the first demand (amendment 5, E1)", async () => {
 			const { traces } = await simulate(build(), onDemandPlan(build()));
-			expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8, 40) }]);
+			expect(traces[0].opens).toEqual([{ account: 1, at: now }]);
 		});
 
 		test("a preference for the open account does not hold back the due opening", async () => {
@@ -592,5 +599,139 @@ describe("simulate: the weekly cap on the day line (spec section 3)", () => {
 		expect(axis.times[w + 1]).toBe(weekReset);
 		expect(t.day[w]).toBeCloseTo(50, 9);
 		expect(t.day[w + 1]).toBe(100);
+	});
+});
+
+describe("an idle account first (amendment 5, E1)", () => {
+	// acct-a open until 11:00, acct-b closed; 1 point a minute (k 10, 0.1 units a minute) from 07:00.
+	const now = prague(12, 7);
+	const build = (rate = 0.1) =>
+		makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({ id: "acct-a", fiveReset: prague(12, 11) }),
+				account({ id: "acct-b" }),
+			],
+			k5: { "acct-a": 10, "acct-b": 10 },
+			rate: (_m, _w, at) => (at < prague(12, 11) ? rate : 0),
+			settings: { prewarm: false },
+		});
+	const hold = (at: number): SimPlan => ({
+		openAt: [null, at],
+		preferred: null,
+		move: null,
+	});
+
+	test("on demand the first unattached demand opens the idle account; then the open account that resets first takes it", async () => {
+		const ctx = build();
+		const { traces } = await simulate(ctx, onDemandPlan(ctx));
+		expect(traces[0].opens).toEqual([{ account: 1, at: now }]);
+		// acct-b took the first 5-minute step (5 points); acct-a (reset 11:00, before 12:00) the rest.
+		expect(traces[0].outs[0]).toEqual({
+			account: 0,
+			at: prague(12, 8, 45),
+			limit: "five_hour",
+		});
+	});
+
+	test("a hold keeps the idle account closed until its time; the first demand at or after it opens the window", async () => {
+		const ctx = build(0.02);
+		const { traces } = await simulate(ctx, hold(prague(12, 8)));
+		expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8) }]);
+		expect(traces[0].outs).toEqual([]);
+	});
+
+	test("a hold without demand at its time opens at the first demand after it", async () => {
+		const ctx = makeCtx({
+			now,
+			days: 1,
+			accounts: [
+				account({ id: "acct-a", fiveReset: prague(12, 11) }),
+				account({ id: "acct-b" }),
+			],
+			k5: { "acct-a": 10, "acct-b": 10 },
+			rate: (_m, _w, at) =>
+				at < prague(12, 7, 30) ||
+				(at >= prague(12, 8, 20) && at < prague(12, 11))
+					? 0.02
+					: 0,
+			settings: { prewarm: false },
+		});
+		const { traces } = await simulate(ctx, hold(prague(12, 8)));
+		expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8, 20) }]);
+	});
+
+	test("last resort: a held account still opens when the open account fills", async () => {
+		const ctx = build();
+		const { traces } = await simulate(ctx, hold(prague(12, 10)));
+		expect(traces[0].outs[0]).toEqual({
+			account: 0,
+			at: prague(12, 8, 40),
+			limit: "five_hour",
+		});
+		expect(traces[0].opens).toEqual([{ account: 1, at: prague(12, 8, 40) }]);
+	});
+
+	describe("tie-break among idle accounts", () => {
+		const weekReset = prague(16, 9);
+		const idle = (aWeek: number, bWeek: number) =>
+			makeCtx({
+				now,
+				days: 1,
+				accounts: [
+					account({ id: "acct-a", weekUsed: aWeek, weekReset }),
+					account({ id: "acct-b", weekUsed: bWeek, weekReset }),
+				],
+				k5: { "acct-a": 10, "acct-b": 10 },
+				rate: (_m, _w, at) => (at < prague(12, 8) ? 0.1 : 0),
+				settings: { prewarm: false },
+			});
+
+		test("the larger weekly pace deficit first (less used against the same week)", async () => {
+			const ctx = idle(40, 10);
+			const { traces } = await simulate(ctx, onDemandPlan(ctx));
+			expect(traces[0].opens[0]).toEqual({ account: 1, at: now });
+		});
+
+		test("equal deficits: the lower index first", async () => {
+			const ctx = idle(10, 10);
+			const { traces } = await simulate(ctx, onDemandPlan(ctx));
+			expect(traces[0].opens[0]).toEqual({ account: 0, at: now });
+		});
+	});
+
+	test("failover: an attached session whose account is full moves to the idle account, not to the open one that resets first", async () => {
+		const at = prague(12, 8);
+		const s = session({
+			sessionId: "s1",
+			accountId: "acct-a",
+			lastRequestAt: at,
+			coldAt: at + HOUR,
+			contextTokens: 1_000_000,
+		});
+		const ctx = makeCtx({
+			now: at,
+			days: 1,
+			accounts: [
+				account({ id: "acct-a", fiveUsed: 100, fiveReset: at + 3 * HOUR }),
+				account({ id: "acct-b", fiveUsed: 0, fiveReset: at + HOUR }),
+				account({ id: "acct-c" }),
+			],
+			k5: { "acct-a": 10, "acct-b": 10, "acct-c": 10 },
+			rate: (_m, _w, t) => (t < at + 10 * MIN ? 0.1 : 0),
+			sessions: [s],
+			settings: { sessionTurnoverMin: 1e9 },
+		});
+		const { traces } = await simulate(ctx, onDemandPlan(ctx));
+		expect(traces[0].opens[0]).toEqual({ account: 2, at });
+	});
+
+	test("determinism: the idle-first rule draws nothing random; same input, same traces", async () => {
+		const ctx = build();
+		const a = await simulate(ctx, onDemandPlan(ctx));
+		const b = await simulate(ctx, onDemandPlan(ctx));
+		expect(b.traces[0].opens).toEqual(a.traces[0].opens);
+		expect(Array.from(b.traces[0].day)).toEqual(Array.from(a.traces[0].day));
 	});
 });

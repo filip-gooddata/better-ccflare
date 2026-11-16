@@ -122,6 +122,16 @@ export interface EngineContext {
 }
 
 /**
+ * The planner's score S of the chosen plan and of on demand, in points (design amendment 5, E5).
+ * The engine adds them to the inputs detail for the service's log line only; the HTTP response
+ * never carries them.
+ */
+export interface PlanLowPoints {
+	lowPoint: number;
+	lowPointOnDemand: number;
+}
+
+/**
  * Shared time axis of one simulation run. Starts at now; then every 5 minutes on
  * the clock to horizon.fineEnd, then every full hour to horizon.simEnd (both
  * ends included, simEnd even when not on the hour); plus every deterministic jump time (a reset of a window open now, a
