@@ -866,11 +866,10 @@ async function untilLogged(h: Harness, prefix: string): Promise<string> {
 const DETAIL_LINE = "forecast usage detail backfill finished";
 
 describe("forecast service: usage-detail backfill", () => {
-	it("starts after the existing backfill finishes, whatever its status", async () => {
+	it("with transcriptsDir set after creation, starts after the existing backfill finishes, whatever its status", async () => {
 		const order: string[] = [];
 		const gate = new Deferred();
 		const h = harness({
-			settings: { transcriptsDir: "/tmp/transcripts" },
 			backfill: async () => {
 				order.push("backfill:start");
 				await gate.promise;
@@ -882,6 +881,11 @@ describe("forecast service: usage-detail backfill", () => {
 				return { status: "done" };
 			},
 		});
+		await flush();
+		h.settings.current = {
+			...h.settings.current,
+			transcriptsDir: "/tmp/transcripts",
+		};
 		await h.service.runOnce();
 		await flush();
 		expect(order).toEqual(["backfill:start"]);
@@ -898,13 +902,17 @@ describe("forecast service: usage-detail backfill", () => {
 		expect(order.filter((o) => o.startsWith("detail"))).toHaveLength(1);
 	});
 
-	it("does not start when the existing backfill failed; the next start retries both", async () => {
+	it("with transcriptsDir set after creation, does not start when the existing backfill failed", async () => {
 		const h = harness({
-			settings: { transcriptsDir: "/tmp/transcripts" },
 			backfill: async () => {
 				throw new Error("boom");
 			},
 		});
+		await flush();
+		h.settings.current = {
+			...h.settings.current,
+			transcriptsDir: "/tmp/transcripts",
+		};
 		await h.service.runOnce();
 		await flush();
 		expect(h.usageDetailBackfills).toEqual([]);
@@ -1043,6 +1051,7 @@ describe("forecast service: usage-detail backfill", () => {
 		const db = startupDb(detail);
 		const store = createDemandStore({ db });
 		const root = transcriptsRoot();
+		const beforeAll = await demandSnapshot(db);
 		let afterExisting: string | null = null;
 		const h = harness({
 			settings: { transcriptsDir: root },
@@ -1060,8 +1069,12 @@ describe("forecast service: usage-detail backfill", () => {
 			},
 			usageDetailBackfill: undefined,
 		});
-		await h.service.runOnce();
+		// The new pass runs at creation, before the existing backfill.
 		expect(await untilLogged(h, DETAIL_LINE)).toContain("status=done");
+		expect(await demandSnapshot(db)).toBe(beforeAll);
+		await h.service.runOnce();
+		for (let i = 0; i < 400 && afterExisting === null; i++)
+			await new Promise((r) => setTimeout(r, 5));
 		expect(afterExisting).not.toBe(null);
 		expect(await demandSnapshot(db)).toBe(afterExisting as unknown as string);
 
@@ -1841,6 +1854,26 @@ describe("forecast service: F3 start-up and salt", () => {
 	});
 });
 
+const DAY = 24 * 60 * MIN;
+
+/** One Claude OAuth account and a request at each time, in the database `db` wraps. */
+async function seedClaudeRequests(db: ForecastDb, times: EpochMs[]) {
+	const adapter = (db as unknown as DatabaseOperations).getAdapter();
+	await adapter.run(
+		`INSERT INTO accounts (id, name, provider, refresh_token, access_token, created_at)
+			 VALUES ('acct-a', 'acct-a', 'anthropic', 'refresh-a', 'access-a', 0)`,
+	);
+	for (const [i, at] of times.entries()) {
+		await adapter.run(
+			`INSERT INTO requests (id, timestamp, method, path, account_used, model,
+			   input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+			   client_session_id)
+			 VALUES (?, ?, 'POST', '/v1/messages', 'acct-a', 'claude-opus-4-1', 10, 20, 100, 50, 's1')`,
+			[`req-seed-${i}`, at],
+		);
+	}
+}
+
 function markedStore(): FakeDemandStore {
 	const store = new FakeDemandStore([]);
 	store.meta.set(TRANSCRIPT_BACKFILL_META_KEY, '{"rows":2}');
@@ -1969,14 +2002,156 @@ describe("forecast service: usage-detail pass at creation", () => {
 		await h.service.stop();
 	});
 
-	it("a fresh install (no old marker) does not run the pass at creation", async () => {
+	it("a fresh install (no old marker) runs the pass at creation and leaves the demand backfill to the first cycle", async () => {
 		const h = harness({ settings: { transcriptsDir: "/tmp/transcripts" } });
 		await flush();
 		await flush();
 		expect(h.backfills).toEqual([]);
-		expect(h.usageDetailBackfills).toEqual([]);
+		expect(h.usageDetailBackfills).toEqual(["/tmp/transcripts"]);
 		await h.service.stop();
-		expect(h.usageDetailBackfills).toEqual([]);
+		expect(h.usageDetailBackfills).toEqual(["/tmp/transcripts"]);
+	});
+
+	it("fresh install with Claude OAuth requests: creation alone cuts transcript tokens at the earliest request, and the first cycle stores that cut-over", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const R = T0 - 75 * MIN;
+		await seedClaudeRequests(db, [R, R + 20 * MIN]);
+		const store = createDemandStore({ db });
+		const root = transcriptsRoot();
+		const h = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		expect(await untilLogged(h, DETAIL_LINE)).toContain(
+			"status=done files=2 unreadable=0 lines=4",
+		);
+		expect(h.engine.inputs).toHaveLength(0);
+		const cut = bucketStart(R);
+		const transcriptTokens = () =>
+			[...detail.tokens.values()].filter((r) => r.source === "transcript");
+		const atCreation = transcriptTokens();
+		expect(atCreation.length).toBeGreaterThan(0);
+		expect(atCreation.every((r) => r.bucketStart < cut)).toBe(true);
+		// T0 - 1h is a transcript response at or after the cut-over
+		expect(atCreation.reduce((n, r) => n + r.requestCount, 0)).toBe(3);
+		expect(
+			[...detail.requests.values()].filter((r) => r.source === "transcript"),
+		).toHaveLength(4);
+		expect(await db.getForecastMeta(USAGE_DETAIL_BACKFILL_META_KEY)).not.toBe(
+			null,
+		);
+		expect(await db.getForecastMeta(TRANSCRIPT_BACKFILL_META_KEY)).toBe(null);
+		expect(await db.getForecastMeta(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			null,
+		);
+		expect(await db.getForecastDemandByAccount("proxy", 0, T0 + DAY)).toEqual(
+			[],
+		);
+
+		await h.service.runOnce();
+		for (
+			let i = 0;
+			i < 400 &&
+			(await db.getForecastMeta(TRANSCRIPT_BACKFILL_META_KEY)) === null;
+			i++
+		)
+			await new Promise((r) => setTimeout(r, 5));
+		expect(await db.getForecastMeta(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			String(cut),
+		);
+		const demand = await db.getForecastDemandByAccount("transcript", 0, cut);
+		const demandCounts = new Map<number, number>();
+		for (const row of demand)
+			demandCounts.set(
+				row.bucketStart,
+				(demandCounts.get(row.bucketStart) ?? 0) + row.requestCount,
+			);
+		const tokenCounts = new Map<number, number>();
+		for (const row of transcriptTokens())
+			tokenCounts.set(
+				row.bucketStart,
+				(tokenCounts.get(row.bucketStart) ?? 0) + row.requestCount,
+			);
+		expect(demandCounts.size).toBeGreaterThan(0);
+		expect([...tokenCounts.entries()].sort()).toEqual(
+			[...demandCounts.entries()].sort(),
+		);
+		await h.service.stop();
+		expect(h.infos.filter((m) => m.startsWith(DETAIL_LINE))).toHaveLength(1);
+
+		const before = await fullSnapshot(db, detail);
+		writeFileSync(
+			join(root, "proj", "three.jsonl"),
+			`${transcriptLine(T0 - 4 * 3_600_000, 9)}\n`,
+		);
+		const second = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		expect(await untilLogged(second, DETAIL_LINE)).toContain(
+			"status=already_done files=0 unreadable=0 lines=0",
+		);
+		await second.service.stop();
+		expect(await fullSnapshot(db, detail)).toBe(before);
+	});
+
+	it("fresh install with an empty requests table: creation cuts at the bucket of now; a second service changes nothing", async () => {
+		const detail = new MemoryUsageDetail();
+		const db = startupDb(detail);
+		const store = createDemandStore({ db });
+		const root = transcriptsRoot();
+		// in the bucket of now, so at the cut-over: a session row, never a token row
+		writeFileSync(
+			join(root, "proj", "now.jsonl"),
+			`${transcriptLine(T0 + MIN, 5)}\n`,
+		);
+		const first = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		expect(await untilLogged(first, DETAIL_LINE)).toContain(
+			"status=done files=3 unreadable=0 lines=5",
+		);
+		const tokens = [...detail.tokens.values()];
+		expect(tokens.every((r) => r.source === "transcript")).toBe(true);
+		expect(tokens.every((r) => r.bucketStart < bucketStart(T0))).toBe(true);
+		expect(tokens.reduce((n, r) => n + r.requestCount, 0)).toBe(4);
+		expect(detail.requests.size).toBe(5);
+		expect(await db.getForecastDemandByAccount("proxy", 0, T0 + DAY)).toEqual(
+			[],
+		);
+		expect(await db.getForecastMeta(TRANSCRIPT_BACKFILL_CUTOVER_META_KEY)).toBe(
+			null,
+		);
+		await first.service.stop();
+		expect(first.infos.filter((m) => m.startsWith(DETAIL_LINE))).toHaveLength(
+			1,
+		);
+		expect(first.engine.inputs).toHaveLength(0);
+
+		const before = await fullSnapshot(db, detail);
+		const second = harness({
+			settings: { transcriptsDir: root },
+			db,
+			store,
+			backfill: undefined,
+			usageDetailBackfill: undefined,
+		});
+		expect(await untilLogged(second, DETAIL_LINE)).toContain(
+			"status=already_done files=0 unreadable=0 lines=0",
+		);
+		await second.service.stop();
+		expect(await fullSnapshot(db, detail)).toBe(before);
 	});
 
 	it("does not run at creation without transcriptsDir", async () => {

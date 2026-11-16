@@ -76,11 +76,16 @@ export interface ForecastServiceDeps {
 	/** Defaults to runTranscriptBackfill over `store` and `db`. */
 	backfill?(transcriptsDir: string): Promise<unknown>;
 	/**
-	 * Runs once per service: at creation when the `backfill` marker is already
-	 * set, else after `backfill` succeeds. Defaults to runUsageDetailBackfill over
-	 * `db`, with usageDetailMeta(db) as the meta store.
+	 * Runs once per service, from creation. Before the `backfill` marker is set,
+	 * creation passes `earliestProxyBucket`: the cut-over that backfill will
+	 * take once the first sync has stored every Claude OAuth request. Defaults
+	 * to runUsageDetailBackfill over `db`, with usageDetailMeta(db) as the meta
+	 * store.
 	 */
-	usageDetailBackfill?(transcriptsDir: string): Promise<unknown>;
+	usageDetailBackfill?(
+		transcriptsDir: string,
+		earliestProxyBucket?: () => Promise<EpochMs | null>,
+	): Promise<unknown>;
 	clock: { now(): EpochMs };
 	/** The server passes unref'd timers so none keeps the process alive. */
 	timer: ForecastServiceTimer;
@@ -144,12 +149,16 @@ export function createForecastService(
 			}));
 	const usageDetailBackfill =
 		deps.usageDetailBackfill ??
-		((transcriptsDir: string) =>
+		((
+			transcriptsDir: string,
+			earliest: () => Promise<EpochMs | null> = () =>
+				earliestProxyBucket({ db }),
+		) =>
 			runUsageDetailBackfill({
 				db,
 				meta: usageDetailMeta(db),
 				transcriptsDir,
-				earliestProxyBucket: () => earliestProxyBucket({ db }),
+				earliestProxyBucket: earliest,
 				now: () => clock.now(),
 				historyLookbackDays: deps.settings().historyLookbackDays,
 			}));
@@ -182,12 +191,19 @@ export function createForecastService(
 	};
 
 	/** At most once per service, from creation or from the first cycle; never after stop. */
-	const startUsageDetailBackfill = (dir: string): Promise<void> => {
+	const startUsageDetailBackfill = (
+		dir: string,
+		earliest?: () => Promise<EpochMs | null>,
+	): Promise<void> => {
 		if (usageDetailRun) return usageDetailRun;
 		if (stopped) return Promise.resolve();
 		const startedAt = clock.now();
 		usageDetailRun = Promise.resolve()
-			.then(() => usageDetailBackfill(dir))
+			.then(() =>
+				earliest
+					? usageDetailBackfill(dir, earliest)
+					: usageDetailBackfill(dir),
+			)
 			.then(
 				(result) => {
 					logger.info(usageDetailBackfillLine(result, clock.now() - startedAt));
@@ -201,16 +217,36 @@ export function createForecastService(
 		return usageDetailRun;
 	};
 
-	// Once the demand backfill's marker is set its cut-over is settled, so the
-	// pass need not wait for a usage snapshot that may never come.
+	/**
+	 * The demand backfill's cut-over before its first run: the first sync starts
+	 * at 0 and stores a proxy bucket for every Claude OAuth request, so the
+	 * earliest of those and of the proxy buckets already stored.
+	 */
+	const earliestAfterFirstSync = async (): Promise<EpochMs | null> => {
+		let earliest = await earliestProxyBucket({ db });
+		for (const request of await db.getClaudeOAuthRequestUsage(
+			0,
+			clock.now() + 1,
+		)) {
+			if (earliest === null || request.timestamp < earliest) {
+				earliest = request.timestamp;
+			}
+		}
+		return earliest;
+	};
+
+	// The pass starts at creation, without waiting for a usage snapshot that may
+	// never come. Before the demand backfill has run, it gets the cut-over that
+	// backfill will take.
 	const startupDir = deps.settings().transcriptsDir;
 	const startupCheck: Promise<unknown> = startupDir
 		? Promise.resolve()
 				.then(() => store.getMeta(TRANSCRIPT_BACKFILL_META_KEY))
 				.then(
-					(marker) => {
-						if (marker !== null) return startUsageDetailBackfill(startupDir);
-					},
+					(marker) =>
+						marker !== null
+							? startUsageDetailBackfill(startupDir)
+							: startUsageDetailBackfill(startupDir, earliestAfterFirstSync),
 					(error: unknown) => {
 						logger.warn(
 							`forecast usage detail backfill check failed error=${errorName(error)}`,
