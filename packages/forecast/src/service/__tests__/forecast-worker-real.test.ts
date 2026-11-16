@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { DemandBucket } from "../../types";
 import { createForecastWorkerRunner } from "../forecast-worker-runner";
+import { paceRefitLine } from "../pace-refit-log";
 import { createPaceRefitRunner } from "../pace-refit-runner";
 
 const T0 = Date.UTC(2026, 10, 16, 9, 0);
@@ -93,6 +94,10 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				);
 				expect(outcome.status).toBe("ok");
 				expect(outcome.ms).toBeGreaterThanOrEqual(1_000);
+				console.info(
+					`real refit ms=${Math.round(outcome.ms)} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)}`,
+				);
+				console.info(paceRefitLine(outcome, null, T0));
 				expect(ticks).toBeGreaterThanOrEqual(Math.floor(outcome.ms / 40));
 				expect(maxGap).toBeLessThan(250);
 			} finally {

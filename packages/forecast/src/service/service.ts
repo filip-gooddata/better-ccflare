@@ -72,10 +72,6 @@ export interface PaceRefitDeps {
 	timeoutMs?: number;
 }
 
-/** The setting the model part adds to ForecastSettings; on unless set to false. */
-const paceConditioning = (settings: ForecastSettings) =>
-	(settings as { paceConditioning?: boolean }).paceConditioning !== false;
-
 export interface ForecastServiceTimer {
 	set(fn: () => void, ms: number): unknown;
 	clear(handle: unknown): void;
@@ -332,7 +328,7 @@ export function createForecastService(
 		}, PACE_REFIT_CADENCE_MS);
 		if (refitRunning) return;
 		try {
-			if (!paceConditioning(deps.settings())) return;
+			if (!deps.settings().paceConditioning) return;
 		} catch {
 			return;
 		}

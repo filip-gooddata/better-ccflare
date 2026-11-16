@@ -14,10 +14,24 @@ const state: PaceFitState = {
 	cellsEstablished: 41,
 	cellsTotal: 189,
 	belowFloor: [
-		{ band: "0-1h", feature: "span-60", units: 7 },
-		{ band: "1-2h", feature: "day-k1", units: 9 },
+		{ band: "0-1h", feature: "span-60", units: 7, dayType: "workday", hour: 9 },
+		{ band: "1-2h", feature: "day-k1", units: 9, dayType: "weekend", hour: 14 },
 	],
-	selected: [{ band: "0-1h", feature: "span-60" }],
+	baseline: { workday: [], monday: [], weekend: [] },
+	bands: [
+		{
+			band: "0-1h",
+			feature: { id: "span-60", family: "R", long: false, len: 12, end: 0 },
+			gainSE: 3.21456,
+			units: 64,
+			cells: [],
+		},
+		{ band: "1-2h", feature: null, gainSE: null, units: null, cells: [] },
+	],
+	selected: [
+		{ band: "0-1h", feature: "span-60" },
+		{ band: "1-2h", feature: null },
+	],
 	dayTypeComparison: [
 		{ partition: "present", groups: 3, loss: 0.41234, se: 0.03111 },
 		{ partition: "one", groups: 1, loss: 0.5, se: 0.04 },
@@ -36,7 +50,7 @@ describe("pace refit log line", () => {
 		expect(
 			paceRefitLine({ status: "ok", state, ms: 4210.6 }, null, T0 + MIN),
 		).toBe(
-			"forecast e4 refit status=ok ms=4211 cadenceMin=60 days=84 weeks=12 cells=41/189 belowFloor=2 switchOn=0-1h/span-60/7,1-2h/day-k1/9 candidates=101 floor=10" +
+			"forecast e4 refit status=ok ms=4211 cadenceMin=60 days=84 weeks=12 cells=41/189 selected=0-1h/span-60/3.215/64 belowFloor=2 switchOn=0-1h:workday:9/span-60/7,1-2h:weekend:14/day-k1/9 candidates=101 floor=10" +
 				" daytypes present=0.4123/0.03111 one=0.5/0.04 workday-weekend=0.42/0.031 merged=Mon|TueWedThuFri|SatSun:0.4/0.02999",
 		);
 	});
@@ -64,14 +78,43 @@ describe("pace refit log line", () => {
 					status: "ok",
 					state: {
 						...state,
-						belowFloor: [{ band: "0-1h", feature: "a b/c,d", units: 3 }],
+						belowFloor: [
+							{
+								band: "0-1h",
+								feature: "a b/c,d",
+								units: 3,
+								dayType: "monday",
+								hour: 0,
+							},
+						],
 					},
 					ms: 1,
 				},
 				null,
 				T0,
 			),
-		).toContain(" belowFloor=1 switchOn=0-1h/a_b_c_d/3 ");
+		).toContain(" belowFloor=1 switchOn=0-1h:monday:0/a_b_c_d/3 ");
+	});
+
+	it("writes selected=none when no band selected a feature", () => {
+		const line = paceRefitLine(
+			{
+				status: "ok",
+				state: {
+					...state,
+					bands: state.bands.map((b) => ({
+						...b,
+						feature: null,
+						gainSE: null,
+						units: null,
+					})),
+				},
+				ms: 1,
+			},
+			null,
+			T0,
+		);
+		expect(line).toContain(" cells=41/189 selected=none belowFloor=2 ");
 	});
 
 	it("masks characters outside the id alphabet in partition ids", () => {

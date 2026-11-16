@@ -38,6 +38,8 @@ self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
 				cellsEstablished: 0,
 				cellsTotal: 0,
 				belowFloor: [],
+				baseline: { workday: [], monday: [], weekend: [] },
+				bands: [],
 				selected: [],
 				dayTypeComparison: [],
 			},

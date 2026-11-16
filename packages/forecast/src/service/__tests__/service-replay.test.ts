@@ -135,6 +135,7 @@ function world() {
 		loadLimits: async () => current.input.accounts,
 		scheduler,
 		backfill: async () => {},
+		paceRefit: null,
 		clock,
 		timer,
 		pollIntervalMs: POLL_MS,

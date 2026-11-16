@@ -11,13 +11,28 @@ const num = (x: number) =>
 /** Model ids (bands, features) as logged: anything outside the id alphabet is masked. */
 const ident = (id: string) => id.replace(/[^A-Za-z0-9._-]/g, "_");
 
-/** Cells that pass every test but the evidence floor: band/feature/units each, so they switch on by themselves. */
+const count = (x: number | null) =>
+	x !== null && Number.isFinite(x) ? String(x) : "na";
+
+/** Cells that pass every test but the evidence floor (band:dayType:hour/feature/units each), so they switch on by themselves. */
 function switchOn(state: PaceFitState): string {
 	if (state.belowFloor.length === 0) return "switchOn=none";
 	return `switchOn=${state.belowFloor
 		.map(
-			({ band, feature, units }) =>
-				`${ident(band)}/${ident(feature)}/${Number.isFinite(units) ? units : "na"}`,
+			({ band, dayType, hour, feature, units }) =>
+				`${ident(band)}:${ident(dayType)}:${count(hour)}/${ident(feature)}/${count(units)}`,
+		)
+		.join(",")}`;
+}
+
+/** The pooled selection per band: band/feature/gain in standard errors/independent units. */
+function selected(state: PaceFitState): string {
+	const rows = state.bands.filter((b) => b.feature !== null);
+	if (rows.length === 0) return "selected=none";
+	return `selected=${rows
+		.map(
+			(b) =>
+				`${ident(b.band)}/${ident(b.feature?.id ?? "")}/${b.gainSE === null ? "na" : num(b.gainSE)}/${count(b.units)}`,
 		)
 		.join(",")}`;
 }
@@ -38,7 +53,7 @@ function dayTypes(state: PaceFitState): string {
 
 /**
  * One line per refit, numbers and ids only. On success: what the fit saw and
- * established, and the day-type partitions compared by out-of-fold loss and its
+ * established, the feature selected per band with its gain, and the day-type partitions compared by out-of-fold loss and its
  * standard error. On failure: the reason and the age of the state kept.
  */
 export function paceRefitLine(
@@ -49,7 +64,7 @@ export function paceRefitLine(
 	const head = `forecast e4 refit status=${outcome.status} ms=${Math.round(outcome.ms)} cadenceMin=${PACE_REFIT_CADENCE_MIN}`;
 	if (outcome.status === "ok") {
 		const s = outcome.state;
-		return `${head} days=${s.days} weeks=${s.weeks} cells=${s.cellsEstablished}/${s.cellsTotal} belowFloor=${s.belowFloor.length} ${switchOn(s)} candidates=${s.candidates} floor=${s.floor} ${dayTypes(s)}`;
+		return `${head} days=${s.days} weeks=${s.weeks} cells=${s.cellsEstablished}/${s.cellsTotal} ${selected(s)} belowFloor=${s.belowFloor.length} ${switchOn(s)} candidates=${s.candidates} floor=${s.floor} ${dayTypes(s)}`;
 	}
 	const reason = outcome.status === "timeout" ? "timeout" : outcome.reason;
 	const age =
