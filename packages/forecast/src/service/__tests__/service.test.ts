@@ -1196,6 +1196,8 @@ function fitState(fittedAt: EpochMs, over: Partial<PaceFitState> = {}) {
 		cellsEstablished: 5,
 		cellsTotal: 189,
 		belowFloor: [],
+		baseline: { workday: [], monday: [], weekend: [] },
+		bands: [],
 		selected: [],
 		dayTypeComparison: [],
 		...over,
