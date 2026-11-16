@@ -25,6 +25,12 @@ export {
 } from "./response";
 export { buildScenarios, scaleBandwidth } from "./scenarios";
 export {
+	type DayRanking as EngineDayRanking,
+	MEDIAN_DAY_WINDOW,
+	rankDays as rankEngineDays,
+	serveDay as serveEngineDay,
+} from "./served-day";
+export {
 	onDemandPlan,
 	type SimPlan as EngineSimPlan,
 	simulate as simulatePlan,

@@ -94,14 +94,19 @@ describe("level lines", () => {
 		}
 	});
 
-	test("all 41 lines ordered at every index, after rounding, inserted points included", () => {
+	test("light, the fan and heavy ordered at every index, typical between light and heavy, after rounding, inserted points included", () => {
 		for (const [, block] of blocks) {
-			const lines = blockLines(block);
-			for (let i = 0; i < block.times.length; i++)
-				for (let l = 1; l < lines.length; l++)
-					expect(lines[l].values[i]).toBeLessThanOrEqual(
-						lines[l - 1].values[i],
+			// The typical line is one served day, not a percentile: it is not
+			// ordered against the fan, only clamped into [heavy, light].
+			const chain = blockLines(block).filter((line) => line.level !== 50);
+			for (let i = 0; i < block.times.length; i++) {
+				for (let l = 1; l < chain.length; l++)
+					expect(chain[l].values[i]).toBeLessThanOrEqual(
+						chain[l - 1].values[i],
 					);
+				expect(block.typical[i]).toBeLessThanOrEqual(block.light[i]);
+				expect(block.typical[i]).toBeGreaterThanOrEqual(block.heavy[i]);
+			}
 		}
 	});
 

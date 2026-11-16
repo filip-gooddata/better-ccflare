@@ -38,25 +38,27 @@ describe("2026-11-13 12:06 replay: acct-a in a refusal cooldown", () => {
 		expect(day.pastStops).toEqual([]);
 	});
 
-	test("typical stop 13:21–17:00 with the shortfall on it; heavy stops 12:56–17:00 and 17:52–22:05; light low 0.5", async () => {
+	test("typical stop 13:12–17:00 (the served day's own) with the shortfall on it; heavy stops 12:56–17:00 and 17:52–22:05; light low 0.5", async () => {
 		const { response } = await compute();
 		const day = response.day as ForecastBlock;
 		expect(Math.min(...day.light)).toBeCloseTo(0.5, 5);
 		expect(Math.min(...day.typical)).toBe(0);
 		expect(Math.min(...day.heavy)).toBe(0);
 		expect(day.stops.light).toEqual([]);
+		// The served day (205 of 400) runs out at 13:12; its unserved demand to 17:00 is 211.3
+		// points (13:21 and 259.5 for the pointwise median before the served day).
 		expect(day.stops.typical).toEqual([
-			{ start: prague(13, 13, 21), end: B_RESET },
+			{ start: prague(13, 13, 12), end: B_RESET },
 		]);
 		expect(day.stops.heavy).toEqual([
 			{ start: prague(13, 12, 56), end: B_RESET },
 			{ start: prague(13, 17, 52), end: prague(13, 22, 5) },
 		]);
 		expect(day.shortfall).toEqual({
-			stop: { start: prague(13, 13, 21), end: B_RESET },
-			points: 259.5,
+			stop: { start: prague(13, 13, 12), end: B_RESET },
+			points: 211.3,
 			lastAccount: "acct-b",
-			perAccount: { "acct-a": 79, "acct-b": 180.5 },
+			perAccount: { "acct-a": 79, "acct-b": 132.3 },
 		});
 	});
 

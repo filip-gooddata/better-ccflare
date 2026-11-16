@@ -29,6 +29,15 @@ describe("validateForecastResponse accepts", () => {
 		expect(validateForecastResponse(specNone)).toEqual([]);
 	});
 
+	test("typical outside the fan, between light and heavy", () => {
+		const response = clone(specFull);
+		expect(response.day.typical[1]).toBeLessThan(response.day.fan.p20[1]);
+		response.day.typical[1] = response.day.light[1];
+		response.week.typical[2] = response.week.heavy[2] + 1;
+		expect(response.week.typical[2]).toBeLessThan(response.week.fan.p60[2]);
+		expect(validateForecastResponse(response)).toEqual([]);
+	});
+
 	test("a full-size generated response with all 41 lines", () => {
 		const response = generateFullResponse();
 		expect(DEFAULT_FAN_LEVELS).toHaveLength(38);
@@ -78,10 +87,28 @@ describe("validateForecastResponse rejects", () => {
 		expect(errors[0]).toContain("day.fan.p12[10]");
 	});
 
-	test("a named level above the fan level before it", () => {
+	test("a fan level above the fan level before it", () => {
 		const response = clone(specFull);
-		response.week.typical[3] = 999;
-		expectError(response, "week.typical[3]");
+		response.week.fan.p40[3] = response.week.fan.p30[3] + 1;
+		expectError(response, "week.fan.p40[3]");
+	});
+
+	test("typical above light", () => {
+		const response = clone(specFull);
+		response.day.typical[2] = response.day.light[2] + 1;
+		expectError(response, "day.typical[2]");
+	});
+
+	test("typical below heavy", () => {
+		const response = clone(specFull);
+		response.day.typical[2] = 0;
+		response.day.heavy[2] = 1;
+		const errors = validateForecastResponse(response);
+		expect(
+			errors.some(
+				(e) => e.includes("day.heavy[2]") && e.includes("day.typical[2]"),
+			),
+		).toBe(true);
 	});
 
 	test("heavy above typical", () => {

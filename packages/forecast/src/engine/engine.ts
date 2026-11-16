@@ -4,6 +4,8 @@
  * sums), horizon, scenarios (smoothed bootstrap), planner (receding-horizon search),
  * response. Yields to the event loop between stages; the stages yield inside.
  */
+
+import { localDayKey } from "../time";
 import type {
 	AccountId,
 	AccountLimits,
@@ -46,6 +48,7 @@ import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
+import { serveDay } from "./served-day";
 import { yieldToEventLoop } from "./yield";
 
 const HOUR_MS = 3_600_000;
@@ -220,12 +223,18 @@ async function computeForecast(
 	const { plan, result } = await planForecast(ctx);
 	await yieldToEventLoop();
 
-	const response = buildResponse(ctx, result);
+	const servedDay = serveDay(
+		result,
+		ctx.horizon.dayEnd,
+		localDayKey(ctx.now, ctx.timeZone),
+		input.heldDay ?? null,
+	);
+	const response = buildResponse(ctx, result, servedDay.day);
 	checkBlock(response.day);
 	checkBlock(response.week);
 	return ctx.inputs
-		? { available: true, response, plan, inputs: ctx.inputs }
-		: { available: true, response, plan };
+		? { available: true, response, plan, inputs: ctx.inputs, servedDay }
+		: { available: true, response, plan, servedDay };
 }
 
 function historyDetail(table: DayTable): UnavailableDetail {

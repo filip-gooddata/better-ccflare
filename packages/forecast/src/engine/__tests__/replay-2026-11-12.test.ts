@@ -78,9 +78,12 @@ function medianFirstFull(sim: SimulationResult, account: number): EpochMs {
 const BASELINE_STOP = { start: prague(12, 14, 53), end: prague(12, 16) };
 // routing every new session to acct-b from 07:00 (no planned opening): one shorter, later stop (16:14 before)
 const ROUTED_STOP = { start: prague(12, 16, 13), end: prague(12, 17) };
-// the typical (p50) line: the recorded day itself had a stop (15:20 before)
+// the typical line on demand: the served day (359 of 400) keeps 1.6 points to acct-a's 16:00
+// reset, but the light line reaches 0 at 15:55 and the typical line is clamped to it; the
+// served day leaves 1.6 units unserved in 15:55–16:00 (3.2 points), so the stop is listed
+// (15:16 for the pointwise median before the served day, 15:20 before amendment 4)
 const TYPICAL_BASELINE_STOP = {
-	start: prague(12, 15, 16),
+	start: prague(12, 15, 55),
 	end: prague(12, 16),
 };
 // the heavy line under the 10:00 opening (none before amendment 4); the planner's score counts 0 minutes
@@ -90,7 +93,7 @@ const PLANNED_HEAVY_STOPS = [
 ];
 
 describe("2026-11-12 replay through compute()", () => {
-	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:53–16:00, typical stop 15:16–16:00", async () => {
+	test("on demand the day plays out as recorded: acct-a full near 13:17, acct-b near 14:55, heavy stop 14:53–16:00, typical stop 15:55–16:00", async () => {
 		const ctx = await contextOf(buildInput(replayFixture()));
 		const { baseline } = await planForecast(ctx);
 		const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
@@ -141,8 +144,9 @@ describe("2026-11-12 replay through compute()", () => {
 		expect(baseline.score.stopMinutes).toBe(60);
 		expect(score.weekLowPoints).toBeCloseTo(82.15, 1);
 		expect(day.stops.typical).toEqual([]);
-		// 9.0 before amendment 4
-		expect(Math.min(...day.typical)).toBeCloseTo(8.3, 1);
+		// the served day's own low point (day 67 of 400, 3.0, inside [heavy, light]);
+		// 8.3 for the pointwise median, 9.0 before amendment 4
+		expect(Math.min(...day.typical)).toBeCloseTo(3, 1);
 	});
 
 	test("pre-warm off, why 10:00 and not all new sessions to acct-b from 07:00: that preference leaves a 40-minute heavy stop (16:13–17:00), the 10:00 routing-opening none", async () => {

@@ -1155,3 +1155,73 @@ describe("forecast service: log lines (amendment 3, C2)", () => {
 		expect(h.infos.join("\n")).not.toMatch(/[\\/]|jsonl|session|Users/);
 	});
 });
+
+describe("forecast service: the served day is held between polls", () => {
+	const SERVED = { date: "2026-11-12", day: 7 };
+
+	async function poll(h: Harness) {
+		await h.service.runOnce();
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+	}
+
+	it("passes the day the previous poll served to the next computation", async () => {
+		const h = harness();
+		h.engine.result = (i) => ({ ...available(i.now), servedDay: SERVED });
+		await poll(h);
+		await poll(h);
+		expect(h.engine.inputs.map((i) => i.heldDay ?? null)).toEqual([
+			null,
+			SERVED,
+		]);
+	});
+
+	it("serves the engine its newest pick, which replaces the held day", async () => {
+		const h = harness();
+		const picks = [SERVED, { date: "2026-11-12", day: 9 }];
+		h.engine.result = (i) => ({
+			...available(i.now),
+			servedDay: picks[h.engine.inputs.length - 1] ?? SERVED,
+		});
+		await poll(h);
+		await poll(h);
+		await poll(h);
+		expect(h.engine.inputs.map((i) => i.heldDay ?? null)).toEqual([
+			null,
+			SERVED,
+			picks[1],
+		]);
+	});
+
+	it("keeps the held day through a poll without a forecast", async () => {
+		const h = harness();
+		let fail = false;
+		h.engine.result = (i) =>
+			fail
+				? {
+						available: false,
+						reason: "error",
+						response: unavailableResponse(i.now, "error", [A]),
+						plan: null,
+					}
+				: { ...available(i.now), servedDay: SERVED };
+		await poll(h);
+		fail = true;
+		await poll(h);
+		fail = false;
+		await poll(h);
+		expect(h.engine.inputs.map((i) => i.heldDay ?? null)).toEqual([
+			null,
+			SERVED,
+			SERVED,
+		]);
+	});
+
+	it("a fresh service (a restart) holds nothing", async () => {
+		const first = harness();
+		first.engine.result = (i) => ({ ...available(i.now), servedDay: SERVED });
+		await poll(first);
+		const restarted = harness();
+		await poll(restarted);
+		expect(restarted.engine.inputs[0]?.heldDay ?? null).toBeNull();
+	});
+});

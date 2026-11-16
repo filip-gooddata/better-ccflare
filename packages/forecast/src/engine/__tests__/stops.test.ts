@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { EpochMs, LimitReading } from "../../types";
 import type { SampleAxis } from "../model";
 import { buildResponse } from "../response";
+import { freshDay } from "../served-day";
 import { fillAtNow, spill } from "../stops";
 import {
 	account,
@@ -30,7 +31,7 @@ const afterJump = (axis: SampleAxis, t: EpochMs, i: number) =>
  * hour earlier), stays at 0 until acct-a's reset and leaves `units` unserved
  * per 5-minute step while at 0.
  */
-function exampleRun(units: number, k = 2, minStopPoints = 1) {
+function exampleSim(units: number, k = 2, minStopPoints = 1) {
 	const ctx = makeCtx({
 		accounts: [
 			account("acct-a", { fiveHour: { usedPct: 94, resetsAt: RESET_A } }),
@@ -56,8 +57,25 @@ function exampleRun(units: number, k = 2, minStopPoints = 1) {
 			],
 		});
 	});
-	return buildResponse(ctx, makeSim(ctx, axis, traces));
+	return { ctx, sim: makeSim(ctx, axis, traces) };
 }
+
+/** Z_s: when simulated day s of the example runs out. */
+const zeroOf = (s: number) => at(14) + Math.floor(0.3 * s) * MIN;
+
+function exampleRun(units: number, k = 2, minStopPoints = 1) {
+	const { ctx, sim } = exampleSim(units, k, minStopPoints);
+	return buildResponse(ctx, sim);
+}
+
+/**
+ * The served day of the example: ranked by quota missed, the selection window
+ * holds days 179..219, and the deepest of them is day 180 (Z = 14:54): with
+ * every day flat at 0 after its Z, ties at 0 count inside every band, so the
+ * window days that reach 0 earliest gain depth.
+ */
+const example = exampleSim(1);
+const SERVED = freshDay(example.sim, example.ctx.horizon.dayEnd);
 
 describe("projected stops", () => {
 	const day = exampleRun(1).day;
@@ -66,7 +84,12 @@ describe("projected stops", () => {
 	test("start at the level's zero point, end at the reset that brings quota back", () => {
 		// p90 needs 41 of 400 days at 0 (type-7 index ⌈399·0.1⌉): day 40, 14:12.
 		expect(day.stops.heavy).toEqual([{ start: at(14, 12), end: RESET_A }]);
-		expect(day.stops.typical).toEqual([{ start: at(15), end: RESET_A }]);
+		// Typical is the served day alone: its own zero point Z_s.
+		expect(SERVED).toBe(180);
+		expect(zeroOf(SERVED)).toBe(at(14, 54));
+		expect(day.stops.typical).toEqual([
+			{ start: zeroOf(SERVED), end: RESET_A },
+		]);
 		expect(day.stops.light).toEqual([{ start: at(15, 48), end: RESET_A }]);
 		expect(day.times).toContain(at(14, 12));
 		expect(day.heavy[day.times.indexOf(at(14, 12))]).toBe(0);
@@ -91,7 +114,7 @@ describe("projected stops", () => {
 			heavy: [],
 		});
 		// Heavy: 21.6 steps of 0.02 points = 0.432 (the 14:10-14:15 step counts its
-		// 3 minutes inside the stop); typical: 12 steps = 0.24; light: 3 steps.
+		// 3 minutes inside the stop); typical (served day 180): 13.2 steps = 0.264; light: 3 steps.
 		const stops = exampleRun(0.01, 2, 0.3).day?.stops;
 		expect(stops?.heavy).toEqual([{ start: at(14, 12), end: RESET_A }]);
 		expect(stops?.typical).toEqual([]);
@@ -114,19 +137,22 @@ describe("projected stops", () => {
 
 describe("shortfall: spill rule", () => {
 	test("last account up to its fill, the rest to the others", () => {
-		// Median day: 12 steps × 1 unit × k 2 = 24 points in the typical stop.
+		// Served day 180 (Z 14:54): 13.2 steps × 1 unit × k 2 = 26.4 points in the
+		// typical stop (the 14:50-14:55 step counts its 1 minute inside the stop,
+		// then 13 whole steps to 16:00). acct-b, last out, takes its fill of 6.
 		expect(exampleRun(1).day?.shortfall).toEqual({
-			stop: { start: at(15), end: RESET_A },
-			points: 24,
+			stop: { start: zeroOf(SERVED), end: RESET_A },
+			points: 26.4,
 			lastAccount: "acct-b",
-			perAccount: { "acct-a": 18, "acct-b": 6 },
+			perAccount: { "acct-a": 20.4, "acct-b": 6 },
 		});
 	});
 
 	test("leftover beyond every fill goes to the last account", () => {
 		const s = exampleRun(1, 20).day?.shortfall;
-		expect(s?.points).toBe(240);
-		expect(s?.perAccount).toEqual({ "acct-a": 94, "acct-b": 146 });
+		// Served day: 13.2 steps × k 20 = 264; acct-a takes its fill of 94.
+		expect(s?.points).toBe(264);
+		expect(s?.perAccount).toEqual({ "acct-a": 94, "acct-b": 170 });
 	});
 
 	test("others in reverse order of running out, parts sum exactly in tenths", () => {
