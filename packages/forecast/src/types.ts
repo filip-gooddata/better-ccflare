@@ -141,6 +141,8 @@ export interface LiveSession {
 	contextTokens: number;
 	/** Demand units it used in the trailing 60 minutes. */
 	recentUnits: number;
+	/** Demand units it used over its own cache lifetime (cacheTtlMs; the trailing 60 minutes while unknown). */
+	warmUnits: number;
 }
 
 export interface SessionTrackerLike {

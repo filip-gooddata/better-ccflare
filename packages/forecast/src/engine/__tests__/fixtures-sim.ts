@@ -96,6 +96,7 @@ export function session(
 		coldAt: null,
 		contextTokens: 100_000,
 		recentUnits: 1,
+		warmUnits: 1,
 		...over,
 	};
 }
