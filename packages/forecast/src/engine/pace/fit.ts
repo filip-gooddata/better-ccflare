@@ -135,7 +135,7 @@ function predict(f: Ridge, X: Float64Array[], k: number): number {
 	return s;
 }
 
-const meanSd = (d: number[]) => {
+export const meanSd = (d: number[]) => {
 	const mu = d.reduce((s, x) => s + x, 0) / d.length;
 	const sd = Math.sqrt(
 		d.reduce((s, x) => s + (x - mu) ** 2, 0) / Math.max(1, d.length - 1),
