@@ -455,6 +455,24 @@ export interface ForecastBlock {
 	stopNow: Interval | null;
 	pastStops: Interval[];
 	shortfall: Shortfall | null;
+	/**
+	 * Share of the simulated days (0 to 1, two decimals) whose own line lists a
+	 * stop by the stop rule between computedAt and the block's end: "will I be
+	 * stopped at some point in this span", not the state at one moment. 1 during
+	 * stopNow. Optional (specification revision 9).
+	 */
+	stopChance?: number | null;
+	/**
+	 * Over the simulated days that stop: the median start and the median length
+	 * (whole minutes, at least 1) of their first stop. Null when stopChance is
+	 * below 0.5 or during stopNow. Optional (specification revision 9).
+	 */
+	likelyStop?: LikelyStop | null;
+}
+
+export interface LikelyStop {
+	start: EpochMs;
+	minutes: number;
 }
 
 export interface ForecastResponse {

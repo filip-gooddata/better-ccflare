@@ -9,6 +9,8 @@ import type {
 	ForecastBlock,
 	ForecastResponse,
 	ForecastSettings,
+	Interval,
+	LikelyStop,
 	Series,
 	UnavailableReason,
 } from "../types";
@@ -258,6 +260,7 @@ function buildBlock(
 		if (level !== LIGHT && level !== TYPICAL && level !== HEAVY)
 			fan[`p${level}`] = rounded[l];
 	});
+	const current = stopNow(ctx, quantity);
 	return {
 		past: roundSeries(pastSeries(ctx, quantity)),
 		times: block.times,
@@ -266,9 +269,63 @@ function buildBlock(
 		heavy: line(HEAVY),
 		fan,
 		stops,
-		stopNow: stopNow(ctx, quantity),
+		stopNow: current,
 		pastStops: pastStops(ctx, quantity),
 		shortfall: shortfall(ctx, sim, quantity, block, stops.typical),
+		...stopOdds(ctx, sim, quantity, end, current),
+	};
+}
+
+const MINUTE_MS = 60_000;
+
+function median(values: number[]): number {
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = sorted.length >> 1;
+	return sorted.length % 2 === 1
+		? sorted[mid]
+		: (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * The chance of being stopped at some point before the block's end, and the
+ * stop that is typical on the days that stop. Each simulated day is read on its
+ * own: the block's line of a simulation holding only that day, under the same
+ * stop rule as the headline (projectedStops at the typical level, so the zero
+ * cutoff and minStopPoints apply as they do there). With one day every level is
+ * that day's line, so one level is built. stopChance is the share of days that
+ * list a stop; likelyStop is the median start and length of their first stop
+ * when that share (rounded) is at least one half. During a running stop the
+ * chance is 1 and likelyStop is null: the client shows stopNow.
+ */
+function stopOdds(
+	ctx: EngineContext,
+	sim: SimulationResult,
+	quantity: Quantity,
+	end: EpochMs,
+	current: Interval | null,
+): { stopChance: number; likelyStop: LikelyStop | null } {
+	if (current) return { stopChance: 1, likelyStop: null };
+	const starts: number[] = [];
+	const lengths: number[] = [];
+	for (const trace of sim.traces) {
+		const one: SimulationResult = { ...sim, traces: [trace] };
+		const line = blockLines(ctx, one, quantity, [TYPICAL], end);
+		const first = projectedStops(ctx, one, quantity, line, TYPICAL)[0];
+		if (!first) continue;
+		starts.push(first.start);
+		lengths.push(first.end - first.start);
+	}
+	const days = sim.traces.length;
+	const stopChance =
+		days === 0 ? 0 : Math.round((starts.length / days) * 100) / 100;
+	if (stopChance < 0.5 || starts.length === 0)
+		return { stopChance, likelyStop: null };
+	return {
+		stopChance,
+		likelyStop: {
+			start: Math.round(median(starts)),
+			minutes: Math.max(1, Math.round(median(lengths) / MINUTE_MS)),
+		},
 	};
 }
 

@@ -436,6 +436,76 @@ function validateBlock(
 			err,
 		);
 	}
+
+	validateStopChance(
+		block,
+		key,
+		computedAt,
+		stopNow,
+		times ? times[times.length - 1] : null,
+		err,
+	);
+}
+
+/**
+ * stopChance and likelyStop (revision 9, both optional): a share 0 to 1 in two
+ * decimals, 1 during stopNow; likelyStop present exactly when the chance is at
+ * least one half and no stop runs, starting after computedAt and by the block's
+ * last time, lasting a positive whole number of minutes.
+ */
+function validateStopChance(
+	block: Obj,
+	key: "day" | "week",
+	computedAt: number,
+	stopNow: Interval | null,
+	blockEnd: number | null,
+	err: Err,
+): void {
+	const chancePath = `${key}.stopChance`;
+	const raw = block.stopChance;
+	let chance: number | null = null;
+	if (raw !== undefined && raw !== null) {
+		if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0 || raw > 1)
+			err(chancePath, "must be a number from 0 to 1");
+		else if (Math.round(raw * 100) / 100 !== raw)
+			err(chancePath, "must have at most two decimals");
+		else chance = raw;
+	}
+	const running = stopNow !== null || block.stopNow != null;
+	if (running && chance !== null && chance !== 1)
+		err(chancePath, "must be 1 during stopNow");
+
+	const path = `${key}.likelyStop`;
+	const likely = block.likelyStop;
+	const expected = !running && chance !== null && chance >= 0.5;
+	if (likely === undefined || likely === null) {
+		if (expected) err(path, "must be set when stopChance is at least 0.5");
+		return;
+	}
+	if (running) {
+		err(path, "must be null during stopNow");
+		return;
+	}
+	if (!expected) {
+		err(path, "must be null unless stopChance is at least 0.5");
+		return;
+	}
+	if (!isObj(likely) || Array.isArray(likely)) {
+		err(path, "must be { start, minutes } or null");
+		return;
+	}
+	if (
+		!isTime(likely.start) ||
+		likely.start <= computedAt ||
+		(blockEnd !== null && likely.start > blockEnd)
+	)
+		err(path, "start must be after computedAt and by the block's last time");
+	else if (
+		typeof likely.minutes !== "number" ||
+		!Number.isInteger(likely.minutes) ||
+		likely.minutes <= 0
+	)
+		err(path, "minutes must be a positive whole number");
 }
 
 /**
