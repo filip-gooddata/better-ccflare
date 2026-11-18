@@ -1,3 +1,4 @@
+import { getModelFamily } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
 	type UsageData,
@@ -5,6 +6,7 @@ import {
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import { markFamilyExhausted } from "./model-capacity";
 import type { ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
 
@@ -76,21 +78,42 @@ function windowIsOut(window: WindowHeaders): boolean {
 	);
 }
 
+function headerWindowOut(parsed: UnifiedLimitHeaders): boolean {
+	return windowIsOut(parsed.fiveHour) || windowIsOut(parsed.sevenDay);
+}
+
 type CacheWindowKey = "five_hour" | "seven_day";
 
+function claimOf(parsed: UnifiedLimitHeaders): string {
+	return parsed.representativeClaim?.trim().toLowerCase() ?? "";
+}
+
 /**
- * The window to mark full when the response says the account is out
- * (overage in use, or overall status rejected) but neither window header
- * crossed on its own: the one the representative claim names, else (no claim,
- * a model-family claim or one not seen before) the fuller of the two, so the
- * whole account is out until the re-read says otherwise.
+ * The model family a `seven_day_<family>` claim names, or null. Only a suffix
+ * that is itself a known family counts, so `seven_day_overage_included` and
+ * other account-level variants are not mistaken for one.
  */
-function bindingWindow(parsed: UnifiedLimitHeaders): CacheWindowKey {
-	const claim = parsed.representativeClaim?.trim().toLowerCase() ?? "";
+function familyOfClaim(parsed: UnifiedLimitHeaders): string | null {
+	const claim = claimOf(parsed);
+	if (!claim.startsWith("seven_day_")) return null;
+	const suffix = claim.slice("seven_day_".length);
+	return getModelFamily(suffix) === suffix ? suffix : null;
+}
+
+/**
+ * The account-wide window to mark full when the response says the account is
+ * out but neither window header crossed on its own: the window an account-wide
+ * claim (`five_hour`, `seven_day`) names; with overage in use and no claim or
+ * one that names no family, the fuller of the two. Otherwise no window: a
+ * family claim is the family block's business (this runs before the 429
+ * classifiers, which read the same cache), and an overall rejection without
+ * an account-wide claim is benched by the rate-limit path.
+ */
+function bindingWindow(parsed: UnifiedLimitHeaders): CacheWindowKey | null {
+	const claim = claimOf(parsed);
 	if (claim === "five_hour") return "five_hour";
-	if (claim === "seven_day" || claim === "seven_day_overage_included") {
-		return "seven_day";
-	}
+	if (claim === "seven_day") return "seven_day";
+	if (!parsed.overageInUse || familyOfClaim(parsed) !== null) return null;
 	const five = parsed.fiveHour.utilization ?? -1;
 	const seven = parsed.sevenDay.utilization ?? -1;
 	return seven > five ? "seven_day" : "five_hour";
@@ -198,16 +221,22 @@ export function observeLimitHeaders(
 	if (!isAnthropicAccount(account)) return;
 
 	const parsed = readUnifiedLimitHeaders(response.headers);
-	const windowOut =
-		windowIsOut(parsed.fiveHour) || windowIsOut(parsed.sevenDay);
+	const windowOut = headerWindowOut(parsed);
 	const overallRejected = parsed.status === "rejected" && !options.keepalive;
 	if (!windowOut && !overallRejected && !parsed.overageInUse) return;
 
-	writeUsageFromHeaders(
-		account.id,
-		parsed,
-		windowOut ? null : bindingWindow(parsed),
-	);
+	const family = parsed.overageInUse ? familyOfClaim(parsed) : null;
+	if (family !== null && !windowOut) {
+		// Served on credits for one family: block that family until the reset,
+		// keep the account for the others.
+		markFamilyExhausted(account.id, family, parsed.resetMs);
+	} else {
+		writeUsageFromHeaders(
+			account.id,
+			parsed,
+			windowOut ? null : bindingWindow(parsed),
+		);
+	}
 	log.warn(
 		`[ccflare] account=${account.name} limit_header_mark overage_in_use=${parsed.overageInUse} status=${parsed.status ?? "none"} 5h=${parsed.fiveHour.utilization ?? "?"}/${parsed.fiveHour.status ?? "?"} 7d=${parsed.sevenDay.utilization ?? "?"}/${parsed.sevenDay.status ?? "?"} reset=${parsed.resetMs !== null ? new Date(parsed.resetMs).toISOString() : "none"}`,
 	);
@@ -229,6 +258,8 @@ export function applyOverageCooldown(
 	if (!isAnthropicAccount(account)) return;
 	const parsed = readUnifiedLimitHeaders(response.headers);
 	if (!parsed.overageInUse) return;
+	// A family claim is blocked per family (observeLimitHeaders), not benched.
+	if (familyOfClaim(parsed) !== null && !headerWindowOut(parsed)) return;
 	if (parsed.resetMs === null || parsed.resetMs <= Date.now()) return;
 	applyRateLimitCooldown(
 		account,

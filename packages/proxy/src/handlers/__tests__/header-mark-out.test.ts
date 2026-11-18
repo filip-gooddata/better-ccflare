@@ -15,12 +15,20 @@ import type {
 	LoadBalancingStrategy,
 	RequestMeta,
 } from "@better-ccflare/types";
+import {
+	initUsageCollector,
+	resetUsageCollectorForTests,
+} from "../../usage-collector";
 import { selectAccountsForRequest } from "../account-selector";
 import {
 	observeLimitHeaders,
 	resetHeaderMarkOutForTests,
 } from "../header-mark-out";
 import { collectLimitBlockedAccounts } from "../limit-blocked";
+import {
+	clearFamilyExhaustionCache,
+	isFamilyExhausted,
+} from "../model-capacity";
 import { proxyWithAccount } from "../proxy-operations";
 import {
 	INTERNAL_PROBE_SECRET_HEADER,
@@ -28,10 +36,6 @@ import {
 } from "../proxy-types";
 import { resetRateLimitProbeGatesForTests } from "../rate-limit-cooldown";
 import { processProxyResponse } from "../response-processor";
-import {
-	initUsageCollector,
-	resetUsageCollectorForTests,
-} from "../../usage-collector";
 
 const HOUR = 3_600_000;
 const NOW = Date.parse("2026-11-18T12:00:00Z");
@@ -260,6 +264,7 @@ beforeEach(() => {
 
 afterEach(() => {
 	resetUsageCollectorForTests();
+	clearFamilyExhaustionCache();
 	refreshSpy.mockRestore();
 	globalThis.fetch = originalFetch;
 	setSystemTime();
@@ -364,14 +369,14 @@ describe("observeLimitHeaders", () => {
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("overage in use with a family or unknown claim still marks the account out", () => {
+	it("overage in use with an unrecognised claim marks the account out", () => {
 		const { ctx } = makeCtx();
 		seedUsage("a");
 		observeLimitHeaders(
 			respond(
 				allowedHeaders({
 					[`${P}overage-in-use`]: "true",
-					[`${P}representative-claim`]: "seven_day_opus",
+					[`${P}representative-claim`]: "seven_day_overage_included",
 				}),
 			),
 			makeAccount("a"),
@@ -380,6 +385,47 @@ describe("observeLimitHeaders", () => {
 		expect(cached("a").five_hour.resets_at).toBe(
 			new Date(atSecond(FIVE_HOUR_RESET)).toISOString(),
 		);
+	});
+
+	it("overage in use on one family blocks that family only, without a bench", async () => {
+		const { ctx, marks } = makeCtx();
+		const account = makeAccount("a");
+		seedUsage("a");
+		const familyOverage = () =>
+			respond(
+				allowedHeaders({
+					[`${P}overage-in-use`]: "true",
+					[`${P}representative-claim`]: "seven_day_opus",
+					[`${P}reset`]: secs(SEVEN_DAY_RESET),
+				}),
+			);
+		observeLimitHeaders(familyOverage(), account);
+		await processProxyResponse(familyOverage(), account, ctx);
+		await flush();
+
+		expect(isFamilyExhausted("a", "opus")).toBe(true);
+		expect(isFamilyExhausted("a", "sonnet")).toBe(false);
+		expect(limitKinds(ctx, "a")).toEqual([]);
+		expect(account.rate_limited_until).toBeNull();
+		expect(marks).toEqual([]);
+		setSystemTime(new Date(SEVEN_DAY_RESET + 1000));
+		expect(isFamilyExhausted("a", "opus")).toBe(false);
+	});
+
+	it("an overall rejection naming a family leaves the cache to the family classifier", () => {
+		seedUsage("a");
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
+					[`${P}status`]: "rejected",
+					[`${P}representative-claim`]: "seven_day_opus",
+				}),
+				429,
+			),
+			makeAccount("a"),
+		);
+		expect(cached("a").five_hour.utilization).toBe(42);
+		expect(cached("a").seven_day.utilization).toBe(21);
 	});
 
 	it("below-threshold headers change nothing", async () => {
