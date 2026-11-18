@@ -181,6 +181,17 @@ describe("stopChance and likelyStop: the engine's stop rule on each simulated da
 		expect(day.likelyStop).not.toBeNull();
 	});
 
+	test("the rounding boundary: 197 of 400 days is 0.49 without likelyStop, 198 is 0.50 with it", () => {
+		const below = block(scattered({ stopping: 197 }).response, "day");
+		expect(below.stopChance).toBe(0.49);
+		expect(below.likelyStop).toBeNull();
+		const { ctx, sim, response } = scattered({ stopping: 198 });
+		const half = block(response, "day");
+		expect(half.stopChance).toBe(0.5);
+		expect(half.likelyStop).not.toBeNull();
+		expect(half.likelyStop).toEqual(reference(ctx, sim, "day").likelyStop);
+	});
+
 	test("minStopPoints: days at 0 with too little unserved demand do not count", () => {
 		const day = block(
 			scattered({ stopping: 300, unserved: 0 }).response,
