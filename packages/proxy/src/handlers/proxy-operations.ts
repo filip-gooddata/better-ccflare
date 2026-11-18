@@ -94,6 +94,7 @@ function resolveForwardToClient(ctx: ProxyContext) {
 }
 
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import { observeLimitHeaders } from "./header-mark-out";
 
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
@@ -1579,7 +1580,15 @@ export async function proxyWithAccount(
 						undefined,
 						signal,
 					),
-			);
+			).then((response) => {
+				// Every upstream answer, before any classification or forwarding:
+				// a response that shows the account out marks it for the next
+				// request. Headers only; the body is left to the caller.
+				observeLimitHeaders(response, account, {
+					keepalive: isInternalProbe(req.headers, ctx, "keepalive"),
+				});
+				return response;
+			});
 		};
 		if (
 			process.env.DEBUG?.includes("proxy") ||

@@ -4,6 +4,7 @@ import {
 	describe,
 	expect,
 	it,
+	mock,
 	setSystemTime,
 	spyOn,
 } from "bun:test";
@@ -15,14 +16,22 @@ import type {
 	RequestMeta,
 } from "@better-ccflare/types";
 import { selectAccountsForRequest } from "../account-selector";
-import { resetHeaderMarkOutForTests } from "../header-mark-out";
+import {
+	observeLimitHeaders,
+	resetHeaderMarkOutForTests,
+} from "../header-mark-out";
 import { collectLimitBlockedAccounts } from "../limit-blocked";
+import { proxyWithAccount } from "../proxy-operations";
 import {
 	INTERNAL_PROBE_SECRET_HEADER,
 	type ProxyContext,
 } from "../proxy-types";
 import { resetRateLimitProbeGatesForTests } from "../rate-limit-cooldown";
 import { processProxyResponse } from "../response-processor";
+import {
+	initUsageCollector,
+	resetUsageCollectorForTests,
+} from "../../usage-collector";
 
 const HOUR = 3_600_000;
 const NOW = Date.parse("2026-11-18T12:00:00Z");
@@ -30,6 +39,7 @@ const FIVE_HOUR_RESET = NOW + 2 * HOUR;
 const SEVEN_DAY_RESET = NOW + 50 * HOUR;
 const MODEL = "claude-opus-4-5";
 const P = "anthropic-ratelimit-unified-";
+const SECRET = "probe-secret";
 
 function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 	return {
@@ -63,23 +73,15 @@ function makeAccount(id: string, overrides: Partial<Account> = {}): Account {
 	};
 }
 
-function makeCtx(providerName = "anthropic", rows: Account[] = []) {
+function makeCtx(rows: Account[] = []) {
 	const marks: Array<{ accountId: string; until: number; reason: string }> = [];
 	const strategy: LoadBalancingStrategy = {
 		select: (accounts: Account[]) =>
 			accounts.filter((a) => isAccountAvailable(a, Date.now())),
 		peek: () => null,
 	};
-	const provider =
-		providerName === "anthropic"
-			? new AnthropicProvider()
-			: {
-					name: providerName,
-					parseRateLimit: () => ({ isRateLimited: false }),
-					isStreamingResponse: () => false,
-				};
 	const ctx = {
-		provider,
+		provider: new AnthropicProvider(),
 		strategy,
 		dbOps: {
 			getAllAccounts: async () => rows,
@@ -92,11 +94,13 @@ function makeCtx(providerName = "anthropic", rows: Account[] = []) {
 				marks.push({ accountId, until, reason });
 				return { consecutiveRateLimits: 0, applied: true };
 			},
+			saveRequest: async () => {},
 			updateAccountUsage: async () => {},
 			updateAccountRateLimitMeta: async () => {},
 			resetConsecutiveRateLimits: async () => {},
 			getAdapter: () => ({ get: async () => null, run: async () => {} }),
 		},
+		runtime: { port: 8080, clientId: "test" },
 		asyncWriter: {
 			enqueue: (job: () => unknown) => {
 				void Promise.resolve().then(job);
@@ -106,46 +110,46 @@ function makeCtx(providerName = "anthropic", rows: Account[] = []) {
 			getModelScopedCapacityRouting: () => "off",
 			getForceAccountModel: () => false,
 			getComboSessionFallback: () => true,
+			getStorePayloads: () => false,
 		},
 		refreshInFlight: new Map(),
+		internalProbeSecret: SECRET,
 	} as unknown as ProxyContext;
 	return { ctx, marks };
 }
 
-function meta(): RequestMeta {
+function meta(headers: Headers = new Headers()): RequestMeta {
 	return {
 		id: "req-1",
 		method: "POST",
 		path: "/v1/messages",
 		timestamp: NOW,
-		headers: new Headers(),
+		headers,
 		clientSessionId: null,
 	};
 }
 
 const secs = (ms: number) => String(Math.floor(ms / 1000));
+const atSecond = (ms: number) => Math.floor(ms / 1000) * 1000;
 
 /** A plain (overage off) usage snapshot with both windows well below 100 %. */
-function seedUsage(id: string, fiveHour = 40, sevenDay = 20) {
+function seedUsage(id: string) {
 	usageCache.set(id, {
 		five_hour: {
-			utilization: fiveHour,
+			utilization: 40,
 			resets_at: new Date(FIVE_HOUR_RESET).toISOString(),
 		},
 		seven_day: {
-			utilization: sevenDay,
+			utilization: 20,
 			resets_at: new Date(SEVEN_DAY_RESET).toISOString(),
 		},
 		spend: { enabled: false },
 	} as never);
 }
 
-function headers(extra: Record<string, string>): Headers {
-	return new Headers({ "content-type": "application/json", ...extra });
-}
-
-function allowedHeaders(extra: Record<string, string> = {}) {
-	return headers({
+function allowedHeaders(extra: Record<string, string> = {}): Headers {
+	return new Headers({
+		"content-type": "application/json",
 		[`${P}status`]: "allowed",
 		[`${P}reset`]: secs(FIVE_HOUR_RESET),
 		[`${P}5h-status`]: "allowed",
@@ -158,203 +162,345 @@ function allowedHeaders(extra: Record<string, string> = {}) {
 	});
 }
 
-/**
- * The limits in force for a freshly loaded row (no cooldown persisted yet),
- * i.e. what the next selection in the same event-loop turn sees.
- */
-function blockedNow(ctx: ProxyContext, id: string, now = NOW) {
-	const fresh = makeAccount(id);
-	return {
-		limits:
-			collectLimitBlockedAccounts([fresh], ctx, meta(), MODEL, now)[0]
-				?.limits ?? [],
+/** The real upstream 429 shape (COMMON-BRIEF fixture), five-hour window spent. */
+function real429Headers(): Headers {
+	return new Headers({
+		"content-type": "application/json",
+		"retry-after": "7200",
+		"x-should-retry": "true",
+		[`${P}status`]: "rejected",
+		[`${P}reset`]: secs(FIVE_HOUR_RESET),
+		[`${P}representative-claim`]: "five_hour",
+		[`${P}5h-status`]: "rejected",
+		[`${P}5h-reset`]: secs(FIVE_HOUR_RESET),
+		[`${P}5h-utilization`]: "1.0",
+		[`${P}5h-surpassed-threshold`]: "1.0",
+		[`${P}7d-status`]: "allowed_warning",
+		[`${P}7d-reset`]: secs(SEVEN_DAY_RESET),
+		[`${P}7d-utilization`]: "0.17",
+		[`${P}7d-surpassed-threshold`]: "0.75",
+		[`${P}fallback-percentage`]: "0.5",
+		[`${P}overage-status`]: "rejected",
+		[`${P}overage-disabled-reason`]: "org_spend_cap_reached",
+		[`${P}upgrade-paths`]: "overage",
+	});
+}
+
+function respond(h: Headers, status = 200, body: BodyInit = "{}") {
+	return new Response(body, { status, headers: h });
+}
+
+/** Limits in force for a freshly loaded row (no cooldown persisted yet). */
+function limitKinds(ctx: ProxyContext, id: string, now = NOW): string[] {
+	const rows = collectLimitBlockedAccounts(
+		[makeAccount(id)],
+		ctx,
+		meta(),
+		MODEL,
+		now,
+	);
+	return (rows[0]?.limits ?? []).map((l) => l.kind);
+}
+
+function cached(id: string) {
+	return usageCache.get(id) as {
+		five_hour: { utilization: number; resets_at: string };
+		seven_day: { utilization: number; resets_at: string };
 	};
 }
 
+const flush = async () => {
+	for (let i = 0; i < 3; i++) await new Promise((r) => setTimeout(r, 0));
+};
+
+function requestBody() {
+	return new TextEncoder().encode(
+		JSON.stringify({
+			model: MODEL,
+			messages: [{ role: "user", content: "hi" }],
+			max_tokens: 10,
+		}),
+	).buffer;
+}
+
+async function proxyOnce(ctx: ProxyContext, account: Account) {
+	const body = requestBody();
+	return proxyWithAccount(
+		new Request("https://proxy.local/v1/messages", {
+			method: "POST",
+			body,
+			headers: { "Content-Type": "application/json" },
+		}),
+		new URL("https://proxy.local/v1/messages"),
+		account,
+		meta(),
+		body,
+		() => undefined,
+		0,
+		ctx,
+	);
+}
+
 let refreshSpy: ReturnType<typeof spyOn>;
+let originalFetch: typeof globalThis.fetch;
 
 beforeEach(() => {
 	setSystemTime(new Date(NOW));
 	resetHeaderMarkOutForTests();
 	resetRateLimitProbeGatesForTests();
+	originalFetch = globalThis.fetch;
 	refreshSpy = spyOn(usageCache, "refreshNow").mockImplementation(
-		async () => true,
+		async (id: string) => {
+			await Promise.resolve();
+			seedUsage(id);
+			return true;
+		},
 	);
 });
 
 afterEach(() => {
+	resetUsageCollectorForTests();
 	refreshSpy.mockRestore();
+	globalThis.fetch = originalFetch;
 	setSystemTime();
 	usageCache.clear();
 });
 
-describe("header-driven mark-out on Anthropic responses", () => {
-	it("overage-in-use on a 200 marks the account out until the unified reset without pausing it", async () => {
-		const { ctx, marks } = makeCtx();
-		const account = makeAccount("a");
-		seedUsage("a");
-		const response = new Response("{}", {
-			status: 200,
-			headers: allowedHeaders({ [`${P}overage-in-use`]: "true" }),
-		});
-
-		const limited = await processProxyResponse(response, account, ctx);
-		expect(limited).toBe(false);
-
-		const now = blockedNow(ctx, "a");
-		expect(now.limits.length).toBeGreaterThan(0);
-		expect(account.paused).toBe(false);
-		expect(account.rate_limited_until).toBe(
-			Math.floor(FIVE_HOUR_RESET / 1000) * 1000,
-		);
-		expect(account.rate_limited_reason).toBe("overage_in_use");
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(marks).toEqual([
-			{
-				accountId: "a",
-				until: Math.floor(FIVE_HOUR_RESET / 1000) * 1000,
-				reason: "overage_in_use",
-			},
-		]);
-		expect(refreshSpy).toHaveBeenCalledTimes(1);
-	});
-
+describe("observeLimitHeaders", () => {
 	it("5h utilization 1.0 writes the header numbers into the usage cache and re-reads usage once per burst", async () => {
 		const { ctx } = makeCtx();
 		seedUsage("a");
+		refreshSpy.mockImplementation(async () => true);
 		const tipped = () =>
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({
+			respond(
+				allowedHeaders({
 					[`${P}5h-utilization`]: "1.0",
 					[`${P}5h-status`]: "allowed_warning",
 				}),
-			});
+			);
 
-		await processProxyResponse(tipped(), makeAccount("a"), ctx);
-		const cached = usageCache.get("a") as {
-			five_hour: { utilization: number; resets_at: string };
-			seven_day: { utilization: number; resets_at: string };
-		};
-		expect(cached.five_hour.utilization).toBe(100);
-		expect(Date.parse(cached.five_hour.resets_at)).toBe(
-			Math.floor(FIVE_HOUR_RESET / 1000) * 1000,
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		expect(cached("a").five_hour.utilization).toBe(100);
+		expect(Date.parse(cached("a").five_hour.resets_at)).toBe(
+			atSecond(FIVE_HOUR_RESET),
 		);
-		expect(cached.seven_day.utilization).toBe(21);
-		expect(blockedNow(ctx, "a").limits.map((l) => l.kind)).toContain(
-			"five_hour",
-		);
+		expect(cached("a").seven_day.utilization).toBe(21);
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
 
-		await processProxyResponse(tipped(), makeAccount("a"), ctx);
-		await processProxyResponse(tipped(), makeAccount("a"), ctx);
-		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		await flush();
+		// One re-read for the burst; it left the header mark in place (the
+		// fake fetch did not install a reading), so exactly one follow-up.
+		expect(refreshSpy).toHaveBeenCalledTimes(2);
 		expect(refreshSpy).toHaveBeenCalledWith("a");
 	});
 
-	it("7d utilization 1.0 marks the weekly window out", async () => {
-		const { ctx } = makeCtx();
+	it("does not re-read twice when the first re-read installed a fresh reading", async () => {
 		seedUsage("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({ [`${P}7d-utilization`]: "1.0" }),
-			}),
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}5h-utilization`]: "1.0" })),
 			makeAccount("a"),
-			ctx,
 		);
-		expect(blockedNow(ctx, "a").limits.map((l) => l.kind)).toContain("weekly");
+		await flush();
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("a 5h status of rejected marks the account out even below 1.0", async () => {
+	it("re-reads again once the throttle window has passed", async () => {
+		seedUsage("a");
+		const tipped = () =>
+			respond(allowedHeaders({ [`${P}5h-utilization`]: "1.0" }));
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		await flush();
+		setSystemTime(new Date(NOW + 31_000));
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		await flush();
+		expect(refreshSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("7d utilization 1.0 marks the weekly window out", () => {
 		const { ctx } = makeCtx();
 		seedUsage("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 429,
-				headers: headers({
-					"retry-after": "7200",
-					[`${P}status`]: "rejected",
-					[`${P}reset`]: secs(FIVE_HOUR_RESET),
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}7d-utilization`]: "1.0" })),
+			makeAccount("a"),
+		);
+		expect(limitKinds(ctx, "a")).toContain("weekly");
+		expect(refreshSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("a 5h status of rejected marks the account out even below 1.0", () => {
+		const { ctx } = makeCtx();
+		seedUsage("a");
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
 					[`${P}5h-status`]: "rejected",
-					[`${P}5h-reset`]: secs(FIVE_HOUR_RESET),
 					[`${P}5h-utilization`]: "0.99",
-					[`${P}7d-status`]: "allowed_warning",
-					[`${P}7d-reset`]: secs(SEVEN_DAY_RESET),
-					[`${P}7d-utilization`]: "0.17",
 				}),
-			}),
+				429,
+			),
 			makeAccount("a"),
-			ctx,
 		);
-		const cached = usageCache.get("a") as {
-			five_hour: { utilization: number };
-		};
-		expect(cached.five_hour.utilization).toBe(100);
-		expect(blockedNow(ctx, "a").limits.map((l) => l.kind)).toContain(
-			"five_hour",
-		);
-		expect(refreshSpy).toHaveBeenCalledTimes(1);
+		expect(cached("a").five_hour.utilization).toBe(100);
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
 	});
 
-	it("an overall unified status of rejected on a 200 marks the binding window out", async () => {
+	it("an overall status of rejected marks the window the claim names", () => {
 		const { ctx } = makeCtx();
 		seedUsage("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
 					[`${P}status`]: "rejected",
 					[`${P}representative-claim`]: "seven_day",
 					[`${P}reset`]: secs(SEVEN_DAY_RESET),
 				}),
-			}),
+				429,
+			),
 			makeAccount("a"),
-			ctx,
 		);
-		const kinds = blockedNow(ctx, "a").limits.map((l) => l.kind);
-		expect(kinds).toContain("weekly");
+		expect(limitKinds(ctx, "a")).toEqual(["weekly"]);
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 	});
 
+	it("overage in use with a family or unknown claim still marks the account out", () => {
+		const { ctx } = makeCtx();
+		seedUsage("a");
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
+					[`${P}overage-in-use`]: "true",
+					[`${P}representative-claim`]: "seven_day_opus",
+				}),
+			),
+			makeAccount("a"),
+		);
+		expect(limitKinds(ctx, "a")).toEqual(["five_hour"]);
+		expect(cached("a").five_hour.resets_at).toBe(
+			new Date(atSecond(FIVE_HOUR_RESET)).toISOString(),
+		);
+	});
+
 	it("below-threshold headers change nothing", async () => {
-		const { ctx, marks } = makeCtx();
-		const account = makeAccount("a");
+		const { ctx } = makeCtx();
 		seedUsage("a");
 		const before = usageCache.get("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
 					[`${P}5h-utilization`]: "0.99",
 					[`${P}5h-status`]: "allowed_warning",
 					[`${P}overage-in-use`]: "false",
 				}),
-			}),
-			account,
-			ctx,
+			),
+			makeAccount("a"),
 		);
-		await Promise.resolve();
+		await flush();
 		expect(usageCache.get("a")).toBe(before);
-		expect(blockedNow(ctx, "a").limits).toEqual([]);
-		expect(account.rate_limited_until).toBeNull();
-		expect(marks).toEqual([]);
+		expect(limitKinds(ctx, "a")).toEqual([]);
 		expect(refreshSpy).not.toHaveBeenCalled();
 	});
 
-	it("the mark ends at the reported reset", async () => {
-		const { ctx } = makeCtx();
-		const account = makeAccount("a");
+	it("a keepalive burst refusal with no window evidence marks nothing", () => {
 		seedUsage("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({
+		const before = usageCache.get("a");
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}status`]: "rejected" }), 429),
+			makeAccount("a"),
+			{ keepalive: true },
+		);
+		expect(usageCache.get("a")).toBe(before);
+		expect(refreshSpy).not.toHaveBeenCalled();
+	});
+
+	it("a keepalive response with a spent window still marks it", () => {
+		const { ctx } = makeCtx();
+		seedUsage("a");
+		observeLimitHeaders(respond(real429Headers(), 429), makeAccount("a"), {
+			keepalive: true,
+		});
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
+	});
+
+	it("leaves non-Anthropic accounts alone", async () => {
+		observeLimitHeaders(
+			respond(
+				allowedHeaders({
 					[`${P}overage-in-use`]: "true",
 					[`${P}5h-utilization`]: "1.0",
 				}),
-			}),
+			),
+			makeAccount("c", { provider: "openai-compatible" }),
+		);
+		await flush();
+		expect(usageCache.get("c")).toBeNull();
+		expect(refreshSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("overage cooldown in processProxyResponse", () => {
+	it("benches until the unified reset without pausing, streak or breaker", async () => {
+		const { ctx, marks } = makeCtx();
+		const account = makeAccount("a");
+		seedUsage("a");
+		const limited = await processProxyResponse(
+			respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
+			account,
+			ctx,
+		);
+		expect(limited).toBe(false);
+		expect(account.paused).toBe(false);
+		expect(account.consecutive_rate_limits).toBe(0);
+		expect(account.rate_limited_until).toBe(atSecond(FIVE_HOUR_RESET));
+		expect(account.rate_limited_reason).toBe("overage_in_use");
+		await flush();
+		expect(marks).toEqual([
+			{
+				accountId: "a",
+				until: atSecond(FIVE_HOUR_RESET),
+				reason: "overage_in_use",
+			},
+		]);
+	});
+
+	it("is not undone by the success clear of an older bench", async () => {
+		const { ctx } = makeCtx();
+		const account = makeAccount("a", { rate_limited_until: NOW + 60_000 });
+		await processProxyResponse(
+			respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
+			account,
+			ctx,
+		);
+		expect(account.rate_limited_until).toBe(atSecond(FIVE_HOUR_RESET));
+	});
+
+	it("does nothing without overage in use or for other providers", async () => {
+		const { ctx, marks } = makeCtx();
+		const plain = makeAccount("a");
+		await processProxyResponse(respond(allowedHeaders()), plain, ctx);
+		const other = makeAccount("c", { provider: "openai-compatible" });
+		await processProxyResponse(
+			respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
+			other,
+			ctx,
+		);
+		await flush();
+		expect(plain.rate_limited_until).toBeNull();
+		expect(other.rate_limited_until).toBeNull();
+		expect(marks).toEqual([]);
+	});
+
+	it("the bench ends at the reported reset", async () => {
+		const { ctx } = makeCtx();
+		const account = makeAccount("a");
+		seedUsage("a");
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
+			account,
+		);
+		await processProxyResponse(
+			respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
 			account,
 			ctx,
 		);
@@ -368,107 +514,109 @@ describe("header-driven mark-out on Anthropic responses", () => {
 		).toEqual([]);
 		expect(isAccountAvailable(row, after)).toBe(true);
 	});
+});
 
-	it("never cuts a stream already being served", async () => {
+describe("through proxyWithAccount (fake upstream)", () => {
+	it("a real-shaped upstream 429 marks the account in the cache on every classifier path", async () => {
+		refreshSpy.mockImplementation(async () => true);
 		const { ctx } = makeCtx();
 		seedUsage("a");
-		const chunks = [
-			"event: message_start\ndata: {}\n\n",
-			'event: content_block_delta\ndata: {"delta":{"text":"hello"}}\n\n',
-			"event: message_stop\ndata: {}\n\n",
-		];
-		const body = new ReadableStream<Uint8Array>({
-			start(controller) {
-				const enc = new TextEncoder();
-				for (const chunk of chunks) controller.enqueue(enc.encode(chunk));
-				controller.close();
-			},
-		});
-		const response = new Response(body, {
-			status: 200,
-			headers: allowedHeaders({
-				"content-type": "text/event-stream",
-				[`${P}overage-in-use`]: "true",
-			}),
-		});
+		globalThis.fetch = mock(async () =>
+			respond(
+				real429Headers(),
+				429,
+				'{"type":"error","error":{"type":"rate_limit_error","message":"x"}}',
+			),
+		) as unknown as typeof fetch;
 
-		await processProxyResponse(response, makeAccount("a"), ctx);
+		await proxyOnce(ctx, makeAccount("a"));
 
-		expect(blockedNow(ctx, "a").limits.length).toBeGreaterThan(0);
-		expect(response.bodyUsed).toBe(false);
-		expect(await response.text()).toBe(chunks.join(""));
+		expect(cached("a").five_hour.utilization).toBe(100);
+		expect(cached("a").seven_day.utilization).toBe(17);
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
+		await flush();
+		expect(refreshSpy).toHaveBeenCalledWith("a");
 	});
 
-	it("the very next selection, before any database write lands, skips the marked account", async () => {
+	it("serves an overage stream in full while the very next selection skips the account", async () => {
 		const rows = [makeAccount("a"), makeAccount("b")];
-		const { ctx } = makeCtx("anthropic", rows);
+		const { ctx } = makeCtx(rows);
+		await initUsageCollector(
+			() => false,
+			() => {},
+			{
+				initializeAsync: async () => {},
+				saveRequest: async () => {},
+				updateRequestUsage: async () => {},
+				getAdapter: () => ({ get: async () => null, run: async () => {} }),
+			} as never,
+		);
+		refreshSpy.mockImplementation(async () => true);
 		seedUsage("a");
 		seedUsage("b");
 		expect(
 			(await selectAccountsForRequest(meta(), ctx, MODEL)).map((x) => x.id),
 		).toEqual(["a", "b"]);
 
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({ [`${P}overage-in-use`]: "true" }),
-			}),
-			makeAccount("a"),
-			ctx,
-		);
+		const chunks = [
+			"event: message_start\ndata: {}\n\n",
+			'event: content_block_delta\ndata: {"delta":{"text":"hello"}}\n\n',
+			"event: message_stop\ndata: {}\n\n",
+		];
+		globalThis.fetch = mock(async () => {
+			const enc = new TextEncoder();
+			const body = new ReadableStream<Uint8Array>({
+				start(controller) {
+					for (const chunk of chunks) controller.enqueue(enc.encode(chunk));
+					controller.close();
+				},
+			});
+			return respond(
+				allowedHeaders({
+					"content-type": "text/event-stream",
+					[`${P}overage-in-use`]: "true",
+				}),
+				200,
+				body,
+			);
+		}) as unknown as typeof fetch;
+
+		const served = await proxyOnce(ctx, makeAccount("a"));
 
 		expect(rows[0].rate_limited_until).toBeNull();
 		expect(
 			(await selectAccountsForRequest(meta(), ctx, MODEL)).map((x) => x.id),
 		).toEqual(["b"]);
+		expect(served).not.toBeNull();
+		expect(await (served as Response).text()).toBe(chunks.join(""));
 	});
 
-	it("a keepalive burst refusal marks nothing", async () => {
+	it("a keepalive replay refused without window evidence marks nothing", async () => {
 		const { ctx } = makeCtx();
-		(ctx as { internalProbeSecret?: string }).internalProbeSecret = "s3cret";
 		seedUsage("a");
 		const before = usageCache.get("a");
-		await processProxyResponse(
-			new Response("{}", {
-				status: 429,
-				headers: headers({
-					[`${P}status`]: "rejected",
-					[`${P}reset`]: secs(FIVE_HOUR_RESET),
-					[`${P}5h-utilization`]: "0.42",
-				}),
-			}),
-			makeAccount("a"),
-			ctx,
-			undefined,
-			{
-				headers: new Headers({
-					[INTERNAL_PROBE_SECRET_HEADER]: "s3cret",
+		globalThis.fetch = mock(async () =>
+			respond(allowedHeaders({ [`${P}status`]: "rejected" }), 429),
+		) as unknown as typeof fetch;
+		const body = requestBody();
+		await proxyWithAccount(
+			new Request("https://proxy.local/v1/messages", {
+				method: "POST",
+				body,
+				headers: {
+					"Content-Type": "application/json",
+					[INTERNAL_PROBE_SECRET_HEADER]: SECRET,
 					"x-better-ccflare-keepalive": "true",
-				}),
-			},
+				},
+			}),
+			new URL("https://proxy.local/v1/messages"),
+			makeAccount("a"),
+			meta(),
+			body,
+			() => undefined,
+			0,
+			ctx,
 		);
 		expect(usageCache.get("a")).toBe(before);
-		expect(refreshSpy).not.toHaveBeenCalled();
-	});
-
-	it("leaves non-Anthropic providers alone", async () => {
-		const { ctx, marks } = makeCtx("openai-compatible");
-		const account = makeAccount("c", { provider: "openai-compatible" });
-		await processProxyResponse(
-			new Response("{}", {
-				status: 200,
-				headers: allowedHeaders({
-					[`${P}overage-in-use`]: "true",
-					[`${P}5h-utilization`]: "1.0",
-				}),
-			}),
-			account,
-			ctx,
-		);
-		await Promise.resolve();
-		expect(usageCache.get("c")).toBeNull();
-		expect(account.rate_limited_until).toBeNull();
-		expect(marks).toEqual([]);
-		expect(refreshSpy).not.toHaveBeenCalled();
 	});
 });

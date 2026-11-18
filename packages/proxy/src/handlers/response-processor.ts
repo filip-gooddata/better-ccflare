@@ -22,7 +22,7 @@ import {
 	tryGetUsageCollector,
 } from "../usage-collector";
 import { drainBody } from "./discard-body-cancel";
-import { applyHeaderMarkOut } from "./header-mark-out";
+import { applyOverageCooldown } from "./header-mark-out";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import {
 	applyRateLimitCooldown,
@@ -529,11 +529,6 @@ export async function processProxyResponse(
 			bypassSession,
 			requestMeta?.timestamp,
 		);
-		// A keepalive burst refusal says nothing about the account's own quota
-		// (see the cooldown skip above), so it marks nothing either.
-		if (!isKeepalive) {
-			applyHeaderMarkOut(response, account, ctx, { applyCooldown: false });
-		}
 		return true; // Signal rate limit
 	}
 
@@ -630,12 +625,10 @@ export async function processProxyResponse(
 		}
 	}
 
-	// After the clear above, so a response that reports the account out
-	// benches it for the next request instead of being undone by its own
+	// After the clear above, so a response served on extra usage benches the
+	// account for the next request instead of being undone by its own
 	// success. Reads headers only; the body still streams to the client.
-	if (!skipAccountMetadata) {
-		applyHeaderMarkOut(response, account, ctx, { applyCooldown: true });
-	}
+	applyOverageCooldown(response, account, ctx);
 
 	return false;
 }
