@@ -900,11 +900,14 @@ export class SessionPaceStrategy implements LoadBalancingStrategy {
 
 	/**
 	 * Every account that could serve the request is out on limits: pick the
-	 * one usable again first, so the request goes there and the client gets
-	 * that account's own upstream answer. An account is usable again at the
-	 * latest reset among its limits; an unknown reset sorts after every known
-	 * one. Ties go to the lower priority number, then the account name.
-	 * Session mappings are left alone.
+	 * one usable again first. Nothing is forwarded to it (upstream would serve
+	 * a full account from extra usage); the proxy answers locally with that
+	 * account's limit 429, so its retry-after is the soonest any account frees
+	 * up. An account is usable again at the latest reset among its limits; an
+	 * unknown reset sorts after every known one. Ties go to the lower priority
+	 * number, then the account name. Session mappings are left alone. The log
+	 * line keeps its `place ... rule=all-exhausted` shape for log readers; it
+	 * names the account the answer describes.
 	 */
 	selectWhenAllLimited(
 		blocked: LimitBlockedAccount[],

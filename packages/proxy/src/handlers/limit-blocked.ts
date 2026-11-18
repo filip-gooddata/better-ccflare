@@ -32,6 +32,12 @@ import {
 	getFamilyExhaustionOrigin,
 	isAccountExhaustedForModel,
 } from "./model-capacity";
+import {
+	buildLocalLimitResponse,
+	getCachedLimitRefusal,
+	localLimitInputForAccount,
+	localLimitResponseForAccount,
+} from "./limit-response";
 import type { ProxyContext } from "./proxy-types";
 
 /**
@@ -202,12 +208,12 @@ function familyLimitInForce(
 }
 
 /**
- * Whether the all-limited rule may route this request: the strategy has
- * `selectWhenAllLimited` and the request does not own its routing. A request
- * naming an account (`x-better-ccflare-account-id`, which auto-refresh and
- * keepalive probes send too) or bypassing session routing must reach only the
- * account it asked for, so neither selection nor failover path C may send it
- * anywhere else, and its refusals are not held.
+ * Whether failover path C may hold this request's limit refusals and answer
+ * with one: the strategy has `selectWhenAllLimited` and the request does not
+ * own its routing. A request naming an account (`x-better-ccflare-account-id`,
+ * which auto-refresh and keepalive probes send too) or bypassing session
+ * routing gets the answer of the account it reached, so its refusals are not
+ * held.
  */
 export function isAllLimitedRuleEligible(
 	ctx: ProxyContext,
@@ -221,14 +227,92 @@ export function isAllLimitedRuleEligible(
 }
 
 /**
- * The account to forward a request to when every account that could serve it
- * is out only on limits, or null when the request is not eligible for the rule
- * ({@link isAllLimitedRuleEligible}), nothing is limit-blocked, or the
- * strategy declines.
+ * Whether an empty selection may be answered with the local limit 429 of the
+ * account the all-limited rule ranks first. Nothing is forwarded on that path,
+ * so a bypass-session request is answered too. A request naming an account is
+ * not: its answer describes the account it named ({@link fullLimitAnswer}).
+ */
+function isLocalLimitAnswerEligible(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+): boolean {
+	return (
+		ctx.strategy.selectWhenAllLimited !== undefined &&
+		!meta.headers?.get("x-better-ccflare-account-id")
+	);
+}
+
+/**
+ * Whose limit a local 429 describes. `family` is set when the account is out
+ * on the request's model family; `cooldownResetMs` when it is out on nothing
+ * but a cooldown, whose end is then the reset the answer carries.
+ */
+export interface LocalLimitAnswer {
+	account: Account;
+	family: string | null;
+	familyResetMs: number | null;
+	cooldownResetMs: number | null;
+}
+
+function localLimitAnswerFor(entry: LimitBlockedAccount): LocalLimitAnswer {
+	const family = entry.limits.find((limit) => limit.kind === "family");
+	const onlyCooldown =
+		entry.limits.length > 0 &&
+		entry.limits.every((limit) => limit.kind === "cooldown");
+	const cooldownResets = entry.limits
+		.map((limit) => limit.resetAt)
+		.filter((reset): reset is number => reset !== null);
+	return {
+		account: entry.account,
+		family: family?.family ?? null,
+		familyResetMs: family?.resetAt ?? null,
+		cooldownResetMs:
+			onlyCooldown && cooldownResets.length > 0
+				? Math.max(...cooldownResets)
+				: null,
+	};
+}
+
+/**
+ * When every account that could serve the request is out only on limits, the
+ * account whose limit the local 429 describes: the one the strategy's
+ * `selectWhenAllLimited` ranks first (for session-pace, the account usable
+ * again first). Null when the request is not eligible, nothing is
+ * limit-blocked, or the strategy declines. Nothing is forwarded to it.
  *
  * `accounts` is the raw account list when the caller already holds it; it is
  * read from the database otherwise.
  */
+export async function selectAllLimitedAnswer(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+	model: string | undefined,
+	now: number = Date.now(),
+	accounts?: Account[],
+): Promise<LocalLimitAnswer | null> {
+	if (
+		!ctx.strategy.selectWhenAllLimited ||
+		!isLocalLimitAnswerEligible(ctx, meta)
+	) {
+		return null;
+	}
+	const all = accounts ?? (await ctx.dbOps.getAllAccounts());
+	const blocked = collectLimitBlockedAccounts(all, ctx, meta, model, now);
+	if (blocked.length === 0) return null;
+	const target = ctx.strategy.selectWhenAllLimited(blocked, meta);
+	if (!target) return null;
+	const entry = blocked.find((b) => b.account.id === target.id);
+	return entry
+		? localLimitAnswerFor(entry)
+		: {
+				account: target,
+				family: null,
+				familyResetMs: null,
+				cooldownResetMs: null,
+			};
+}
+
+/** The account of {@link selectAllLimitedAnswer}, or null. */
 export async function selectAllLimitedTarget(
 	ctx: ProxyContext,
 	meta: RequestMeta,
@@ -236,29 +320,87 @@ export async function selectAllLimitedTarget(
 	now: number = Date.now(),
 	accounts?: Account[],
 ): Promise<Account | null> {
-	if (
-		!ctx.strategy.selectWhenAllLimited ||
-		!isAllLimitedRuleEligible(ctx, meta)
-	) {
-		return null;
-	}
-	const all = accounts ?? (await ctx.dbOps.getAllAccounts());
-	const blocked = collectLimitBlockedAccounts(all, ctx, meta, model, now);
-	if (blocked.length === 0) return null;
-	return ctx.strategy.selectWhenAllLimited(blocked, meta);
+	return (
+		(await selectAllLimitedAnswer(ctx, meta, model, now, accounts))?.account ??
+		null
+	);
 }
 
-const allLimitedSelections = new WeakMap<RequestMeta, string>();
+/**
+ * The local 429 answer for `account` when it is at a full limit for this
+ * request: its five-hour or weekly window, or the request model's family.
+ * A cooldown alone does not count. Null when no full limit is in force.
+ */
+export function fullLimitAnswer(
+	account: Account,
+	ctx: ProxyContext,
+	model: string | undefined,
+	now: number = Date.now(),
+): LocalLimitAnswer | null {
+	const family = model ? getModelFamily(model) : null;
+	const limits = limitsInForce(
+		account,
+		model,
+		family,
+		isCapacityRoutingEnabled(ctx),
+		now,
+	).filter((limit) => limit.kind !== "cooldown");
+	if (limits.length === 0) return null;
+	return localLimitAnswerFor({ account, limits });
+}
 
-/** Record that this request's selection came from the all-limited rule. */
-export function markAllLimitedSelection(
+const localLimitAnswers = new WeakMap<RequestMeta, LocalLimitAnswer>();
+
+/**
+ * Record that an empty selection for this request is answered with the local
+ * 429 for `answer.account`. proxy.ts reads it before its other no-account
+ * answers; a selection that is not empty ignores it.
+ */
+export function markLocalLimitAnswer(
 	meta: RequestMeta,
-	accountId: string,
+	answer: LocalLimitAnswer,
 ): void {
-	allLimitedSelections.set(meta, accountId);
+	localLimitAnswers.set(meta, answer);
 }
 
-/** Whether this request's selection came from the all-limited rule. */
-export function isAllLimitedSelection(meta: RequestMeta): boolean {
-	return allLimitedSelections.has(meta);
+/** The answer recorded by {@link markLocalLimitAnswer}, if any. */
+export function getLocalLimitAnswer(
+	meta: RequestMeta,
+): LocalLimitAnswer | undefined {
+	return localLimitAnswers.get(meta);
+}
+
+/**
+ * The local 429 for `answer`: the account's cached real 429 replayed with
+ * retry-after and date rebased while its reset is ahead, else one built from
+ * its usage readings. An account out only on a cooldown, with no cached
+ * refusal, gets the built 429 with the cooldown end as its reset, since that
+ * is when it can serve again.
+ */
+export function localLimitAnswerResponse(
+	answer: LocalLimitAnswer,
+	requestId: string,
+	now: number = Date.now(),
+): Response {
+	if (
+		answer.cooldownResetMs !== null &&
+		!getCachedLimitRefusal(answer.account.id, now)
+	) {
+		const input = localLimitInputForAccount(answer.account.id, {
+			now,
+			provider: answer.account.provider ?? "anthropic",
+		}) ?? { binding: { kind: "five_hour" as const }, resetMs: null };
+		const response = buildLocalLimitResponse(
+			{ ...input, resetMs: answer.cooldownResetMs },
+			now,
+		);
+		response.headers.set("x-better-ccflare-request-id", requestId);
+		return response;
+	}
+	return localLimitResponseForAccount(answer.account, {
+		requestId,
+		family: answer.family,
+		familyResetMs: answer.familyResetMs,
+		now,
+	});
 }

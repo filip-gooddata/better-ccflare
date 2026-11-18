@@ -56,7 +56,6 @@ import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
 import { classifyRefusalScope, rateLimitHeaderSummary } from "./family-refusal";
-import { isAllLimitedSelection } from "./limit-blocked";
 import { blockFamily, markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
@@ -2760,7 +2759,6 @@ export async function proxyWithAccount(
 							resetTime: cooldown.until,
 							resetIsInferred,
 							reason,
-							preserveStreak: isAllLimitedSelection(requestMeta),
 						},
 						ctx,
 					);
@@ -3490,7 +3488,6 @@ export async function proxyWithAccount(
 									resetTime: cooldown.until,
 									resetIsInferred,
 									reason,
-									preserveStreak: isAllLimitedSelection(requestMeta),
 								},
 								ctx,
 							);
