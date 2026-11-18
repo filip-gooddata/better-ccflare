@@ -234,16 +234,23 @@ function targetCensored(
  * out-of-fold served loss (`oof` empty) and no day-type diagnostic
  * (`dayTypeComparison` empty). Selection, ridge, lambda, R^2 gate, cells and
  * baseline are exactly the full fit's.
+ *
+ * `excludeDays`: local day indices of the fit's calendar that never train
+ * (R3-2's outer held-out days): every target or feature span touching one is
+ * dropped from selection, inner folds, gates and cells whatever its censor
+ * share, and the baseline profiles skip those days. Unlike censoring, no
+ * partial overlap is tolerated.
  */
 export interface FitOptions {
 	lean?: boolean;
+	excludeDays?: ReadonlySet<number>;
 }
 
 export function fitPaceModel(
 	series: PaceSeries,
 	now: EpochMs,
 	partition: ArrayLike<number> = PRESENT_GROUP,
-	{ lean = false }: FitOptions = {},
+	{ lean = false, excludeDays }: FitOptions = {},
 ): PaceFitState {
 	const {
 		present,
@@ -264,6 +271,14 @@ export function fitPaceModel(
 	const floor = floorOf(m);
 	const ctx = new GrammarContext(cal);
 
+	const excluded = cal.days.map((_, d) => excludeDays?.has(d) === true);
+	const PX = excluded.includes(true)
+		? prefix(
+				Uint8Array.from({ length: cut }, (_, i) =>
+					excluded[cal.dayIdx[i] as number] ? 1 : 0,
+				),
+			)
+		: null;
 	const profile = (trainDay: (d: number) => boolean) =>
 		baselineProfile(
 			cal,
@@ -271,12 +286,13 @@ export function fitPaceModel(
 			series.censored,
 			group,
 			names.length,
-			trainDay,
+			PX ? (d) => !excluded[d] && trainDay(d) : trainDay,
 		);
 	const sums = (prof: Float64Array[]): SpanSums => ({
 		PU,
 		PC,
 		PB: baselinePrefix(cal, prof, group, cut),
+		...(PX ? { PX } : {}),
 	});
 
 	const folds: Fold[] = weeks.map((wk) => ({
@@ -804,7 +820,8 @@ function fitBand(
  * E4 fit (`fit`, lean: its own selection, ridge, lambda and R^2 gate, without
  * the diagnostics it does not serve) on the series
  * with every local day from w's first test day to the last day its targets
- * touch censored, so none of it trains, then w's test rows scored with that
+ * touch excluded (`FitOptions.excludeDays`), so no span touching one trains,
+ * then w's test rows scored with that
  * fit's served model as `PaceFitState.oof` scores them: target and feature
  * against the fit's baseline on the real series, prediction coef *
  * (clip(x) - mean) / sd of the served cell (target group, origin hour), 0
@@ -828,12 +845,9 @@ export function nestedOof(
 	const byUnit = new Map<number, number>();
 	for (const wk of weeks) {
 		const [lo, hi] = support.get(wk) as [number, number];
-		const censored = Uint8Array.from(series.censored);
-		for (let i = 0; i < cut; i++) {
-			const d = cal.dayIdx[i] as number;
-			if (d >= lo && d <= hi) censored[i] = 1;
-		}
-		const state = fit({ ...series, censored }, now, partition, { lean: true });
+		const excludeDays = new Set<number>();
+		for (let d = lo; d <= hi; d++) excludeDays.add(d);
+		const state = fit(series, now, partition, { lean: true, excludeDays });
 		const prof = names.map((t) =>
 			Float64Array.from(state.baseline[t as keyof PaceFitState["baseline"]]),
 		);
