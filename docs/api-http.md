@@ -914,11 +914,11 @@ curl -X POST http://localhost:8080/api/config/force-account-model \
 
 #### GET /api/config/use-extra-usage
 
-Whether an account whose plan window is spent stays in rotation while its provider reports billed capacity beyond the plan (Codex credits, Anthropic extra usage). Config-file setting, off by default; `CCFLARE_USE_EXTRA_USAGE` can only seed it once — see [Use Extra Usage](configuration.md#use-extra-usage) in configuration.md.
+The stored `use_extra_usage` value. **It no longer does anything**: a full five-hour, weekly or model-family limit is final, whatever extra usage or spend says. Still accepted and stored so old clients keep working; `ignored` is always `true`. `CCFLARE_USE_EXTRA_USAGE` can only seed the stored value once — see [Use Extra Usage](configuration.md#use-extra-usage) in configuration.md.
 
 **Response:**
 ```json
-{ "enabled": false, "source": "default" }
+{ "enabled": false, "source": "default", "ignored": true, "note": "use_extra_usage no longer does anything: ..." }
 ```
 
 **Example:**
@@ -928,7 +928,7 @@ curl http://localhost:8080/api/config/use-extra-usage
 
 #### POST /api/config/use-extra-usage
 
-Enable or disable serving on extra usage. Takes effect immediately, no restart required.
+Stores the value and returns 200, but it has no effect: routing never serves a full limit on extra usage. `effective` is always `false`.
 
 **Request:**
 ```json
@@ -937,7 +937,7 @@ Enable or disable serving on extra usage. Takes effect immediately, no restart r
 
 **Response:**
 ```json
-{ "success": true, "enabled": true, "source": "file", "effective": true }
+{ "success": true, "enabled": true, "source": "file", "effective": false, "ignored": true, "note": "use_extra_usage no longer does anything: ..." }
 ```
 
 **Example:**

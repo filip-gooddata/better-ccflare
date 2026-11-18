@@ -21,7 +21,6 @@ import {
 	registerDisposable,
 	setForceAccountModel,
 	setPricingLogger,
-	setUseExtraUsage,
 	shutdown,
 	TIME_CONSTANTS,
 	USAGE_THRESHOLD_PAUSE_REASON,
@@ -1347,12 +1346,11 @@ export default async function startServer(options?: {
 	// which may depend on config; mirror the setting there before anything can
 	// route. The config POST handler mirrors it again after a write.
 	setForceAccountModel(config.getForceAccountModel());
-	// Same constraint for "use extra usage": the usage snapshot that gates
-	// admission is built in providers. Seed it from the environment first (a
-	// one-time adoption into the config file), then mirror the result.
-	const extraUsageNote = config.adoptUseExtraUsageFromEnv();
-	if (extraUsageNote) new Logger("Startup").info(extraUsageNote);
-	setUseExtraUsage(config.getUseExtraUsage());
+	// "Use extra usage" is retired: still read from the config, never mirrored
+	// into routing. Warn once when it is on so the operator knows it is ignored.
+	config.reportUseExtraUsageAtStartup((message) =>
+		new Logger("Startup").warn(message),
+	);
 	installOutboundProxy(() => config.getOutboundProxy());
 	// The usage poller detects Codex window rollovers with the same predicate
 	// as the traffic path, so it must ride the same window. Config cannot be

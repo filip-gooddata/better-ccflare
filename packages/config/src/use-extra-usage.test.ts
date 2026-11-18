@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Config } from "./index";
+import { Config, USE_EXTRA_USAGE_IGNORED_WARNING } from "./index";
 
 const ENV = "CCFLARE_USE_EXTRA_USAGE";
 
@@ -130,6 +130,108 @@ describe("adoptUseExtraUsageFromEnv", () => {
 			expect(config.getUseExtraUsageSource()).toBe("default");
 		} finally {
 			cleanup();
+		}
+	});
+});
+
+describe("use_extra_usage is accepted but ignored", () => {
+	const original = process.env[ENV];
+
+	beforeEach(() => {
+		delete process.env[ENV];
+	});
+
+	afterEach(() => {
+		if (original === undefined) delete process.env[ENV];
+		else process.env[ENV] = original;
+	});
+
+	function report(config: Config): string[] {
+		const warnings: string[] = [];
+		config.reportUseExtraUsageAtStartup((message) => warnings.push(message));
+		return warnings;
+	}
+
+	it("warns once at start when the file sets it true", () => {
+		const { dir, cleanup } = makeConfig();
+		try {
+			writeFileSync(
+				join(dir, "config.json"),
+				JSON.stringify({ use_extra_usage: true }),
+			);
+			const config = new Config(join(dir, "config.json"));
+			expect(config.getUseExtraUsage()).toBe(true);
+			expect(report(config)).toEqual([USE_EXTRA_USAGE_IGNORED_WARNING]);
+			expect(USE_EXTRA_USAGE_IGNORED_WARNING).toContain("ignored");
+			expect(USE_EXTRA_USAGE_IGNORED_WARNING).toContain("five-hour");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("says nothing when the file sets it false", () => {
+		const { dir, cleanup } = makeConfig();
+		try {
+			writeFileSync(
+				join(dir, "config.json"),
+				JSON.stringify({ use_extra_usage: false }),
+			);
+			const config = new Config(join(dir, "config.json"));
+			expect(config.getUseExtraUsage()).toBe(false);
+			expect(report(config)).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("says nothing when it is unset", () => {
+		const { config, cleanup } = makeConfig();
+		try {
+			expect(report(config)).toEqual([]);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("warns once when the environment seeds it true, and not when it seeds false", () => {
+		process.env[ENV] = "true";
+		const on = makeConfig();
+		try {
+			expect(report(on.config)).toEqual([USE_EXTRA_USAGE_IGNORED_WARNING]);
+			expect(on.config.getUseExtraUsage()).toBe(true);
+		} finally {
+			on.cleanup();
+		}
+
+		process.env[ENV] = "false";
+		const off = makeConfig();
+		try {
+			expect(report(off.config)).toEqual([]);
+			expect(off.config.getUseExtraUsage()).toBe(false);
+		} finally {
+			off.cleanup();
+		}
+	});
+
+	it("starts an old config file carrying the setting without rewriting it", () => {
+		for (const value of [true, false]) {
+			const { dir, cleanup } = makeConfig();
+			try {
+				const path = join(dir, "config.json");
+				const before = `${JSON.stringify(
+					{ port: 8080, use_extra_usage: value },
+					null,
+					2,
+				)}\n`;
+				writeFileSync(path, before);
+				const config = new Config(path);
+				report(config);
+				expect(config.getUseExtraUsage()).toBe(value);
+				expect(config.getUseExtraUsageSource()).toBe("file");
+				expect(readFileSync(path, "utf8")).toBe(before);
+			} finally {
+				cleanup();
+			}
 		}
 	});
 });

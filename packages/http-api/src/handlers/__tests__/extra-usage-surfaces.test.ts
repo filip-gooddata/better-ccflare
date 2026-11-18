@@ -94,16 +94,18 @@ describe("computePoolStatus — extra usage", () => {
 });
 
 describe("/api/config/use-extra-usage", () => {
-	it("reports the switch and pushes a write into the runtime mirror", async () => {
+	it("accepts and stores a write, says it is ignored, and never arms the runtime flag", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "bcc-extra-usage-api-"));
 		try {
-			const handlers = createConfigHandlers(
-				new Config(join(dir, "config.json")),
-				paceSettings,
-			);
+			const config = new Config(join(dir, "config.json"));
+			const handlers = createConfigHandlers(config, paceSettings);
 
 			const before = await handlers.getUseExtraUsage().json();
-			expect(before).toEqual({ enabled: false, source: "default" });
+			expect(before).toMatchObject({
+				enabled: false,
+				source: "default",
+				ignored: true,
+			});
 
 			const res = await handlers.setUseExtraUsage(
 				new Request("http://localhost/api/config/use-extra-usage", {
@@ -116,9 +118,16 @@ describe("/api/config/use-extra-usage", () => {
 				success: true,
 				enabled: true,
 				source: "file",
-				effective: true,
+				effective: false,
+				ignored: true,
 			});
-			expect(isUseExtraUsageEnabled()).toBe(true);
+			expect(config.getUseExtraUsage()).toBe(true);
+			expect(await handlers.getUseExtraUsage().json()).toMatchObject({
+				enabled: true,
+				source: "file",
+				ignored: true,
+			});
+			expect(isUseExtraUsageEnabled()).toBe(false);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
