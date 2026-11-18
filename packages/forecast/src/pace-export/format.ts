@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { learnDays } from "../engine/learn/daily";
-import type { Partition } from "../engine/learn/types";
+import type { Partition, RowChoice } from "../engine/learn/types";
 import type { PaceSeries } from "../engine/pace/types";
 import type { RefitDemandSettings } from "../service/pace-refit-runner";
 import { BUCKET_MS, type EpochMs } from "../types";
@@ -19,8 +19,8 @@ export interface PaceExportInput {
 	historyFrom: EpochMs;
 	accountCount: number;
 	settings: RefitDemandSettings;
-	/** The row-1 partitions in force at this refit (served, and pending confirmation), null before any row-1 choice. */
-	rowOne: { served: Partition; pending: Partition | null } | null;
+	/** The stored row-1 choice the main job passes to learnDemand, and the partition pending confirmation; null before any row-1 choice. */
+	rowOne: { choice: RowChoice<Partition>; pending: Partition | null } | null;
 }
 
 export interface PaceExportDay {
@@ -40,10 +40,63 @@ export interface PaceExportFile {
 	timeZone: string;
 	accountCount: number;
 	settings: RefitDemandSettings;
-	rowOne: { served: number[]; pending: number[] | null } | null;
+	rowOne: { choice: ExportedRowChoice; pending: number[] | null } | null;
 	buckets: { start: EpochMs; units: number[]; censored: number[] };
 	days: PaceExportDay[];
 	hash: string;
+}
+
+/** The only row a stored row-1 choice comes from. */
+export const ROW_ONE = "daytypes";
+/** `RowChoice.reason`, stored as its index here. */
+export const ROW_REASONS: readonly RowChoice<unknown>["reason"][] = [
+	"on",
+	"present-best",
+	"below-floor",
+	"gain-le-se",
+	"bh",
+	"no-units",
+];
+
+/** A row-1 `RowChoice` as numbers: NaN as null, `on` as 0|1, `reason` as its ROW_REASONS index; `row` is always ROW_ONE. */
+export interface ExportedRowChoice {
+	m: number;
+	floor: number;
+	units: number;
+	present: number[];
+	chosen: number[];
+	runnerUp: number[] | null;
+	served: number[];
+	presentLoss: number | null;
+	chosenLoss: number | null;
+	gain: number | null;
+	se: number | null;
+	p: number | null;
+	on: 0 | 1;
+	reason: number;
+}
+
+const nanToNull = (x: number): number | null => (Number.isNaN(x) ? null : x);
+
+export function encodeRowChoice(c: RowChoice<Partition>): ExportedRowChoice {
+	const reason = ROW_REASONS.indexOf(c.reason);
+	if (c.row !== ROW_ONE || reason < 0) throw new PaceExportError("rowone");
+	return {
+		m: c.m,
+		floor: c.floor,
+		units: c.units,
+		present: Array.from(c.present),
+		chosen: Array.from(c.chosen),
+		runnerUp: c.runnerUp ? Array.from(c.runnerUp) : null,
+		served: Array.from(c.served),
+		presentLoss: nanToNull(c.presentLoss),
+		chosenLoss: nanToNull(c.chosenLoss),
+		gain: nanToNull(c.gain),
+		se: nanToNull(c.se),
+		p: nanToNull(c.p),
+		on: c.on ? 1 : 0,
+		reason,
+	};
 }
 
 /**
@@ -152,7 +205,7 @@ export function buildPaceExport(
 		settings,
 		rowOne: input.rowOne
 			? {
-					served: Array.from(input.rowOne.served),
+					choice: encodeRowChoice(input.rowOne.choice),
 					pending: input.rowOne.pending
 						? Array.from(input.rowOne.pending)
 						: null,

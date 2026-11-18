@@ -3,6 +3,7 @@ import type {
 	LearnInput,
 	Partition,
 	PartitionFitter,
+	RowChoice,
 } from "../engine/learn/types";
 import type { PaceSeries } from "../engine/pace/types";
 import type { SeriesJobPayload } from "../service/forecast-jobs";
@@ -15,6 +16,8 @@ import {
 	type PaceExportFile,
 	paceExportHash,
 	pickSettings,
+	ROW_ONE,
+	ROW_REASONS,
 } from "./format";
 
 /** An exported pace series read back into the inputs the same revision's learners take. */
@@ -23,7 +26,8 @@ export interface LoadedPaceExport {
 	series: PaceSeries;
 	now: EpochMs;
 	settings: RefitDemandSettings;
-	rowOne: { served: Partition; pending: Partition | null } | null;
+	/** `rowOne.choice` is the second argument learnDemand got in the live main job. */
+	rowOne: { choice: RowChoice<Partition>; pending: Partition | null } | null;
 	/** `learnDemand`'s first argument; rows 2-8 call no fitter, row 1 needs a real one. */
 	learnInput(fitWithPartition: PartitionFitter): LearnInput;
 	/** The worker job payload (`refitJob`, `daytypesJob`) without `daytypes`/`pending`; fresh buffers per call. */
@@ -46,6 +50,36 @@ function numbers(v: unknown, what: string): number[] {
 function num(v: unknown, what: string): number {
 	if (!isNum(v)) fail(`${what} must be a finite number`);
 	return v;
+}
+
+const numOrNaN = (v: unknown, what: string): number =>
+	v === null ? Number.NaN : num(v, what);
+
+function decodeRowChoice(v: unknown): RowChoice<Partition> {
+	const c = (v ?? fail("rowOne.choice missing")) as Record<string, unknown>;
+	const reason = ROW_REASONS[num(c.reason, "rowOne.choice.reason")];
+	if (reason === undefined) fail("rowOne.choice.reason out of range");
+	if (c.on !== 0 && c.on !== 1) fail("rowOne.choice.on must be 0 or 1");
+	return {
+		row: ROW_ONE,
+		m: num(c.m, "rowOne.choice.m"),
+		floor: num(c.floor, "rowOne.choice.floor"),
+		units: num(c.units, "rowOne.choice.units"),
+		present: numbers(c.present, "rowOne.choice.present"),
+		chosen: numbers(c.chosen, "rowOne.choice.chosen"),
+		runnerUp:
+			c.runnerUp === null
+				? null
+				: numbers(c.runnerUp, "rowOne.choice.runnerUp"),
+		served: numbers(c.served, "rowOne.choice.served"),
+		presentLoss: numOrNaN(c.presentLoss, "rowOne.choice.presentLoss"),
+		chosenLoss: numOrNaN(c.chosenLoss, "rowOne.choice.chosenLoss"),
+		gain: numOrNaN(c.gain, "rowOne.choice.gain"),
+		se: numOrNaN(c.se, "rowOne.choice.se"),
+		p: numOrNaN(c.p, "rowOne.choice.p"),
+		on: c.on === 1,
+		reason,
+	};
 }
 
 /** Parses and checks a file `exportPaceSeries` wrote: schema, field types, hash and the day table. */
@@ -82,7 +116,7 @@ export function parsePaceExport(text: string): LoadedPaceExport {
 		r1 == null
 			? null
 			: {
-					served: numbers(r1.served, "rowOne.served"),
+					choice: decodeRowChoice(r1.choice),
 					pending:
 						r1.pending == null ? null : numbers(r1.pending, "rowOne.pending"),
 				};
