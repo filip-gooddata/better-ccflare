@@ -3,6 +3,10 @@ import {
 	fanLevelsForCount,
 	DEFAULT_FAN_LEVELS as SERVED_DEFAULT_FAN_LEVELS,
 } from "../../contract/levels";
+import {
+	createForecastWorkerRunner,
+	type ForecastWorkerRunner,
+} from "../../service/forecast-worker-runner";
 import { localDayStart } from "../../time";
 import type {
 	ForecastBlock,
@@ -14,8 +18,11 @@ import { poolFor } from "../days";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import { presentDemand } from "../learn";
 import type { EngineContext } from "../model";
+import { buildPaceSeries, fitPaceModel } from "../pace";
+import type { PlanJobResult } from "../plan-job";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
+import { SCENARIO_LADDER_TOP } from "../scenario-count";
 import {
 	buildInput,
 	DEFAULT_FAN_LEVELS,
@@ -346,6 +353,61 @@ describe("cost", () => {
 			expect(value.available).toBe(true);
 			console.info(
 				`[engine] production compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+			);
+			expect(longestMs).toBeLessThan(40);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
+
+	test(
+		"at the top rung, with learned demand and a fitted demand model, the same slice limit holds",
+		async () => {
+			const base = buildInput(replayFixture());
+			const series = buildPaceSeries({
+				history: base.history,
+				historyFrom: base.historyFrom,
+				now: base.now,
+				readings: base.readings,
+				accounts: base.accounts.map((a) => a.accountId),
+				timeZone: TZ,
+			});
+			const settings = { ...base.settings, paceConditioning: true };
+			const input: ForecastInput = {
+				...base,
+				settings,
+				demandModel: fitPaceModel(series, base.now),
+				learnedDemand: {
+					...presentDemand(settings),
+					jitterMin: settings.timeShiftMin + 15,
+					bandwidthK: 1,
+					halfLifeDays: settings.historyHalfLifeDays * 2,
+				},
+			};
+			const worker = createForecastWorkerRunner();
+			const counted: number[] = [];
+			const planRunner: ForecastWorkerRunner = {
+				async run(job, payload, options) {
+					const outcome = await worker.run(job, payload, options);
+					if (job === "plan" && outcome.status === "ok") {
+						const planned = outcome.result as PlanJobResult;
+						counted.push(planned.scenarioCount.n, planned.result.traces.length);
+					}
+					return outcome;
+				},
+			};
+			const top = createForecastEngine({
+				planRunner,
+				planJob: {
+					ladder: { start: SCENARIO_LADDER_TOP, top: SCENARIO_LADDER_TOP },
+				},
+			});
+			const { value, longestMs, turns, wallMs } = await measureYield(() =>
+				top.compute(input),
+			);
+			expect(value.available).toBe(true);
+			expect(counted).toEqual([SCENARIO_LADDER_TOP, SCENARIO_LADDER_TOP]);
+			console.info(
+				`[engine] top-rung learned compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
 			);
 			expect(longestMs).toBeLessThan(40);
 		},
