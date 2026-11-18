@@ -143,7 +143,10 @@ export function workStartMinute(
 }
 
 /** Index of the first bucket at which the cumulative units reach `sharePct` percent of the day's total; null without demand. */
-function shareReachedAt(units: Float64Array, sharePct: number): number | null {
+export function shareReachedAt(
+	units: Float64Array,
+	sharePct: number,
+): number | null {
 	let total = 0;
 	for (const u of units) total += u;
 	if (!(total > 0)) return null;
