@@ -24,7 +24,9 @@ export interface MarkAccountRateLimitedResult {
  * The `rate_limited_until` / `rate_limited_reason` assignments of a cooldown
  * write. Any cooldown but an overage bench may extend an `overage_in_use`
  * bench that has not reached its reset, never shorten or relabel it: ending
- * it early would readmit an account that is spending extra usage. All right-
+ * it early would readmit an account that is spending extra usage. An overage
+ * bench keeps the later of its own deadline and an active stored one, so a
+ * second response reporting an earlier reset cannot end the bench. All right-
  * hand sides read the row as it was before the update.
  */
 function cooldownAssignments(
@@ -34,8 +36,8 @@ function cooldownAssignments(
 ): { sql: string; params: unknown[] } {
 	if (reason === "overage_in_use") {
 		return {
-			sql: "rate_limited_until = ?, rate_limited_reason = ?",
-			params: [until, reason],
+			sql: "rate_limited_until = CASE WHEN rate_limited_until > ? AND rate_limited_until > ? THEN rate_limited_until ELSE ? END, rate_limited_reason = ?",
+			params: [now, until, until, reason],
 		};
 	}
 	const bench =
@@ -428,7 +430,11 @@ export class AccountRepository extends BaseRepository<Account> {
                rate_limit_reset        = NULL,
                rate_limit_reset_at     = NULL
          WHERE id = ?
-           AND (rate_limited_until IS NULL OR rate_limited_until <= ?)`,
+           AND (rate_limited_until IS NULL OR rate_limited_until <= ?${
+							// An overage bench already keeps the later deadline in its
+							// assignment; it still has to label a longer cooldown.
+							reason === "overage_in_use" ? " OR 1 = 1" : ""
+						})`,
 				[...cooldown.params, Date.now(), accountId, until],
 			);
 			applied = changes > 0;

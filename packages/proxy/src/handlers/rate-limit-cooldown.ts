@@ -414,8 +414,21 @@ export function applyRateLimitCooldown(
 		account.rate_limited_until != null &&
 		account.rate_limited_until > now;
 
+	// An overage bench never shortens an active cooldown, whatever its reason:
+	// two in-flight responses may report different resets, and the earlier one
+	// must not end the bench. It keeps the later deadline and the bench label.
+	// The database write applies the same rule (markAccountRateLimited).
+	const overageKeepsLaterDeadline =
+		reason === "overage_in_use" &&
+		account.rate_limited_until != null &&
+		account.rate_limited_until > now &&
+		account.rate_limited_until > cooldownUntil;
+
 	// In-memory update so the rest of this request sees consistent state.
-	if (keepsOverageBench) {
+	if (overageKeepsLaterDeadline) {
+		account.rate_limited_at = now;
+		account.rate_limited_reason = reason;
+	} else if (keepsOverageBench) {
 		if (cooldownUntil > (account.rate_limited_until as number)) {
 			account.rate_limited_until = cooldownUntil;
 		}
