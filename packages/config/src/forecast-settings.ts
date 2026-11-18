@@ -3,6 +3,8 @@ import {
 	DEFAULT_FAN_LEVELS,
 	FIXED_PERCENTILES,
 	type ForecastSettings,
+	fanLevelsForCount,
+	MAX_FAN_LEVEL_COUNT,
 } from "@better-ccflare/forecast";
 
 /** Config-file keys of the forecast settings (snake_case, like `session_pace_*`). */
@@ -192,39 +194,55 @@ function resolveModel(input: ForecastResolveInput): string {
 	return DEFAULT_PREWARM_MODEL;
 }
 
+/**
+ * `fanLevels` from a count or a list. A count (a number in the config file, a bare whole
+ * number in the environment) generates the levels by `fanLevelsForCount`; a list (a JSON
+ * array, or comma-separated in the environment, a trailing comma allowed so one level can
+ * be written "25,") names them. The environment wins over the config file whatever form
+ * each has.
+ */
 function resolveFanLevels(input: ForecastResolveInput): number[] {
 	const raw = pick(input, "FORECAST_FAN_LEVELS", "forecast_fan_levels");
 	const fallback = [...DEFAULT_FAN_LEVELS];
 	if (!raw) return fallback;
+	let count: unknown = null;
 	let list: unknown[] | null = null;
-	if (Array.isArray(raw.value)) list = raw.value;
+	if (typeof raw.value === "number" && !raw.fromEnv) count = raw.value;
+	else if (Array.isArray(raw.value)) list = raw.value;
 	else if (raw.fromEnv && typeof raw.value === "string") {
 		const s = raw.value.trim();
-		list =
-			s.toLowerCase() === NONE
-				? []
-				: s.split(",").map((part) => {
-						const t = part.trim();
-						return t === "" ? Number.NaN : Number(t);
-					});
+		if (/^\d+$/.test(s)) count = Number(s);
+		else if (s.toLowerCase() === NONE) list = [];
+		else
+			list = (s.endsWith(",") ? s.slice(0, -1) : s).split(",").map((part) => {
+				const t = part.trim();
+				return t === "" ? Number.NaN : Number(t);
+			});
 	}
-	if (
-		list === null ||
-		!list.every(
+	if (count !== null) {
+		const n = count as number;
+		if (
+			Number.isInteger(n) &&
+			n >= 0 &&
+			n <= MAX_FAN_LEVEL_COUNT &&
+			n % 2 === 0
+		)
+			return fanLevelsForCount(n);
+	} else if (
+		list?.every(
 			(p) => Number.isInteger(p) && (p as number) >= 1 && (p as number) <= 99,
 		)
-	) {
-		input.warn(
-			raw.source,
-			raw.value,
-			`a list of whole percentiles from 1 to 99 (comma-separated in the environment, "${NONE}" for no fan)`,
-			"every 2 points 12…48 and 52…88",
-		);
-		return fallback;
-	}
-	return [...new Set(list as number[])]
-		.filter((p) => !FIXED_PERCENTILES.includes(p))
-		.sort((a, b) => a - b);
+	)
+		return [...new Set(list as number[])]
+			.filter((p) => !FIXED_PERCENTILES.includes(p))
+			.sort((a, b) => a - b);
+	input.warn(
+		raw.source,
+		raw.value,
+		`an even count from 0 to ${MAX_FAN_LEVEL_COUNT}, or a list of whole percentiles from 1 to 99 (comma-separated in the environment, "${NONE}" for no fan)`,
+		DEFAULT_FAN_LEVELS.join(","),
+	);
+	return fallback;
 }
 
 function parseAt(value: unknown): number | null {

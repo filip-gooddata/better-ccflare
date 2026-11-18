@@ -269,7 +269,10 @@ describe("APIRouter — GET /api/config/strategy forecast fields", () => {
 			path: "/api/forecast",
 			contractVersion: 1,
 		});
-		expect(body.forecastSettings).toEqual(SETTINGS);
+		expect(body.forecastSettings).toEqual({
+			...SETTINGS,
+			fanLevelCount: SETTINGS.fanLevels.length,
+		});
 	});
 
 	it("keeps forecastSettings and drops the discovery field while disabled", async () => {
