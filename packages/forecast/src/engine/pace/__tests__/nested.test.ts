@@ -268,8 +268,8 @@ describe("outer-fold exclusion (R3-2: held-out days never train)", () => {
 				excludeDays,
 			});
 			expect(
-				base.selected.find((b) => b.band === "8-16h")?.feature,
-			).not.toBeNull();
+				typeof base.selected.find((b) => b.band === "8-16h")?.feature,
+			).toBe("string");
 			expect(
 				comparable(
 					fitPaceModel(changed, NOW, undefined, { lean: true, excludeDays }),
