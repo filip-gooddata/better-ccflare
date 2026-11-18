@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import {
+	fanLevelsForCount,
+	DEFAULT_FAN_LEVELS as SERVED_DEFAULT_FAN_LEVELS,
+} from "../../contract/levels";
 import { localDayStart } from "../../time";
 import type {
 	ForecastBlock,
@@ -192,6 +196,31 @@ describe("determinism", () => {
 });
 
 describe("response shape (spec sections 3 to 6) on a real compute", () => {
+	test.each([
+		["the served default", [...SERVED_DEFAULT_FAN_LEVELS]],
+		["no fan", fanLevelsForCount(0)],
+		["the largest count", fanLevelsForCount(78)],
+	])("serves exactly the fan keys of %s, ordered at every index", async (_, fanLevels) => {
+		const input = buildInput(replayFixture());
+		const response = await computed({
+			...input,
+			settings: { ...input.settings, fanLevels },
+		});
+		for (const block of [response.day, response.week]) {
+			expect(block).not.toBeNull();
+			const all = lines(block as ForecastBlock);
+			expect(all.map((l) => l.level)).toEqual(
+				[10, 50, 90, ...fanLevels].sort((a, b) => a - b),
+			);
+			const n = (block as ForecastBlock).times.length;
+			for (let i = 0; i < n; i++)
+				for (let j = 1; j < all.length; j++)
+					expect(all[j]?.values[i] ?? Number.NaN).toBeLessThanOrEqual(
+						all[j - 1]?.values[i] ?? Number.NaN,
+					);
+		}
+	});
+
 	test("41 lines ordered at every index for day and week, rounded to one decimal", async () => {
 		const response = await computed(buildInput(replayFixture()));
 		for (const block of [response.day, response.week]) {

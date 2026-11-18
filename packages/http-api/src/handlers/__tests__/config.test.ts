@@ -42,7 +42,10 @@ function defaultForecastSettings() {
 /** The strategy response fields the forecast adds with nothing configured. */
 function defaultForecastFields() {
 	return {
-		forecastSettings: realDefaultForecastSettings(),
+		forecastSettings: {
+			...realDefaultForecastSettings(),
+			fanLevelCount: 6,
+		},
 		forecast: { path: "/api/forecast", contractVersion: 1 },
 	};
 }

@@ -123,7 +123,7 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `simulatedDays` | `FORECAST_SIMULATED_DAYS` | `forecast_simulated_days` | `400` | integer 50–2000 |
 | `timeShiftMin` | `FORECAST_TIME_SHIFT_MIN` | `forecast_time_shift_min` | `30` | 0–120 |
 | `transcriptsDir` | `FORECAST_TRANSCRIPTS_DIR` | `forecast_transcripts_dir` | `~/.claude/projects` (expanded) | absolute path, or `none` |
-| `fanLevels` | `FORECAST_FAN_LEVELS` | `forecast_fan_levels` | `12,14,…,48,52,…,88` (38 levels) | whole numbers 1–99 |
+| `fanLevels` | `FORECAST_FAN_LEVELS` | `forecast_fan_levels` | `12,24,38,62,76,88` (6 levels) | an even count 0–78, or a list of whole numbers 1–99 |
 | `minStopPoints` | `FORECAST_MIN_STOP_POINTS` | `forecast_min_stop_points` | `1` | 0–100 |
 | `moveMinGainPoints` | `FORECAST_MOVE_MIN_GAIN_POINTS` | `forecast_move_min_gain_points` | `2` | 0–100 |
 | `openMinGainPoints` | `FORECAST_OPEN_MIN_GAIN_POINTS` | `forecast_open_min_gain_points` | `1` | 0–100 |
@@ -144,7 +144,11 @@ How the values are read:
 - Numbers: out-of-range values are clamped to the range; integer settings are rounded. In the config file a number must be a JSON number.
 - Booleans: from the environment `true`, `1`, `yes`, `on` and `false`, `0`, `no`, `off` (any case); in the config file only JSON `true` and `false`.
 - Paths (`claudePath`, `transcriptsDir`): a leading `~` is expanded to the home directory and the result must be absolute. `none` turns the setting off, as do JSON `null` and an empty string in the config file.
-- `fanLevels`: in the environment a comma-separated list, or `none` for an empty fan; in the config file a JSON array. 10, 50 and 90 are dropped (they are always the named light, typical and heavy lines), duplicates are removed and the list is sorted. One bad entry makes the whole list invalid.
+- `fanLevels`: a count or a list.
+  - A count is a JSON number in the config file, or a bare whole number in the environment. It must be even, from 0 to 78; 0 means no fan. Half the levels lie below 50 and half above: with h = count / 2, the lower levels are 10 + 40·k / (h + 1) for k = 1…h, rounded to a whole number (halves round up), and the upper levels are 100 minus each lower level. So `38` gives every 2 points `12,14,…,48,52,…,88`, `6` gives `20,30,40,60,70,80` (not the default), and `78` gives every whole point 11–49 and 51–89.
+  - A list is a JSON array in the config file, or comma-separated in the environment (`none` for an empty fan). A single level in the environment needs a trailing comma (`25,`), because a bare number is a count. 10, 50 and 90 are dropped (they are always the named light, typical and heavy lines), duplicates are removed and the list is sorted. One bad entry makes the whole list invalid.
+  - The default is the list `12,24,38,62,76,88`, which no count gives. The environment wins over the config file whichever form each uses; an invalid value falls back to the default with one warning.
+  - Like the other settings, a change takes effect on the next forecast after a restart: the server reads the config file and its environment once, at start.
 - `prewarmTest`: in the environment JSON or `none`; in the config file a JSON object or `null`. `account` is an account name or id; `at` is epoch milliseconds or an ISO 8601 time with a zone (`Z` or `±hh:mm`).
 - Pre-warm is off by default (`prewarm` is `false`). With it off, a window opening the forecast plans is made by routing: from the planned time the next new session goes to that account (rule `forecast-open`) and opens its window. With it on, a pre-warm request opens the window at that time.
 
@@ -576,7 +580,7 @@ Response:
 - While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
 - The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
 
-`forecastSettings` is always present. It holds the 20 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`).
+`forecastSettings` is always present. It holds the 20 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`), plus `fanLevelCount`, the number of levels in `fanLevels` (whether they were set by a count or a list).
 
 `forecast` is present only while the forecast setting `enabled` is `true`:
 

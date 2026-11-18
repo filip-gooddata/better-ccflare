@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { ForecastResponse } from "../../types";
 import { disabledForecastResponse } from "../disabled";
-import { DEFAULT_FAN_LEVELS } from "../levels";
+import {
+	DEFAULT_FAN_LEVELS,
+	fanLevelsForCount,
+	MAX_FAN_LEVEL_COUNT,
+} from "../levels";
 import { validateForecastResponse } from "../validate";
 import specFull from "./fixtures/spec-example-full.json";
 import specNone from "./fixtures/spec-example-none.json";
@@ -29,9 +33,25 @@ describe("validateForecastResponse accepts", () => {
 		expect(validateForecastResponse(specNone)).toEqual([]);
 	});
 
+	test.each([
+		["the default", [...DEFAULT_FAN_LEVELS]],
+		["no fan", fanLevelsForCount(0)],
+		["the largest count", fanLevelsForCount(MAX_FAN_LEVEL_COUNT)],
+	])("a generated response with %s fan validates with exactly its keys", (_, levels) => {
+		const response = generateFullResponse(levels);
+		const keys = levels.map((p) => `p${p}`);
+		expect(Object.keys(response.day?.fan ?? {}).sort()).toEqual(
+			[...keys].sort(),
+		);
+		expect(Object.keys(response.week?.fan ?? {}).sort()).toEqual(
+			[...keys].sort(),
+		);
+		expect(validateForecastResponse(response)).toEqual([]);
+	});
+
 	test("a full-size generated response with all 41 lines", () => {
 		const response = generateFullResponse();
-		expect(DEFAULT_FAN_LEVELS).toHaveLength(38);
+		expect(fanLevelsForCount(38)).toHaveLength(38);
 		expect(Object.keys(response.day?.fan ?? {})).toHaveLength(38);
 		expect(response.day?.times.length).toBeGreaterThanOrEqual(300);
 		expect(response.week?.times.length).toBeGreaterThanOrEqual(170);

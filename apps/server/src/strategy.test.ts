@@ -86,9 +86,8 @@ function defaultForecastFields() {
 			simulatedDays: 400,
 			timeShiftMin: 30,
 			transcriptsDir: join(homedir(), ".claude", "projects"),
-			fanLevels: Array.from({ length: 39 }, (_, i) => 12 + 2 * i).filter(
-				(p) => p !== 50,
-			),
+			fanLevels: [12, 24, 38, 62, 76, 88],
+			fanLevelCount: 6,
 			minStopPoints: 1,
 			moveMinGainPoints: 2,
 			openMinGainPoints: 1,
@@ -412,6 +411,7 @@ describe("GET /api/config/strategy forecast fields", () => {
 	const FORECAST_SETTINGS_KEYS = [
 		"claudePath",
 		"enabled",
+		"fanLevelCount",
 		"fanLevels",
 		"historyHalfLifeDays",
 		"historyLookbackDays",
@@ -485,6 +485,7 @@ describe("GET /api/config/strategy forecast fields", () => {
 		const settings = off.forecastSettings as Record<string, unknown>;
 		expect(settings.simulatedDays).toBe(800);
 		expect(settings.fanLevels).toEqual([20, 80]);
+		expect(settings.fanLevelCount).toBe(2);
 
 		process.env.FORECAST_ENABLED = "true";
 		process.env.FORECAST_SIMULATED_DAYS = "9";
@@ -493,6 +494,23 @@ describe("GET /api/config/strategy forecast fields", () => {
 		expect((on.forecastSettings as Record<string, unknown>).simulatedDays).toBe(
 			50,
 		);
+	});
+
+	it("shows the count and the generated list when the fan is set by a count", async () => {
+		const config = makeConfig({ forecast_fan_levels: 38 });
+		const body = await strategyBody(config, null);
+		const settings = body.forecastSettings as Record<string, unknown>;
+		expect(settings.fanLevelCount).toBe(38);
+		expect(settings.fanLevels).toEqual([
+			...Array.from({ length: 19 }, (_, i) => 12 + 2 * i),
+			...Array.from({ length: 19 }, (_, i) => 52 + 2 * i),
+		]);
+
+		process.env.FORECAST_FAN_LEVELS = "0";
+		const none = await strategyBody(config, null);
+		const noneSettings = none.forecastSettings as Record<string, unknown>;
+		expect(noneSettings.fanLevelCount).toBe(0);
+		expect(noneSettings.fanLevels).toEqual([]);
 	});
 
 	it("warns once per distinct invalid forecast value however often the endpoint is polled", async () => {

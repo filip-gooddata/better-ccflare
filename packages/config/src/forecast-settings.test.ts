@@ -74,10 +74,7 @@ describe("resolveForecastSettings", () => {
 		const { settings, warnings } = resolve();
 		expect(settings).toEqual(DEFAULTS);
 		expect(warnings).toEqual([]);
-		expect(settings.fanLevels).toHaveLength(38);
-		expect(settings.fanLevels[0]).toBe(12);
-		expect(settings.fanLevels.at(-1)).toBe(88);
-		expect(settings.fanLevels).not.toContain(50);
+		expect(settings.fanLevels).toEqual([12, 24, 38, 62, 76, 88]);
 	});
 
 	it("has no recentTauMin and ignores its old environment variable and config key", () => {
@@ -298,6 +295,77 @@ describe("resolveForecastSettings", () => {
 		expect(resolve({ FORECAST_FAN_LEVELS: "none" }).settings.fanLevels).toEqual(
 			[],
 		);
+	});
+
+	describe("fanLevels as a count", () => {
+		const EVERY_2_POINTS = [
+			...Array.from({ length: 19 }, (_, i) => 12 + 2 * i),
+			...Array.from({ length: 19 }, (_, i) => 52 + 2 * i),
+		];
+
+		it("generates the levels from a count in the config file", () => {
+			const { settings, warnings } = resolve({}, { forecast_fan_levels: 38 });
+			expect(settings.fanLevels).toEqual(EVERY_2_POINTS);
+			expect(warnings).toEqual([]);
+			expect(
+				resolve({}, { forecast_fan_levels: 6 }).settings.fanLevels,
+			).toEqual([20, 30, 40, 60, 70, 80]);
+			expect(
+				resolve({}, { forecast_fan_levels: 0 }).settings.fanLevels,
+			).toEqual([]);
+		});
+
+		it("generates the levels from a bare whole number in the environment", () => {
+			const { settings, warnings } = resolve({ FORECAST_FAN_LEVELS: " 38 " });
+			expect(settings.fanLevels).toEqual(EVERY_2_POINTS);
+			expect(warnings).toEqual([]);
+			expect(resolve({ FORECAST_FAN_LEVELS: "0" }).settings.fanLevels).toEqual(
+				[],
+			);
+			expect(
+				resolve({ FORECAST_FAN_LEVELS: "78" }).settings.fanLevels,
+			).toHaveLength(78);
+		});
+
+		it("reads a one-level list from the environment with a trailing comma", () => {
+			expect(
+				resolve({ FORECAST_FAN_LEVELS: "25," }).settings.fanLevels,
+			).toEqual([25]);
+			expect(
+				resolve({ FORECAST_FAN_LEVELS: "20,80," }).settings.fanLevels,
+			).toEqual([20, 80]);
+		});
+
+		it("keeps an old config file list of every 2 points as it was", () => {
+			expect(
+				resolve({}, { forecast_fan_levels: EVERY_2_POINTS }).settings.fanLevels,
+			).toEqual(EVERY_2_POINTS);
+		});
+
+		it("lets the environment win over the config file whatever form each has", () => {
+			expect(
+				resolve({ FORECAST_FAN_LEVELS: "6" }, { forecast_fan_levels: [25, 75] })
+					.settings.fanLevels,
+			).toEqual([20, 30, 40, 60, 70, 80]);
+			expect(
+				resolve({ FORECAST_FAN_LEVELS: "25,75" }, { forecast_fan_levels: 6 })
+					.settings.fanLevels,
+			).toEqual([25, 75]);
+		});
+
+		it.each([
+			[{}, { forecast_fan_levels: 7 }, "forecast_fan_levels=7"],
+			[{}, { forecast_fan_levels: 80 }, "forecast_fan_levels=80"],
+			[{}, { forecast_fan_levels: -2 }, "forecast_fan_levels=-2"],
+			[{}, { forecast_fan_levels: 6.5 }, "forecast_fan_levels=6.5"],
+			[{ FORECAST_FAN_LEVELS: "7" }, {}, 'FORECAST_FAN_LEVELS="7"'],
+			[{ FORECAST_FAN_LEVELS: "80" }, {}, 'FORECAST_FAN_LEVELS="80"'],
+			[{ FORECAST_FAN_LEVELS: "25,," }, {}, 'FORECAST_FAN_LEVELS="25,,"'],
+		] as const)("rejects the count or list %j %j", (env, file, warning) => {
+			const { settings, warnings } = resolve(env, file);
+			expect(settings.fanLevels).toEqual([12, 24, 38, 62, 76, 88]);
+			expect(warnings).toEqual([warning]);
+		});
 	});
 
 	it.each([
