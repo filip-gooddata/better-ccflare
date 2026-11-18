@@ -1,10 +1,10 @@
-import type { EngineContext } from "../engine/model";
 import type {
 	DaytypesResult,
 	LearnedDemand,
 	Partition,
 	RowChoice,
 } from "../engine/learn/types";
+import type { EngineContext } from "../engine/model";
 import type { PaceFitState } from "../engine/pace/types";
 import type { PlanJobResult, ScenarioLadderOverride } from "../engine/plan-job";
 import type { EpochMs } from "../types";

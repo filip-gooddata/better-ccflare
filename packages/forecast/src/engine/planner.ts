@@ -4,7 +4,6 @@
  * unserved demand counted below zero; the first step of the best plan is applied and the search runs
  * again at the next usage poll.
  */
-import { addLocalDays, atLocalMinute, localDayStart } from "../time";
 import type {
 	EpochMs,
 	LiveSession,

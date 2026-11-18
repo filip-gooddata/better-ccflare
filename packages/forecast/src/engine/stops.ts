@@ -343,7 +343,10 @@ export function* shortfall(
 	} else {
 		return null;
 	}
-	const points = levelOf(yield* unservedPoints(ctx, sim, quantity, counted), 50);
+	const points = levelOf(
+		yield* unservedPoints(ctx, sim, quantity, counted),
+		50,
+	);
 	const pointsTenths = Math.round(points * TENTHS);
 	const fills = ctx.accounts.map((a) =>
 		fillAtNow(a, quantity, ctx.now, capRatio(ctx.calibration, a.accountId)),
