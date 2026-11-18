@@ -108,6 +108,32 @@ describe("forecast inputs: the served scenario pool (R3-1, R3-8)", () => {
 		expect(result.inputs.pool.p90Units).toBe(lowerWeightedQuantile(pool, 0.9));
 	});
 
+	test("the pool diagnostic uses the served E4 partition, as the scenarios draw (R3-4)", async () => {
+		const input = buildInput(replayFixture());
+		const engine = createForecastEngine({ noise: false });
+		const present = await engine.compute({
+			...input,
+			demandModel: null,
+			learnedDemand: presentDemand(input.settings),
+		});
+		const unserved = await engine.compute({
+			...input,
+			demandModel: null,
+			learnedDemand: {
+				...presentDemand(input.settings),
+				partition: [0, 0, 0, 0, 0, 0, 0],
+			},
+		});
+		if (!present.inputs || !unserved.inputs) throw new Error("no inputs");
+		const table = buildDayTable(input);
+		expect(
+			datePool(table, today(input), input.pace, {
+				partition: [0, 0, 0, 0, 0, 0, 0],
+			}).length,
+		).not.toBe(present.inputs.pool.days);
+		expect(unserved.inputs.pool).toEqual(present.inputs.pool);
+	});
+
 	test("a lookback setting above 84 serves an 84-day scenario table on every path; calibration keeps the setting", async () => {
 		const input = buildInput(
 			replayFixture({

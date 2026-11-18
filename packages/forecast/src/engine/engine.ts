@@ -53,7 +53,12 @@ import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
-import { buildScenarios, datePool, resolveNoiseMode } from "./scenarios";
+import {
+	buildScenarios,
+	datePool,
+	resolveNoiseMode,
+	servedPartition,
+} from "./scenarios";
 import { yieldToEventLoop } from "./yield";
 
 const HOUR_MS = 3_600_000;
@@ -205,7 +210,7 @@ async function prepare(
 		scenarioTable,
 		localDayStart(input.now, timeZone),
 		input.pace,
-		learned ?? {},
+		{ poolTau: learned?.poolTau, partition: servedPartition(input) },
 	);
 	return {
 		input,
