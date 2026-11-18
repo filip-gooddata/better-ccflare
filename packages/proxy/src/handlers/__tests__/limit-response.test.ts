@@ -5,6 +5,7 @@ import {
 	buildLocalLimitResponse,
 	clearLimitRefusalCache,
 	getCachedLimitRefusal,
+	LOCAL_429_HEADER,
 	localLimitInputForAccount,
 	localLimitResponseForAccount,
 	rebaseLimitRefusalHeaders,
@@ -65,8 +66,12 @@ const REAL_BODY = new TextEncoder().encode(
 
 const NOT_LOCAL = new Set(["request-id", "cf-ray", "server"]);
 
+/** Header names comparable with upstream's: without upstream-only ones and
+ * without the proxy's own marker of a locally built 429. */
 function names(h: Headers): string[] {
-	return [...h.keys()].filter((k) => !NOT_LOCAL.has(k)).sort();
+	return [...h.keys()]
+		.filter((k) => !NOT_LOCAL.has(k) && k !== LOCAL_429_HEADER)
+		.sort();
 }
 
 // Value grammar per header family, as observed on the real response.
@@ -145,6 +150,8 @@ describe("buildLocalLimitResponse — compared with the real 429", () => {
 		expect(res.status).toBe(429);
 		const real = realHeaders();
 		expect(names(res.headers)).toEqual(names(real));
+		expect(res.headers.get(LOCAL_429_HEADER)).toBe("limit");
+		expect(real.has(LOCAL_429_HEADER)).toBe(false);
 		expectGrammar(res.headers);
 		const h = res.headers;
 		expect(h.get("content-type")).toBe("application/json");
@@ -576,6 +583,7 @@ describe("buildLocalCooldownResponse", () => {
 		expect(h.get("content-type")).toBe("application/json");
 		expect(h.get("x-should-retry")).toBe("true");
 		expect(h.get("retry-after")).toBe(String(7 * 60));
+		expect(h.get(LOCAL_429_HEADER)).toBe("cooldown");
 		expect(h.get("anthropic-ratelimit-unified-status")).toBeNull();
 		expect(h.get(CLAIM)).toBeNull();
 		expect(h.get("anthropic-ratelimit-unified-reset")).toBeNull();
@@ -765,5 +773,64 @@ describe("replay against the current binding", () => {
 		usageCache.set("acc-a", anthropicUsage({ five: 30, seven: 100 }) as never);
 		const res = localLimitResponseForAccount({ id: "acc-a" }, { now: NOW });
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(REAL_BODY);
+	});
+});
+
+describe("a limit admission reads from the representative snapshot", () => {
+	const OAUTH_RESET_S = R7 + 24 * 3600;
+	function oauthAppsFull(oauthResetS: number | null = OAUTH_RESET_S) {
+		return {
+			five_hour: {
+				utilization: 40,
+				resets_at: new Date(R5 * 1000).toISOString(),
+			},
+			seven_day: {
+				utilization: 50,
+				resets_at: new Date(R7 * 1000).toISOString(),
+			},
+			seven_day_oauth_apps: {
+				utilization: 100,
+				resets_at:
+					oauthResetS === null
+						? null
+						: new Date(oauthResetS * 1000).toISOString(),
+			},
+		};
+	}
+
+	it("binds the weekly limit with the snapshot's reset, not five_hour", () => {
+		usageCache.set("acc-a", oauthAppsFull() as never);
+		const input = localLimitInputForAccount("acc-a", { now: NOW });
+		expect(input?.binding).toEqual({ kind: "seven_day" });
+		expect(input?.resetMs).toBe(OAUTH_RESET_S * 1000);
+
+		const h = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ now: NOW },
+		).headers;
+		expect(h.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+		expect(h.get(CLAIM)).toBe("seven_day");
+		expect(h.get("anthropic-ratelimit-unified-reset")).toBe(
+			String(OAUTH_RESET_S),
+		);
+		expect(h.get("retry-after")).toBe(String(OAUTH_RESET_S - NOW_S));
+	});
+
+	it("competes with a full family: the later reset binds", () => {
+		usageCache.set("acc-a", oauthAppsFull() as never);
+		const input = localLimitInputForAccount("acc-a", {
+			family: "fable",
+			familyResetMs: (R7 - 3600) * 1000,
+			familyOut: true,
+			now: NOW,
+		});
+		expect(input?.binding).toEqual({ kind: "seven_day" });
+		expect(input?.resetMs).toBe(OAUTH_RESET_S * 1000);
+	});
+
+	it("does not bind once the snapshot's reset has passed", () => {
+		usageCache.set("acc-a", oauthAppsFull(NOW_S - 60) as never);
+		const input = localLimitInputForAccount("acc-a", { now: NOW });
+		expect(input?.binding).toEqual({ kind: "five_hour" });
 	});
 });

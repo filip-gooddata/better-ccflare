@@ -11,7 +11,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import { resetAutoRefreshPromptPoolForTests } from "../auto-refresh-prompt-pool";
 import type { AutoRefreshScheduler } from "../auto-refresh-scheduler";
-import { buildLocalLimitResponse } from "../handlers/limit-response";
+import {
+	buildLocalCooldownResponse,
+	buildLocalLimitResponse,
+} from "../handlers/limit-response";
 
 type AccountRow = {
 	id: string;
@@ -183,6 +186,66 @@ describe("AutoRefreshScheduler — a probe refused for a full limit", () => {
 		expect(scheduler.shouldRefreshAccount(row, resetMs + 1000)).toBe(
 			control.shouldRefreshAccount(row, resetMs + 1000),
 		);
+	});
+});
+
+describe("AutoRefreshScheduler — a probe answered by the proxy's cooldown 429", () => {
+	it("never pauses an account on the proxy's local cooldown 429", async () => {
+		const cooldownEnd = Date.now() + 10 * 60 * 1000;
+		respondWith(() => buildLocalCooldownResponse(null, cooldownEnd));
+		const db = makeDb();
+		const scheduler = await makeScheduler(db);
+		const row = makeAccountRow();
+
+		for (let i = 0; i < scheduler.FAILURE_THRESHOLD + 1; i++) {
+			resetAutoRefreshPromptPoolForTests();
+			expect(await scheduler.sendDummyMessage(row)).toBe(false);
+		}
+
+		expect(scheduler.consecutiveFailures.get(row.id)).toBeUndefined();
+		expect(pauseCallFor(db, row.id)).toBeUndefined();
+	});
+
+	it("does not probe the account again before the cooldown's retry-after", async () => {
+		const now = Date.now();
+		const cooldownEnd = now + 3 * DAY;
+		respondWith(() => buildLocalCooldownResponse(null, cooldownEnd, now));
+		const scheduler = await makeScheduler(makeDb());
+		const control = await makeScheduler(makeDb());
+		const row = makeAccountRow();
+
+		await scheduler.sendDummyMessage(row);
+
+		expect(scheduler.shouldRefreshAccount(row, cooldownEnd - HOUR)).toBe(false);
+		expect(scheduler.shouldRefreshAccount(row, cooldownEnd + 2000)).toBe(
+			control.shouldRefreshAccount(row, cooldownEnd + 2000),
+		);
+	});
+
+	it("still counts an upstream 429 with a retry-after but no limit refusal", async () => {
+		respondWith(
+			() =>
+				new Response(
+					JSON.stringify({
+						type: "error",
+						error: { type: "rate_limit_error", message: "Too many requests" },
+					}),
+					{
+						status: 429,
+						headers: {
+							"content-type": "application/json",
+							"retry-after": "30",
+							"x-should-retry": "true",
+						},
+					},
+				),
+		);
+		const scheduler = await makeScheduler(makeDb());
+		const row = makeAccountRow();
+
+		await scheduler.sendDummyMessage(row);
+
+		expect(scheduler.consecutiveFailures.get(row.id)).toBe(1);
 	});
 });
 

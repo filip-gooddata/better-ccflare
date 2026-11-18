@@ -5,6 +5,7 @@ import {
 	extractFiveHourWindow,
 	extractModelFamilyWindows,
 	extractWeeklyWindow,
+	getRepresentativeUsageSnapshotForProvider,
 	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
@@ -40,6 +41,12 @@ export interface LocalLimitInput {
 
 const H = "anthropic-ratelimit-unified";
 const RESET_HEADER = `${H}-reset`;
+/**
+ * Set on every 429 the proxy builds itself (`limit` or `cooldown`), never on
+ * a replayed upstream one, so a caller such as the auto-refresh scheduler can
+ * tell the proxy's own refusal from an upstream 429.
+ */
+export const LOCAL_429_HEADER = "x-better-ccflare-local-429";
 const CLAIM_HEADER = `${H}-representative-claim`;
 const DISABLED_REASON_HEADER = `${H}-overage-disabled-reason`;
 const DEFAULT_RETRY_AFTER_SECONDS = 60;
@@ -91,7 +98,13 @@ function claimFor(binding: LimitBinding): string {
  * - `-unified-representative-claim`: approximate. `five_hour` / `seven_day`
  *   from the binding; a family binding sends `seven_day_<family>` (lower
  *   case), a name never observed upstream. `_overage_included` variants are
- *   not derivable. Omitted on a cooldown answer.
+ *   not derivable. Omitted on a cooldown answer. A `seven_day` binding taken
+ *   from the representative usage snapshot (e.g. a full
+ *   `seven_day_oauth_apps` window) is approximate in claim and reset: the
+ *   reset is the snapshot's, and the `-7d-*` headers still describe the
+ *   all-models weekly window, which may read `allowed`.
+ * - `x-better-ccflare-local-429` (`limit` / `cooldown`): proxy-only marker,
+ *   not an upstream header.
  * - `-5h-status`: exact from utilization ≥ 100 (`rejected`, else `allowed`).
  *   `-5h-reset`: exact. `-5h-utilization`: approximate (integer percent up to
  *   one poll old, as a fraction). `-5h-surpassed-threshold: 1.0`: approximate,
@@ -154,6 +167,7 @@ function buildLocal429(
 		"content-type": "application/json",
 		"retry-after": String(retryAfterSeconds(resetMs, now)),
 		"x-should-retry": "true",
+		[LOCAL_429_HEADER]: binding ? "limit" : "cooldown",
 		[`${H}-fallback-percentage`]: "0.5",
 		[`${H}-overage-status`]: "rejected",
 		[DISABLED_REASON_HEADER]:
@@ -358,8 +372,12 @@ function familyReading(
  * means what admission counts as exhausted: at >= 100 % with the reset ahead
  * or unknown. A full limit with an unknown reset binds only when no full
  * limit has a known one (its reset is then omitted and retry-after is 60).
- * If none is full, the window with the latest reset among those at ≥ 100 %,
- * else five_hour. Null when no usage is cached.
+ * When neither window is full, admission still counts the account weekly
+ * exhausted when its representative usage snapshot is (e.g. a full
+ * `seven_day_oauth_apps`); that binds as `seven_day` with the snapshot's
+ * reset, the same reading admission uses. If none is full, the window with
+ * the latest reset among those at ≥ 100 %, else five_hour. Null when no
+ * usage is cached.
  */
 export function localLimitInputForAccount(
 	accountId: string,
@@ -417,7 +435,7 @@ export function localLimitInputForAccount(
 		{ binding: { kind: "five_hour" }, reading: fiveHour },
 		{ binding: { kind: "seven_day" }, reading: sevenDay },
 	];
-	const anyFull = windows.some((w) => isFull(w.reading, now));
+	let anyFull = windows.some((w) => isFull(w.reading, now));
 	const candidates: Array<{ binding: LimitBinding; resetMs: number | null }> =
 		[];
 	for (const w of windows) {
@@ -426,6 +444,27 @@ export function localLimitInputForAccount(
 			: (w.reading?.utilization ?? 0) >= 100;
 		if (qualifies && w.reading)
 			candidates.push({ binding: w.binding, resetMs: w.reading.resetMs });
+	}
+	// Admission's fallback (limit-blocked limitsInForce): with neither window
+	// full, an exhausted representative snapshot makes the account weekly out.
+	if (!anyFull) {
+		const snapshot = getRepresentativeUsageSnapshotForProvider(
+			data,
+			provider,
+			now,
+		);
+		const snapshotResetMs = snapshot?.resetMs ?? null;
+		if (
+			snapshot &&
+			isUsageExhausted(snapshot.utilization, snapshotResetMs, now)
+		) {
+			anyFull = true;
+			candidates.length = 0;
+			candidates.push({
+				binding: { kind: "seven_day" },
+				resetMs: snapshotResetMs,
+			});
+		}
 	}
 	// A full family competes with the full account-wide windows: the account
 	// is usable again only when every full limit has reset, so the latest
