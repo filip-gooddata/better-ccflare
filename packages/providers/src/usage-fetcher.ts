@@ -331,6 +331,46 @@ export function extractModelFamilyWindows(
 	return rows;
 }
 
+/** How long a full window holds when its reading gives no reset: a week. */
+const UNKNOWN_FULL_RESET_HOLD_MS = 7 * 24 * 3_600_000;
+
+/**
+ * Until when a reading that shows a window full must stay in the cache: the
+ * latest reset among its full windows (five-hour, weekly, and model-scoped
+ * weekly rows, flat or `limits[]` shape), now plus a week when a full window
+ * has no reset. Undefined when nothing in the reading is full; a full window
+ * whose reset already passed holds nothing.
+ */
+export function fullReadingHoldUntil(
+	data: AnyUsageData,
+	now: number = Date.now(),
+): number | undefined {
+	const d = data as UsageData;
+	const windows: StrategyUsageWindow[] = [];
+	const five = extractFiveHourWindow(d, "anthropic");
+	const seven = extractWeeklyWindow(d, "anthropic");
+	if (five) windows.push(five);
+	if (seven) windows.push(seven);
+	if (Array.isArray(d.limits)) {
+		for (const limit of d.limits) {
+			if (limit?.kind !== "weekly_scoped") continue;
+			if (typeof limit.percent !== "number") continue;
+			windows.push({
+				utilization: limit.percent,
+				resetsAt: parseResetMs(limit.resets_at),
+			});
+		}
+	}
+	let until: number | undefined;
+	for (const window of windows) {
+		if (!(window.utilization >= 100)) continue;
+		const end = window.resetsAt ?? now + UNKNOWN_FULL_RESET_HOLD_MS;
+		if (end <= now) continue;
+		until = until === undefined ? end : Math.max(until, end);
+	}
+	return until;
+}
+
 /**
  * Fetch usage data from Anthropic's OAuth usage endpoint
  */
@@ -1723,9 +1763,15 @@ class UsageCache {
 							"anthropic",
 							callback,
 						);
+					// A reading that confirms a window full stays until that
+					// window's reset, like a header mark: failed polls must not
+					// age the account back into rotation. A newer poll replaces
+					// it as usual.
+					const holdUntil = fullReadingHoldUntil(result.data);
 					this.cache.set(accountId, {
 						data: result.data,
 						timestamp: Date.now(),
+						...(holdUntil !== undefined ? { holdUntil } : {}),
 					});
 					this.notifyPolledReading(accountId, result.data, requestedAt);
 					const snapshotCb = this.snapshotCallbacks.get(accountId);
@@ -1842,13 +1888,16 @@ class UsageCache {
 	/**
 	 * Write a payload into the cache and bump the account's generation. Every
 	 * write must go through here so an in-flight poll can tell that it lost a
-	 * race — see {@link generations}.
+	 * race — see {@link generations}. Without an explicit `holdUntil`, a
+	 * payload that shows a window full is held until that window's reset
+	 * ({@link fullReadingHoldUntil}).
 	 */
 	private install(
 		accountId: string,
 		data: AnyUsageData,
-		holdUntil?: number,
+		explicitHoldUntil?: number,
 	): void {
+		const holdUntil = explicitHoldUntil ?? fullReadingHoldUntil(data);
 		this.cache.set(accountId, {
 			data,
 			timestamp: Date.now(),
@@ -1897,8 +1946,9 @@ class UsageCache {
 	}
 
 	/**
-	 * Set cached usage data for an account. With `holdUntil`, the entry does
-	 * not expire by age before that time; the next write replaces it as usual.
+	 * Set cached usage data for an account. With `holdUntil` (by default the
+	 * reset of any window the payload shows full), the entry does not expire
+	 * by age before that time; the next write replaces it as usual.
 	 */
 	set(
 		accountId: string,

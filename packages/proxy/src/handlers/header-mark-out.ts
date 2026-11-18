@@ -1,11 +1,13 @@
 import { getModelFamily } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
+	extractFiveHourWindow,
+	extractWeeklyWindow,
 	type UsageData,
 	type UsageWindow,
 	usageCache,
 } from "@better-ccflare/providers";
-import type { Account } from "@better-ccflare/types";
+import type { Account, StrategyUsageWindow } from "@better-ccflare/types";
 import { blockFamily } from "./model-capacity";
 import type { ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
@@ -210,31 +212,13 @@ function writeUsageFromHeaders(
 	);
 	if (five) next.five_hour = five;
 	if (seven) next.seven_day = seven;
-	usageCache.set(accountId, next, { holdUntil: markHoldUntil(next) });
+	// The cache holds a mark with a full window until that window's reset:
+	// until then only a newer write (a poll that started after the mark, or
+	// another header mark) replaces it, so the account stays out until its
+	// reset or a reading that shows it recovered, not just for the cache's
+	// ten minutes.
+	usageCache.set(accountId, next);
 	headerWritten.set(accountId, next);
-}
-
-/**
- * When a header mark may expire by age: the latest reset of the windows it
- * marks full. Until then only a newer write (a poll that started after the
- * mark, or another header mark) replaces it, so the account stays out until
- * its reset or a reading that shows it recovered, not just for the cache's
- * ten minutes.
- */
-function markHoldUntil(usage: UsageData): number {
-	const now = Date.now();
-	let until = now;
-	for (const window of [usage.five_hour, usage.seven_day]) {
-		if (!window || window.utilization < 100) continue;
-		const resetMs = window.resets_at
-			? Date.parse(window.resets_at)
-			: Number.NaN;
-		until = Math.max(
-			until,
-			Number.isFinite(resetMs) ? resetMs : now + UNKNOWN_RESET_HOLD_MS,
-		);
-	}
-	return until;
 }
 
 function logRefreshFailure(accountId: string, error: unknown): void {
@@ -297,20 +281,22 @@ export function observeLimitHeaders(
 	if (!windowOut && !overallRejected && !parsed.overageInUse) return;
 
 	const family = parsed.overageInUse ? familyOfClaim(parsed) : null;
-	if (family !== null && !windowOut) {
-		// Served on credits for one family: block that family until the reset,
-		// keep the account for the others. The claim names the family upstream
-		// charged, which is the family this account sends (after its model
-		// mapping), and a standing block excludes it in every routing mode.
-		// Without a reset header the account's weekly reset bounds it, else a
-		// full week.
+	if (family !== null) {
+		// Served on credits for one family: block that family until the reset.
+		// The claim names the family upstream charged, which is the family this
+		// account sends (after its model mapping), and a standing block
+		// excludes it in every routing mode. The block stands on its own, so it
+		// outlives an account-wide mark or bench from the same response that a
+		// recovering poll clears earlier. Without a reset header the account's
+		// weekly reset bounds it, else a full week.
 		const now = Date.now();
 		const until =
 			[parsed.resetMs, parsed.sevenDay.resetMs].find(
 				(reset): reset is number => reset !== null && reset > now,
 			) ?? now + UNKNOWN_RESET_HOLD_MS;
 		blockFamily(account.id, family, until, "header", now);
-	} else {
+	}
+	if (family === null || windowOut) {
 		writeUsageFromHeaders(account.id, parsed, windowOut);
 	}
 	log.warn(
@@ -390,11 +376,10 @@ interface PendingBench {
 /** Overage benches this process applied, waiting for a recovering reading. */
 const pendingBenches = new Map<string, PendingBench>();
 
-function windowBelowLimit(window: UsageWindow | undefined): boolean {
+function windowBelowLimit(window: StrategyUsageWindow | null): boolean {
 	return (
-		window !== undefined &&
 		window !== null &&
-		typeof window.utilization === "number" &&
+		Number.isFinite(window.utilization) &&
 		window.utilization < 100
 	);
 }
@@ -419,7 +404,10 @@ function releaseBenchOnRecovery(
 		return;
 	}
 	if (requestedAt < bench.benchedAt) return;
-	const { five_hour: five, seven_day: seven } = data as UsageData;
+	// Either reading shape: the flat windows, else the limits[] session and
+	// weekly_all entries.
+	const five = extractFiveHourWindow(data as UsageData, "anthropic");
+	const seven = extractWeeklyWindow(data as UsageData, "anthropic");
 	if (!windowBelowLimit(five) || !windowBelowLimit(seven)) return;
 	pendingBenches.delete(accountId);
 	log.info(
