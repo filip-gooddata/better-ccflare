@@ -10,7 +10,6 @@ import {
 	STRATEGIES,
 	type StrategyName,
 	setForceAccountModel as setForceAccountModelFlag,
-	setUseExtraUsage as setUseExtraUsageFlag,
 	TIME_CONSTANTS,
 	validateNumber,
 	validateString,
@@ -44,6 +43,9 @@ import type { ConfigResponse, RetentionSetRequest } from "../types";
 /**
  * Create config handlers
  */
+const USE_EXTRA_USAGE_IGNORED_NOTE =
+	"use_extra_usage no longer does anything: an account at 100% of its five-hour, weekly or model-family limit is not used until that limit resets, whatever extra usage or spend says.";
+
 export function createConfigHandlers(
 	config: Config,
 	getSessionPaceSettings: () => SessionPaceSettings,
@@ -526,10 +528,14 @@ export function createConfigHandlers(
 			});
 		},
 
+		// "Use extra usage" is retired: still accepted and stored, never read by
+		// routing. A full five-hour, weekly or model-family limit is final.
 		getUseExtraUsage: (): Response => {
 			return jsonResponse({
 				enabled: config.getUseExtraUsage(),
 				source: config.getUseExtraUsageSource(),
+				ignored: true,
+				note: USE_EXTRA_USAGE_IGNORED_NOTE,
 			});
 		},
 
@@ -543,15 +549,13 @@ export function createConfigHandlers(
 				);
 			}
 			config.setUseExtraUsage(body.enabled);
-			// Push the effective value into the core mirror the usage snapshot
-			// reads (providers cannot depend on config), so the switch takes
-			// effect without a restart.
-			setUseExtraUsageFlag(config.getUseExtraUsage());
 			return jsonResponse({
 				success: true,
 				enabled: body.enabled,
 				source: config.getUseExtraUsageSource(),
-				effective: config.getUseExtraUsage(),
+				effective: false,
+				ignored: true,
+				note: USE_EXTRA_USAGE_IGNORED_NOTE,
 			});
 		},
 
