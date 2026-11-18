@@ -6,7 +6,8 @@ import type {
 } from "../../service/forecast-worker-runner";
 import { createForecastEngine } from "../engine";
 import { PLAN_BUDGET_MS, PLAN_JOB_TIMEOUT_MS, runPlanJob } from "../plan-job";
-import { buildInput, replayFixture } from "./fixtures-engine";
+import { SCENARIO_LADDER_TOP } from "../scenario-count";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 
 const REPLAY_TIMEOUT_MS = 120_000;
 
@@ -37,13 +38,15 @@ function inlineRunner(): { runner: ForecastWorkerRunner; calls: Call[] } {
 	const runner = {
 		run: async (job: string, payload: unknown, options: ForecastJobOptions) => {
 			calls.push({ job, payload, options });
-			const { ctx, budgetMs } = payload as {
+			const { ctx, budgetMs, ladder } = payload as {
 				ctx: Parameters<typeof runPlanJob>[0];
 				budgetMs: number;
+				ladder?: Parameters<typeof runPlanJob>[1]["ladder"];
 			};
 			const result = await runPlanJob(ctx, {
 				deadline: performance.now() + budgetMs,
 				now: () => performance.now(),
+				ladder,
 			});
 			return { status: "ok", result, ms: 0 };
 		},
@@ -76,8 +79,11 @@ describe("engine: the planner runs as a worker plan job", () => {
 		"the same input gives the same result through the worker job as through an inline job",
 		async () => {
 			const input = buildInput(replayFixture());
-			const viaWorker = await createForecastEngine().compute(input);
+			// A fixed N and no deadline: under the real budget the climb could stop at different rungs.
+			const viaWorker =
+				await createForecastEngine(FIXED_N_ENGINE).compute(input);
 			const viaInline = await createForecastEngine({
+				...FIXED_N_ENGINE,
 				planRunner: inlineRunner().runner,
 			}).compute(buildInput(replayFixture()));
 			expect(viaWorker.available).toBe(true);
@@ -108,4 +114,51 @@ describe("engine: the planner runs as a worker plan job", () => {
 			REPLAY_TIMEOUT_MS,
 		);
 	}
+});
+
+describe("engine: compute builds the top scenario rung and lets the job choose N", () => {
+	test(
+		"the job gets the ladder top of scenario days, the production ladder and the spacing budget",
+		async () => {
+			const { runner, calls } = fixedRunner({
+				status: "error",
+				reason: "recorded",
+			} as ForecastJobOutcome<never>);
+			await createForecastEngine({ planRunner: runner }).compute(
+				buildInput(replayFixture()),
+			);
+			const payload = calls[0]?.payload as {
+				ctx: { scenarios: { units: unknown[] } };
+				budgetMs: number;
+				ladder?: unknown;
+			};
+			expect(payload.ctx.scenarios.units).toHaveLength(SCENARIO_LADDER_TOP);
+			expect(payload.ladder).toBeUndefined();
+			expect(payload.budgetMs).toBe(PLAN_BUDGET_MS);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
+
+	test(
+		"a test ladder and budget reach the job, and the top rung of days is built to that ladder",
+		async () => {
+			const { runner, calls } = fixedRunner({
+				status: "error",
+				reason: "recorded",
+			} as ForecastJobOutcome<never>);
+			await createForecastEngine({
+				planRunner: runner,
+				planJob: { ladder: { start: 50, top: 200 }, budgetMs: 1234 },
+			}).compute(buildInput(replayFixture()));
+			const payload = calls[0]?.payload as {
+				ctx: { scenarios: { units: unknown[] } };
+				budgetMs: number;
+				ladder?: unknown;
+			};
+			expect(payload.ctx.scenarios.units).toHaveLength(200);
+			expect(payload.ladder).toEqual({ start: 50, top: 200 });
+			expect(payload.budgetMs).toBe(1234);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
 });

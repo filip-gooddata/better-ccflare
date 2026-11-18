@@ -7,6 +7,7 @@ import type { ForecastBlock, ForecastInput } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { NoiseMode } from "../model";
 import {
+	FIXED_N_ENGINE,
 	buildInput,
 	defaultSettings,
 	profileFixture,
@@ -18,7 +19,10 @@ async function heavyLow(
 	input: ForecastInput,
 	noiseMode: NoiseMode,
 ): Promise<number> {
-	const result = await createForecastEngine({ noiseMode }).compute(input);
+	const result = await createForecastEngine({
+		...FIXED_N_ENGINE,
+		noiseMode,
+	}).compute(input);
 	if (!result.available) throw new Error(result.reason);
 	return Math.min(...(result.response.day as ForecastBlock).heavy);
 }
@@ -27,7 +31,7 @@ describe("aggregated usage profile", () => {
 	test(
 		"gives a forecast: 37 recorded days, calibrated, both blocks",
 		async () => {
-			const result = await createForecastEngine().compute(
+			const result = await createForecastEngine(FIXED_N_ENGINE).compute(
 				buildInput(profileFixture()),
 			);
 			expect(result.available).toBe(true);

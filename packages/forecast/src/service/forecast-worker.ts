@@ -31,10 +31,11 @@ const handlers: {
 	},
 	plan: {
 		// The deadline is on this worker's clock: performance.now has a per-thread origin.
-		run: ({ ctx, budgetMs }) =>
+		run: ({ ctx, budgetMs, ladder }) =>
 			runPlanJob(ctx, {
 				deadline: performance.now() + budgetMs,
 				now: () => performance.now(),
+				ladder,
 			}),
 		transfer: planReplyTransfer,
 	},

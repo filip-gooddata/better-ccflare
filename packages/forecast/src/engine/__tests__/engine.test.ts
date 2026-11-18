@@ -12,6 +12,7 @@ import type { EngineContext } from "../model";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
 import {
+	FIXED_N_ENGINE,
 	buildInput,
 	DEFAULT_FAN_LEVELS,
 	prague,
@@ -21,7 +22,7 @@ import {
 import { measureYield } from "./fixtures-sim";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
-const engine = createForecastEngine();
+const engine = createForecastEngine(FIXED_N_ENGINE);
 
 function lines(block: ForecastBlock): { level: number; values: number[] }[] {
 	return [
@@ -254,9 +255,10 @@ describe("smoothed bootstrap through the engine", () => {
 		"noise off: compute equals the stages run by hand, and every later-date day is one recorded day",
 		async () => {
 			const input = buildInput(replayFixture());
-			const result = await createForecastEngine({ noise: false }).compute(
-				input,
-			);
+			const result = await createForecastEngine({
+				...FIXED_N_ENGINE,
+				noise: false,
+			}).compute(input);
 			if (!result.available) throw new Error(result.reason);
 
 			const ctx = await contextOf(input, false);

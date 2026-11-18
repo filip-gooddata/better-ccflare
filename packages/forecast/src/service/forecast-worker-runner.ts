@@ -1,6 +1,6 @@
 import type { EngineContext } from "../engine/model";
 import type { PaceFitState } from "../engine/pace/types";
-import type { PlanJobResult } from "../engine/plan-job";
+import type { PlanJobResult, ScenarioLadderOverride } from "../engine/plan-job";
 import type { EpochMs } from "../types";
 
 /**
@@ -21,11 +21,16 @@ export interface ForecastWorkerJobs {
 		result: PaceFitState;
 	};
 	/**
-	 * The planner: the prepared context (scenario buffers transferred) and its compute budget,
-	 * which the worker turns into a deadline on its own clock. Answers what computeForecast reads.
+	 * The scenario count, then the planner: the prepared context with the ladder's top rung of
+	 * scenario days (buffers transferred) and the compute budget, which the worker turns into one
+	 * deadline on its own clock. `ladder` is set by tests only. Answers what computeForecast reads.
 	 */
 	plan: {
-		payload: { ctx: EngineContext; budgetMs: number };
+		payload: {
+			ctx: EngineContext;
+			budgetMs: number;
+			ladder?: ScenarioLadderOverride;
+		};
 		result: PlanJobResult;
 	};
 }

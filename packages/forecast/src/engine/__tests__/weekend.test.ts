@@ -8,6 +8,7 @@ import type { EpochMs, ForecastBlock } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { Scenarios } from "../model";
 import {
+	FIXED_N_ENGINE,
 	buildInput,
 	defaultSettings,
 	type EngineFixture,
@@ -43,7 +44,7 @@ describe("Saturday morning", () => {
 	test(
 		"the response conforms to the contract",
 		async () => {
-			const result = await createForecastEngine().compute(
+			const result = await createForecastEngine(FIXED_N_ENGINE).compute(
 				buildInput(saturdayFixture()),
 			);
 			if (!result.available) throw new Error(result.reason);
@@ -83,7 +84,7 @@ describe("Saturday morning", () => {
 	test(
 		"with pre-warm on nothing is opened ahead on a weekend morning: no demand needs it before Monday",
 		async () => {
-			const result = await createForecastEngine().compute(
+			const result = await createForecastEngine(FIXED_N_ENGINE).compute(
 				buildInput(
 					saturdayFixture({ settings: defaultSettings({ prewarm: true }) }),
 				),

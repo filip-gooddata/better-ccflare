@@ -17,7 +17,12 @@ import {
 	type PaceSeriesInput,
 	plainPace,
 } from "../pace";
-import { buildInput, defaultSettings, replayFixture } from "./fixtures-engine";
+import {
+	FIXED_N_ENGINE,
+	buildInput,
+	defaultSettings,
+	replayFixture,
+} from "./fixtures-engine";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const STATE: PaceFitState = {
@@ -130,9 +135,10 @@ describe("the pace in the engine", () => {
 	});
 
 	test("off with a state passed in: plain lines marked off, the state summarised for the log", async () => {
-		const result = await createForecastEngine({ noise: false }).compute(
-			input({ settings: off(), demandModel: STATE }),
-		);
+		const result = await createForecastEngine({
+			...FIXED_N_ENGINE,
+			noise: false,
+		}).compute(input({ settings: off(), demandModel: STATE }));
 		if (!result.available) throw new Error(result.reason);
 		expect(result.inputs?.pace).toEqual(plainPace("off"));
 		expect(result.inputs?.paceModel).toEqual({
@@ -148,7 +154,7 @@ describe("the pace in the engine", () => {
 	test(
 		"off gives exactly the unfitted forecast",
 		async () => {
-			const engine = createForecastEngine({ noise: false });
+			const engine = createForecastEngine({ ...FIXED_N_ENGINE, noise: false });
 			const a = await engine.compute(input());
 			const b = await engine.compute(
 				input({ settings: off(), demandModel: STATE }),

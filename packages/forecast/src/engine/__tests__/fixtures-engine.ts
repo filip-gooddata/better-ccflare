@@ -21,7 +21,16 @@ import type {
 	LiveSession,
 } from "../../types";
 import { BUCKET_MS } from "../../types";
+import { type ForecastEngineOptions, prepareEngineContext } from "../engine";
+import type { EngineContext } from "../model";
+import { planSearchSize } from "../plan-job";
 import { createRng } from "../rng";
+import {
+	chooseScenarioCount,
+	prebuiltScenarioSource,
+	SCENARIO_LADDER_TOP,
+	type ScenarioCount,
+} from "../scenario-count";
 import { prague, settings, TZ } from "./fixtures-sim";
 
 export { prague, TZ };
@@ -46,6 +55,54 @@ export function defaultSettings(
 	over: Partial<ForecastSettings> = {},
 ): ForecastSettings {
 	return settings({ fanLevels: DEFAULT_FAN_LEVELS, ...over });
+}
+
+const FIXTURE_DAYS = defaultSettings().simulatedDays;
+
+/**
+ * Engine options for tests not about the scenario-count rule: N fixed at the fixtures' simulated
+ * days (one rung, the same days as before the rule) and an unbounded search, so their values
+ * depend neither on the rule nor on the machine's load.
+ */
+export const FIXED_N_ENGINE: Pick<ForecastEngineOptions, "planJob"> = {
+	planJob: {
+		ladder: { start: FIXTURE_DAYS, top: FIXTURE_DAYS },
+		budgetMs: Number.POSITIVE_INFINITY,
+	},
+};
+
+/**
+ * Engine options for the replay tests: the real ladder and SE target, the search unbounded, so the
+ * climb is never stopped by the budget and the asserted plan does not depend on the machine's load.
+ * The budget itself is tested with an injected clock in plan-job.test.ts.
+ */
+export const REPLAY_ENGINE: Pick<ForecastEngineOptions, "planJob"> = {
+	planJob: { budgetMs: Number.POSITIVE_INFINITY },
+};
+
+/**
+ * What the plan job plans on under REPLAY_ENGINE, without the worker: the ladder's top rung of
+ * scenario days, then the scenario-count rule's N among them. For planner-level checks of a replay
+ * that compute() answers at the same N.
+ */
+export async function integratedContext(
+	input: ForecastInput,
+): Promise<{ ctx: EngineContext; count: ScenarioCount }> {
+	const top = await prepareEngineContext(
+		{
+			...input,
+			settings: { ...input.settings, simulatedDays: SCENARIO_LADDER_TOP },
+		},
+		{ noise: true },
+	);
+	if (top === "insufficient_history")
+		throw new Error("fixture has no forecast");
+	const count = await chooseScenarioCount(
+		top,
+		prebuiltScenarioSource(top.scenarios),
+		{ deadline: Number.POSITIVE_INFINITY, searchPlans: planSearchSize(top) },
+	);
+	return { ctx: count.ctx, count };
 }
 
 /** Units per local hour (24 entries) of the day with this key and ISO weekday. */

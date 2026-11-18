@@ -8,7 +8,7 @@ import type {
 } from "../../types";
 import * as calibration from "../calibration";
 import { createForecastEngine } from "../engine";
-import { buildInput, replayFixture } from "./fixtures-engine";
+import { FIXED_N_ENGINE, buildInput, replayFixture } from "./fixtures-engine";
 import { settings } from "./fixtures-sim";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
@@ -182,7 +182,7 @@ describe("window instance (amendment 3, C1)", () => {
 });
 
 describe("engine with jittered reset times (amendment 3, C3)", () => {
-	const engine = createForecastEngine();
+	const engine = createForecastEngine(FIXED_N_ENGINE);
 
 	test(
 		"the replay fixture with exact reset times has a forecast",

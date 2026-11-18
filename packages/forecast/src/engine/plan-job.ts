@@ -5,7 +5,18 @@
 import { FORECAST_MIN_SPACING_MS } from "../spacing";
 import type { Plan } from "../types";
 import type { EngineContext, SimulationResult } from "./model";
-import { type PlanScore, planForecast } from "./planner";
+import {
+	openingGrid,
+	type PlannerSearch,
+	type PlanScore,
+	planForecast,
+} from "./planner";
+import {
+	chooseScenarioCount,
+	prebuiltScenarioSource,
+	type ScenarioCount,
+} from "./scenario-count";
+import { isOpenNow } from "./simulate";
 
 /** The planner's compute budget: half the minimum spacing, so a forecast never runs into the next. */
 export const PLAN_BUDGET_MS = FORECAST_MIN_SPACING_MS / 2;
@@ -33,27 +44,87 @@ export function planJobContext(ctx: EngineContext): EngineContext {
 	return { ...planned, input };
 }
 
+/**
+ * Tests only: a scenario ladder other than SCENARIO_LADDER_START..SCENARIO_LADDER_TOP. ctx must
+ * hold at least `top` simulated days.
+ */
+export interface ScenarioLadderOverride {
+	start: number;
+	top: number;
+}
+
 export interface PlanJobOptions {
-	/** Instant on the `now` clock after which the planner stops optional search. */
+	/**
+	 * Instant on the `now` clock after which the job stops optional work: further scenario-count
+	 * rungs, then the planner's optional search. One deadline for both.
+	 */
 	deadline: number;
 	/** Monotonic clock of `deadline`. */
 	now: () => number;
+	ladder?: ScenarioLadderOverride;
 }
 
-/** What computeForecast reads from the planner; the baseline's traces stay in the worker. */
+/** What computeForecast reads from the planner, and what the job chose and searched. */
 export interface PlanJobResult {
 	plan: Plan;
 	result: SimulationResult;
 	score: PlanScore;
+	/** The baseline's traces stay in the worker. */
 	baseline: { score: PlanScore };
+	/** Design row 21: the scenario count N the plan was searched over, and why the climb stopped. */
+	scenarioCount: Pick<
+		ScenarioCount,
+		"n" | "rungs" | "stopReason" | "targetPoints" | "timing"
+	>;
+	/** Distinct candidate plans simulated, the baseline included. */
+	candidates: number;
+	search: PlannerSearch;
 }
 
+/**
+ * The plan simulations the search always runs, for the climb's cost estimate: the baseline,
+ * every stage-1 single of each closed account, and the final simulation of the chosen plan. A
+ * heuristic: it leaves out stage 2, the preference and placement plans, combinations, refinement
+ * and moves, whose number depends on the scores; the deadline cuts all of them but stage 2.
+ */
+export function planSearchSize(ctx: EngineContext): number {
+	const closed = ctx.accounts.filter((_, j) => !isOpenNow(ctx, j)).length;
+	return 2 + closed * openingGrid(ctx).length;
+}
+
+/**
+ * Chooses N over the days ctx holds (design row 21), then plans over exactly those N days under
+ * the same deadline. The count's baseline is not reused: planForecast simulates its own.
+ */
 export async function runPlanJob(
 	ctx: EngineContext,
-	_options: PlanJobOptions,
+	{ deadline, now, ladder }: PlanJobOptions,
 ): Promise<PlanJobResult> {
-	const { plan, result, score, baseline } = await planForecast(ctx);
-	return { plan, result, score, baseline: { score: baseline.score } };
+	const {
+		ctx: counted,
+		n,
+		rungs,
+		stopReason,
+		targetPoints,
+		timing,
+	} = await chooseScenarioCount(ctx, prebuiltScenarioSource(ctx.scenarios), {
+		deadline,
+		now,
+		start: ladder?.start,
+		top: ladder?.top,
+		searchPlans: planSearchSize(ctx),
+	});
+	const { plan, result, score, baseline, candidates, search } =
+		await planForecast(counted, { deadline, now });
+	return {
+		plan,
+		result,
+		score,
+		baseline: { score: baseline.score },
+		scenarioCount: { n, rungs, stopReason, targetPoints, timing },
+		candidates,
+		search,
+	};
 }
 
 function uniqueBuffers(views: ArrayBufferView[]): ArrayBuffer[] {

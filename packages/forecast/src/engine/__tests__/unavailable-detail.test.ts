@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { ForecastInput, ForecastResult } from "../../types";
 import { createForecastEngine } from "../engine";
-import { buildInput, replayFixture } from "./fixtures-engine";
+import { FIXED_N_ENGINE, buildInput, replayFixture } from "./fixtures-engine";
 
-const engine = createForecastEngine();
+const engine = createForecastEngine(FIXED_N_ENGINE);
 
 async function detailOf(input: ForecastInput) {
 	const result: ForecastResult = await engine.compute(input);
