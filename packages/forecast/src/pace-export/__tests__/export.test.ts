@@ -122,6 +122,7 @@ describe("pace export: content", () => {
 				gain: 1,
 				se: 0.25,
 				p: 0.01,
+				runnerUpLoss: 2,
 				on: 1,
 				reason: 0,
 			},
@@ -190,6 +191,7 @@ describe("pace export: content", () => {
 		);
 		expect(f.rowOne?.choice.presentLoss).toBeNull();
 		expect(f.rowOne?.choice.chosenLoss).toBeNull();
+		expect(f.rowOne?.choice.runnerUpLoss).toBeNull();
 		expect(f.rowOne?.choice.reason).toBe(5);
 		expect(f.rowOne?.choice.on).toBe(0);
 		expect(f.rowOne?.pending).toEqual([0, 0, 0, 0, 0, 1, 2]);

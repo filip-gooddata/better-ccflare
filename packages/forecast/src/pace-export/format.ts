@@ -72,6 +72,7 @@ export interface ExportedRowChoice {
 	gain: number | null;
 	se: number | null;
 	p: number | null;
+	runnerUpLoss: number | null;
 	on: 0 | 1;
 	reason: number;
 }
@@ -94,6 +95,7 @@ export function encodeRowChoice(c: RowChoice<Partition>): ExportedRowChoice {
 		gain: nanToNull(c.gain),
 		se: nanToNull(c.se),
 		p: nanToNull(c.p),
+		runnerUpLoss: nanToNull(c.runnerUpLoss),
 		on: c.on ? 1 : 0,
 		reason,
 	};

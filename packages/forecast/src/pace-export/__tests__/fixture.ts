@@ -61,6 +61,7 @@ export const ON_CHOICE: RowChoice<Partition> = {
 	gain: 1,
 	se: 0.25,
 	p: 0.01,
+	runnerUpLoss: 2,
 	on: true,
 	reason: "on",
 };
@@ -80,6 +81,7 @@ export const NO_UNITS_CHOICE: RowChoice<Partition> = {
 	gain: 0,
 	se: 0,
 	p: 1,
+	runnerUpLoss: Number.NaN,
 	on: false,
 	reason: "no-units",
 };

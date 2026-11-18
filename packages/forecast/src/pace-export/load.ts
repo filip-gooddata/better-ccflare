@@ -77,6 +77,7 @@ function decodeRowChoice(v: unknown): RowChoice<Partition> {
 		gain: numOrNaN(c.gain, "rowOne.choice.gain"),
 		se: numOrNaN(c.se, "rowOne.choice.se"),
 		p: numOrNaN(c.p, "rowOne.choice.p"),
+		runnerUpLoss: numOrNaN(c.runnerUpLoss, "rowOne.choice.runnerUpLoss"),
 		on: c.on === 1,
 		reason,
 	};
