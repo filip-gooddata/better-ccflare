@@ -27,7 +27,7 @@ function value(v: unknown): string {
 
 const ident = (id: string) => id.replace(/[^A-Za-z0-9._-]/g, "_");
 
-/** One row: served/chosen/runnerUp/presentLoss/chosenLoss/gain/se/units/floor/on. */
+/** One row: served/chosen/runnerUp/presentLoss/chosenLoss/gain/se/units/floor/on/runnerUpLoss/p. */
 const entry = (c: RowChoice<unknown>) =>
 	`${ident(c.row)}:${[
 		value(c.served),
@@ -40,15 +40,19 @@ const entry = (c: RowChoice<unknown>) =>
 		num(c.units),
 		num(c.floor),
 		c.on ? "1" : "0",
+		num(c.runnerUpLoss),
+		num(c.p),
 	].join("/")}`;
 
 /** Row 1 before its first successful job: every field na. */
-const NO_DAYTYPES = `daytypes:${Array(10).fill("na").join("/")}`;
+const NO_DAYTYPES = `daytypes:${Array(12).fill("na").join("/")}`;
 
 /**
  * The `forecast f2 learn` line (DESIGN-F2 section 3), logged right after
  * `forecast e4 refit`. Numbers only: per row, in `learned.choices` order,
- * served/chosen/runnerUp/presentLoss/chosenLoss/gain/se/units/floor/on.
+ * served/chosen/runnerUp/presentLoss/chosenLoss/gain/se/units/floor/on/runnerUpLoss/p,
+ * where runnerUpLoss is the runner-up mean loss on the same units and p the
+ * sign-flip p of the chosen candidate against the present.
  * Row 1 is scored by its own job: for a main refit job (`mainJob`) that
  * carries no stored row-1 choice yet, its entry comes first with every field na.
  */

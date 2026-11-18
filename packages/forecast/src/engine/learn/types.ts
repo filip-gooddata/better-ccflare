@@ -47,6 +47,8 @@ export interface RowChoice<V> {
 	served: V;
 	presentLoss: number;
 	chosenLoss: number;
+	/** Mean loss of the runner-up on the same units; NaN with no runner-up or no units. */
+	runnerUpLoss: number;
 	gain: number;
 	se: number;
 	p: number;

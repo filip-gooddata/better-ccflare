@@ -26,6 +26,7 @@ const choice = <V>(c: Partial<RowChoice<V>> & { row: string; present: V }) =>
 		served: c.present,
 		presentLoss: Number.NaN,
 		chosenLoss: Number.NaN,
+		runnerUpLoss: Number.NaN,
 		gain: 0,
 		se: 0,
 		p: 1,
@@ -61,14 +62,14 @@ describe("forecast f2 learn log line", () => {
 			formatF2LearnLine(learnDemand(INPUT, null), 1234.4, { mainJob: true }),
 		).toBe(
 			"forecast f2 learn ms=1234 rows=" +
-				"daytypes:na/na/na/na/na/na/na/na/na/na," +
-				"pool:h3/h3/na/na/na/0/0/0/7/0," +
-				"lookback:84/84/na/na/na/0/0/0/6/0," +
-				"halflife:14/14/na/na/na/0/0/0/6/0," +
-				"wsshare:5/5/na/na/na/0/0/0/6/0," +
-				"wssample:10/10/na/na/na/0/0/0/5/0," +
-				"bandwidth:0/0/na/na/na/0/0/0/7/0," +
-				"jitter:30/30/na/na/na/0/0/0/7/0",
+				"daytypes:na/na/na/na/na/na/na/na/na/na/na/na," +
+				"pool:h3/h3/na/na/na/0/0/0/7/0/na/1," +
+				"lookback:84/84/na/na/na/0/0/0/6/0/na/1," +
+				"halflife:14/14/na/na/na/0/0/0/6/0/na/1," +
+				"wsshare:5/5/na/na/na/0/0/0/6/0/na/1," +
+				"wssample:10/10/na/na/na/0/0/0/5/0/na/1," +
+				"bandwidth:0/0/na/na/na/0/0/0/7/0/na/1," +
+				"jitter:30/30/na/na/na/0/0/0/7/0/na/1",
 		);
 	});
 
@@ -83,6 +84,7 @@ describe("forecast f2 learn log line", () => {
 			gain: 0.5,
 			se: 0.125,
 			units: 6,
+			p: 0.002,
 			on: true,
 		}) as RowChoice<Partition>;
 		expect(
@@ -90,7 +92,7 @@ describe("forecast f2 learn log line", () => {
 				mainJob: true,
 			}).split(",")[0],
 		).toBe(
-			"forecast f2 learn ms=10 rows=daytypes:0000011/0000011/na/2/1.5/0.5/0.125/6/4/1",
+			"forecast f2 learn ms=10 rows=daytypes:0000011/0000011/na/2/1.5/0.5/0.125/6/4/1/na/0.002",
 		);
 	});
 
@@ -114,6 +116,7 @@ describe("forecast f2 learn log line", () => {
 					served: 28,
 					presentLoss: 0.123456,
 					chosenLoss: 0.1,
+					runnerUpLoss: 0.1111111,
 					gain: 0.023456,
 					se: 0.004,
 					p: 0.001,
@@ -124,7 +127,7 @@ describe("forecast f2 learn log line", () => {
 			250,
 		);
 		expect(line).toBe(
-			"forecast f2 learn ms=250 rows=halflife:28/28/inf/0.1235/0.1/0.02346/0.004/64/7/1",
+			"forecast f2 learn ms=250 rows=halflife:28/28/inf/0.1235/0.1/0.02346/0.004/64/7/1/0.1111/0.001",
 		);
 	});
 
@@ -152,6 +155,8 @@ describe("forecast f2 learn log line", () => {
 					served: "hard3",
 					presentLoss: 1.5,
 					chosenLoss: 1.25,
+					runnerUpLoss: 1.375,
+					p: 0.0625,
 					gain: 0.25,
 					se: 0.5,
 					units: 30,
@@ -162,8 +167,52 @@ describe("forecast f2 learn log line", () => {
 		);
 		expect(line).toBe(
 			"forecast f2 learn ms=3 rows=" +
-				"daytypes:0111122/0000011/na/na/na/-0.5/0.25/12/6/0," +
-				"pool:h3/inf/h3/1.5/1.25/0.25/0.5/30/7/0",
+				"daytypes:0111122/0000011/na/na/na/-0.5/0.25/12/6/0/na/1," +
+				"pool:h3/inf/h3/1.5/1.25/0.25/0.5/30/7/0/1.375/0.0625",
+		);
+	});
+
+	it("prints the row-1 placeholder as twelve na fields", () => {
+		expect(formatF2LearnLine(learned([]), 2, { mainJob: true })).toBe(
+			"forecast f2 learn ms=2 rows=daytypes:na/na/na/na/na/na/na/na/na/na/na/na",
+		);
+	});
+
+	it("appends the runner-up loss and p after on, na without a runner-up", () => {
+		const line = formatF2LearnLine(
+			learned([
+				choice({
+					row: "lookback",
+					m: 4,
+					floor: 6,
+					units: 40,
+					present: 84,
+					chosen: 84,
+					runnerUp: 56,
+					presentLoss: 0.5,
+					chosenLoss: 0.5,
+					runnerUpLoss: 0.625,
+					p: 1,
+					reason: "present-best",
+				}),
+				choice({
+					row: "jitter",
+					m: 1,
+					floor: 4,
+					units: 12,
+					present: 30,
+					presentLoss: 0.25,
+					chosenLoss: 0.25,
+					p: 1,
+					reason: "present-best",
+				}),
+			]),
+			5,
+		);
+		expect(line).toBe(
+			"forecast f2 learn ms=5 rows=" +
+				"lookback:84/84/56/0.5/0.5/0/0/40/6/0/0.625/1," +
+				"jitter:30/30/na/0.25/0.25/0/0/12/4/0/na/1",
 		);
 	});
 
@@ -173,7 +222,7 @@ describe("forecast f2 learn log line", () => {
 			1,
 		);
 		expect(line).toBe(
-			"forecast f2 learn ms=1 rows=bad_row_x:na/na/na/na/na/0/0/0/4/0",
+			"forecast f2 learn ms=1 rows=bad_row_x:na/na/na/na/na/0/0/0/4/0/na/1",
 		);
 	});
 });
@@ -187,9 +236,11 @@ describe("forecast f2 daytypes log line", () => {
 		served: [1, 0, 0, 0, 0, 2, 2],
 		presentLoss: 2,
 		chosenLoss: 1.9,
+		runnerUpLoss: 2,
 		gain: 0.1,
 		se: 0.25,
 		units: 6,
+		p: 0.3,
 	}) as RowChoice<Partition>;
 	const T = Date.UTC(2026, 10, 18, 10, 0);
 
@@ -207,7 +258,7 @@ describe("forecast f2 daytypes log line", () => {
 				T,
 			),
 		).toBe(
-			"forecast f2 daytypes ms=58049 nested=0 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
+			"forecast f2 daytypes ms=58049 nested=0 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0/2/0.3",
 		);
 	});
 
@@ -225,7 +276,7 @@ describe("forecast f2 daytypes log line", () => {
 				T,
 			),
 		).toBe(
-			"forecast f2 daytypes ms=90000 nested=1 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
+			"forecast f2 daytypes ms=90000 nested=1 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0/2/0.3",
 		);
 	});
 

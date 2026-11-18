@@ -2755,6 +2755,7 @@ describe("forecast service: F2 row 1 in its own worker job", () => {
 		served,
 		presentLoss: 2,
 		chosenLoss: 1,
+		runnerUpLoss: 2,
 		gain: 1,
 		se: 0.25,
 		p: 0.01,
