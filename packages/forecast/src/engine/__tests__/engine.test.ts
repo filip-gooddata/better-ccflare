@@ -335,6 +335,23 @@ describe("cost", () => {
 	);
 
 	test(
+		"the production path (ladder top, real worker, plan budget) keeps the same slice limit, response included",
+		async () => {
+			const production = createForecastEngine();
+			const input = buildInput(replayFixture());
+			const { value, longestMs, turns, wallMs } = await measureYield(() =>
+				production.compute(input),
+			);
+			expect(value.available).toBe(true);
+			console.info(
+				`[engine] production compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+			);
+			expect(longestMs).toBeLessThan(40);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
+
+	test(
 		"REPORT: median wall time and response sizes",
 		async () => {
 			const input = buildInput(replayFixture());
