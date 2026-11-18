@@ -1420,10 +1420,7 @@ OAuth tokens will need to be re-authenticated.
 	): Promise<boolean> {
 		return withDatabaseRetry(
 			async () => {
-				const changes = await this.accounts.clearRateLimitState(
-					accountId,
-					now,
-				);
+				const changes = await this.accounts.clearRateLimitState(accountId, now);
 				return changes >= 0;
 			},
 			this.retryConfig,

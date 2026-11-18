@@ -2544,10 +2544,7 @@ export async function forceResetRateLimit(
 		};
 	}
 
-	const notified = await notifyServersToForceResetRateLimit(
-		account.id,
-		config,
-	);
+	const notified = await notifyServersToForceResetRateLimit(account.id, config);
 
 	// Read after the servers answered: a recovery reading may have released the bench.
 	const benchUntil = await dbOps.getActiveOverageBenchUntil(account.id);

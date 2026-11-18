@@ -71,15 +71,13 @@ describe("CLI --force-reset-rate-limit keeps an overage bench and family blocks"
 	}
 
 	async function row() {
-		return dbOps
-			.getAdapter()
-			.get<{
-				rate_limited_until: number | null;
-				rate_limited_reason: string | null;
-			}>(
-				"SELECT rate_limited_until, rate_limited_reason FROM accounts WHERE id = ?",
-				["acct"],
-			);
+		return dbOps.getAdapter().get<{
+			rate_limited_until: number | null;
+			rate_limited_reason: string | null;
+		}>(
+			"SELECT rate_limited_until, rate_limited_reason FROM accounts WHERE id = ?",
+			["acct"],
+		);
 	}
 
 	it("keeps an active bench and reports it with its deadline when no server answers", async () => {
@@ -127,7 +125,9 @@ describe("CLI --force-reset-rate-limit keeps an overage bench and family blocks"
 		const result = await forceResetRateLimit(dbOps, "work", makeConfig());
 
 		expect(result.success).toBe(true);
-		expect(fetchedUrls[0]).toContain("/api/accounts/acct/force-reset-rate-limit");
+		expect(fetchedUrls[0]).toContain(
+			"/api/accounts/acct/force-reset-rate-limit",
+		);
 		expect(result.kept?.familyBlocks).toEqual([
 			{
 				family: "fable",
