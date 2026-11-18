@@ -187,6 +187,11 @@ export async function buildScenarios(
 	horizon: Horizon,
 	options: NoiseOptions,
 	pace: PaceNow,
+	/**
+	 * Build only simulated days [from, to) instead of [0, settings.simulatedDays). Each date's
+	 * generator still draws for the days before `from`, so day s is the same as in a full build.
+	 */
+	days?: { from: number; to: number },
 ): Promise<Scenarios> {
 	const mode = resolveNoiseMode(options);
 	const tz = input.pace.timeZone;
@@ -196,7 +201,11 @@ export async function buildScenarios(
 	const bucketCount =
 		Math.max(0, Math.floor((horizon.simEnd - 1 - start) / BUCKET_MS)) + 1;
 	const end = start + bucketCount * BUCKET_MS;
-	const simulated = Math.max(0, Math.floor(settings.simulatedDays));
+	const simulated = Math.max(
+		0,
+		Math.floor(days ? days.to : settings.simulatedDays),
+	);
+	const first = days ? Math.min(simulated, Math.max(0, Math.floor(days.from))) : 0;
 	const shiftMax = Math.max(
 		0,
 		Math.floor((settings.timeShiftMin * 60_000) / BUCKET_MS),
@@ -260,7 +269,14 @@ export async function buildScenarios(
 
 	const units: Float32Array[] = [];
 	const fable: Float32Array[] = [];
-	for (let s = 0; s < simulated; s++) {
+	for (let s = 0; s < first; s++) {
+		for (const date of dates) {
+			date.rng.uniform();
+			date.rng.normal();
+			date.rng.int(2 * shiftMax + 1);
+		}
+	}
+	for (let s = first; s < simulated; s++) {
 		const u = new Float32Array(bucketCount);
 		const f = new Float32Array(bucketCount);
 		for (const date of dates) {
