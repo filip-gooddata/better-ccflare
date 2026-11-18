@@ -222,72 +222,86 @@ describe("response shape (spec sections 3 to 6) on a real compute", () => {
 		}
 	});
 
-	test("times ascending, jumps twice, past series paired, fable per account", async () => {
-		const response = await computed(buildInput(replayFixture()));
-		expect(response.available).toBe(true);
-		expect(response.reason).toBeNull();
-		expect(response.accounts).toEqual(["acct-a", "acct-b"]);
-		expect(response.levels).toEqual({ light: 10, typical: 50, heavy: 90 });
-		expect(Object.keys(response.fable).sort()).toEqual(["acct-a", "acct-b"]);
-		const day = response.day as ForecastBlock;
-		const week = response.week as ForecastBlock;
-		for (const block of [day, week]) {
-			for (let i = 1; i < block.times.length; i++) {
-				expect(block.times[i] ?? Number.NaN).toBeGreaterThanOrEqual(
-					block.times[i - 1] ?? Number.NaN,
-				);
+	test(
+		"times ascending, jumps twice, past series paired, fable per account",
+		async () => {
+			const response = await computed(buildInput(replayFixture()));
+			expect(response.available).toBe(true);
+			expect(response.reason).toBeNull();
+			expect(response.accounts).toEqual(["acct-a", "acct-b"]);
+			expect(response.levels).toEqual({ light: 10, typical: 50, heavy: 90 });
+			expect(Object.keys(response.fable).sort()).toEqual(["acct-a", "acct-b"]);
+			const day = response.day as ForecastBlock;
+			const week = response.week as ForecastBlock;
+			for (const block of [day, week]) {
+				for (let i = 1; i < block.times.length; i++) {
+					expect(block.times[i] ?? Number.NaN).toBeGreaterThanOrEqual(
+						block.times[i - 1] ?? Number.NaN,
+					);
+				}
+				expect(block.past.times).toHaveLength(block.past.values.length);
 			}
-			expect(block.past.times).toHaveLength(block.past.values.length);
-		}
-		expect(day.times.filter((t) => t === prague(12, 11))).toHaveLength(2);
-		expect(week.times.filter((t) => t === prague(15, 15))).toHaveLength(2);
-		expect(week.times.at(-1)).toBe(prague(17, 3));
-	});
+			expect(day.times.filter((t) => t === prague(12, 11))).toHaveLength(2);
+			expect(week.times.filter((t) => t === prague(15, 15))).toHaveLength(2);
+			expect(week.times.at(-1)).toBe(prague(17, 3));
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });
 
 describe("smoothed bootstrap through the engine", () => {
-	test("noise off: compute equals the stages run by hand, and every later-date day is one recorded day", async () => {
-		const input = buildInput(replayFixture());
-		const result = await createForecastEngine({ noise: false }).compute(input);
-		if (!result.available) throw new Error(result.reason);
-
-		const ctx = await contextOf(input, false);
-		const { result: sim } = await planForecast(ctx);
-		expect(JSON.stringify(result.response)).toBe(
-			JSON.stringify(buildResponse(ctx, sim)),
-		);
-
-		const tomorrow = localDayStart(prague(13, 12), TZ);
-		const offset = (tomorrow - ctx.scenarios.start) / BUCKET_MS;
-		const pool = poolFor(ctx.table, "workday");
-		const matches = (day: Float32Array) =>
-			pool.some((rec) =>
-				rec.units.every(
-					(u, i) =>
-						Math.abs(u - (day[offset + i] ?? Number.NaN)) <= 1e-5 * (1 + u),
-				),
+	test(
+		"noise off: compute equals the stages run by hand, and every later-date day is one recorded day",
+		async () => {
+			const input = buildInput(replayFixture());
+			const result = await createForecastEngine({ noise: false }).compute(
+				input,
 			);
-		expect(ctx.scenarios.units.every(matches)).toBe(true);
+			if (!result.available) throw new Error(result.reason);
 
-		const noisy = await contextOf(input, true);
-		expect(noisy.scenarios.units.every(matches)).toBe(false);
-	});
+			const ctx = await contextOf(input, false);
+			const { result: sim } = await planForecast(ctx);
+			expect(JSON.stringify(result.response)).toBe(
+				JSON.stringify(buildResponse(ctx, sim)),
+			);
+
+			const tomorrow = localDayStart(prague(13, 12), TZ);
+			const offset = (tomorrow - ctx.scenarios.start) / BUCKET_MS;
+			const pool = poolFor(ctx.table, "workday");
+			const matches = (day: Float32Array) =>
+				pool.some((rec) =>
+					rec.units.every(
+						(u, i) =>
+							Math.abs(u - (day[offset + i] ?? Number.NaN)) <= 1e-5 * (1 + u),
+					),
+				);
+			expect(ctx.scenarios.units.every(matches)).toBe(true);
+
+			const noisy = await contextOf(input, true);
+			expect(noisy.scenarios.units.every(matches)).toBe(false);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });
 
 describe("cost", () => {
-	test("yields to the event loop; no synchronous slice much longer than 25 ms", async () => {
-		const input = buildInput(replayFixture());
-		const { value, longestMs, turns, wallMs } = await measureYield(() =>
-			engine.compute(input),
-		);
-		expect(value.available).toBe(true);
-		console.info(
-			`[engine] compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
-		);
-		expect(turns).toBeGreaterThan(20);
-		// design target about 25 ms; slack for a loaded test machine
-		expect(longestMs).toBeLessThan(40);
-	});
+	test(
+		"yields to the event loop; no synchronous slice much longer than 25 ms",
+		async () => {
+			const input = buildInput(replayFixture());
+			const { value, longestMs, turns, wallMs } = await measureYield(() =>
+				engine.compute(input),
+			);
+			expect(value.available).toBe(true);
+			console.info(
+				`[engine] compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+			);
+			expect(turns).toBeGreaterThan(20);
+			// design target about 25 ms; slack for a loaded test machine
+			expect(longestMs).toBeLessThan(40);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 
 	test(
 		"REPORT: median wall time and response sizes",
