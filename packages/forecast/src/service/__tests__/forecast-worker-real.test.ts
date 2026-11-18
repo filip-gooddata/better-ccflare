@@ -106,3 +106,109 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 		}, 660_000);
 	},
 );
+
+/** The 2026-11-12 replay context: 400 simulated days, the planner fixture of record. */
+async function replayContext() {
+	const { prepareEngineContext } = await import("../../engine/engine");
+	const { buildInput, replayFixture } = await import(
+		"../../engine/__tests__/fixtures-engine"
+	);
+	const ctx = await prepareEngineContext(buildInput(replayFixture()), {
+		noise: true,
+	});
+	if (ctx === "insufficient_history")
+		throw new Error("fixture has no forecast");
+	return ctx;
+}
+
+describe("forecast worker: the plan job", () => {
+	it("answers a plan job with the plan an inline planForecast gives", async () => {
+		const { planForecast } = await import("../../engine/planner");
+		const {
+			PLAN_BUDGET_MS,
+			PLAN_JOB_TIMEOUT_MS,
+			planJobContext,
+			planJobTransfer,
+		} = await import("../../engine/plan-job");
+		const inline = await planForecast(await replayContext());
+		const ctx = await replayContext();
+		const outcome = await sourceRunner().run(
+			"plan",
+			{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
+			{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
+		);
+		if (outcome.status !== "ok") throw new Error(JSON.stringify(outcome));
+		expect(outcome.result.plan).toEqual(inline.plan);
+		expect(outcome.result.score).toEqual(inline.score);
+		expect(outcome.result.baseline.score).toEqual(inline.baseline.score);
+		expect(outcome.result.result).toEqual(inline.result);
+		// The scenarios moved to the worker: the caller keeps detached views.
+		expect(ctx.scenarios.units[0]?.length).toBe(0);
+	}, 240_000);
+
+	it("keeps a 20 ms interval ticking while a plan job runs", async () => {
+		const {
+			PLAN_BUDGET_MS,
+			PLAN_JOB_TIMEOUT_MS,
+			planJobContext,
+			planJobTransfer,
+		} = await import("../../engine/plan-job");
+		const ctx = await replayContext();
+		let last = performance.now();
+		let maxGap = 0;
+		let ticks = 0;
+		const handle = setInterval(() => {
+			const t = performance.now();
+			maxGap = Math.max(maxGap, t - last);
+			last = t;
+			ticks++;
+		}, 20);
+		try {
+			const outcome = await sourceRunner().run(
+				"plan",
+				{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
+				{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
+			);
+			expect(outcome.status).toBe("ok");
+			console.info(
+				`plan job ms=${outcome.ms} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)}`,
+			);
+			expect(ticks).toBeGreaterThanOrEqual(Math.floor(outcome.ms / 40));
+			expect(maxGap).toBeLessThan(250);
+		} finally {
+			clearInterval(handle);
+		}
+	}, 240_000);
+
+	it("reports a timeout when the plan job outlasts its timeout", async () => {
+		const ctx = await replayContext();
+		const outcome = await sourceRunner().run(
+			"plan",
+			{ ctx, budgetMs: 1 },
+			{ timeoutMs: 1 },
+		);
+		expect(outcome.status).toBe("timeout");
+	}, 120_000);
+
+	it("reports a job error, not a worker failure, when the planner throws", async () => {
+		const outcome = await sourceRunner().run(
+			"plan",
+			// A context without scenarios: the planner throws inside the worker.
+			{ ctx: {} as never, budgetMs: 1_000 },
+			{ timeoutMs: 60_000 },
+		);
+		expect(outcome).toMatchObject({ status: "error", reason: "job-error" });
+	}, 120_000);
+
+	it("stops a running plan job on abort", async () => {
+		const ctx = await replayContext();
+		const controller = new AbortController();
+		const pending = sourceRunner().run(
+			"plan",
+			{ ctx, budgetMs: 15_000 },
+			{ timeoutMs: 60_000, signal: controller.signal },
+		);
+		setTimeout(() => controller.abort(), 5);
+		expect(await pending).toMatchObject({ status: "error", reason: "stopped" });
+	}, 120_000);
+});

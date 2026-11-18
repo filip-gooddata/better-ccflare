@@ -4,6 +4,11 @@
  * sums), horizon, scenarios (smoothed bootstrap), planner (receding-horizon search),
  * response. Yields to the event loop between stages; the stages yield inside.
  */
+
+import {
+	createForecastWorkerRunner,
+	type ForecastWorkerRunner,
+} from "../service/forecast-worker-runner";
 import type {
 	AccountId,
 	AccountLimits,
@@ -45,7 +50,13 @@ import type {
 } from "./model";
 import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
-import { planForecast } from "./planner";
+import {
+	PLAN_BUDGET_MS,
+	PLAN_JOB_TIMEOUT_MS,
+	type PlanJobResult,
+	planJobContext,
+	planJobTransfer,
+} from "./plan-job";
 import { buildResponse, unavailableResponse } from "./response";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
@@ -57,7 +68,13 @@ const HOUR_MS = 3_600_000;
  * shrunk kernel (the service's only mode), false is plain resampling. `unshrunk` and `off`
  * exist for measurement.
  */
-export type ForecastEngineOptions = NoiseOptions;
+export interface ForecastEngineOptions extends NoiseOptions {
+	/**
+	 * Runs the planner off the calling thread. Absent: each computation gets its own forecast
+	 * worker runner, so computations stay independent of each other.
+	 */
+	planRunner?: ForecastWorkerRunner;
+}
 
 export function createForecastEngine(
 	options: ForecastEngineOptions = {},
@@ -66,7 +83,8 @@ export function createForecastEngine(
 	return {
 		async compute(input: ForecastInput): Promise<ForecastResult> {
 			try {
-				return await computeForecast(input, noiseMode);
+				const runner = options.planRunner ?? createForecastWorkerRunner();
+				return await computeForecast(input, noiseMode, runner);
 			} catch {
 				return unavailable(input, "error");
 			}
@@ -260,14 +278,35 @@ function poolName(
 	return own >= MIN_POOL_DAYS || type === "weekend" ? type : "weekdays";
 }
 
+/**
+ * The planner in the forecast worker, under the spacing-derived budget and timeout. The scenario
+ * buffers move to the worker; ctx keeps everything buildResponse reads. A failed job throws, so
+ * the computation reports `error` as any other engine failure does.
+ */
+async function planInWorker(
+	ctx: EngineContext,
+	runner: ForecastWorkerRunner,
+): Promise<PlanJobResult> {
+	const outcome = await runner.run(
+		"plan",
+		{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
+		{ timeoutMs: PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
+	);
+	if (outcome.status !== "ok")
+		throw new Error(
+			`plan job ${outcome.status === "timeout" ? "timeout" : outcome.reason}`,
+		);
+	return outcome.result;
+}
+
 async function computeForecast(
 	input: ForecastInput,
 	noiseMode: NoiseMode,
+	runner: ForecastWorkerRunner,
 ): Promise<ForecastResult> {
 	const ctx = await prepare(input, { noiseMode });
 	if ("rule" in ctx) return unavailable(input, "insufficient_history", ctx);
-	const { plan, result, score, baseline } = await planForecast(ctx);
-	await yieldToEventLoop();
+	const { plan, result, score, baseline } = await planInWorker(ctx, runner);
 
 	const response = buildResponse(ctx, result);
 	checkBlock(response.day);

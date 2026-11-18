@@ -1,4 +1,6 @@
+import type { EngineContext } from "../engine/model";
 import type { PaceFitState } from "../engine/pace/types";
+import type { PlanJobResult } from "../engine/plan-job";
 import type { EpochMs } from "../types";
 
 /**
@@ -17,6 +19,14 @@ export interface ForecastWorkerJobs {
 			now: EpochMs;
 		};
 		result: PaceFitState;
+	};
+	/**
+	 * The planner: the prepared context (scenario buffers transferred) and its compute budget,
+	 * which the worker turns into a deadline on its own clock. Answers what computeForecast reads.
+	 */
+	plan: {
+		payload: { ctx: EngineContext; budgetMs: number };
+		result: PlanJobResult;
 	};
 }
 
