@@ -65,7 +65,9 @@ export function formatF2LearnLine(
 
 /**
  * The `forecast f2 daytypes` line, logged when the row-1 job ends. On success
- * its wall time and the row-1 entry as in the f2 learn line; on failure the
+ * its wall time, nested=1 when the job ran the nested confirmation (R3-2), else
+ * 0, and the row-1 entry as in the f2 learn line (a switch stored as pending
+ * shows on=1 with served unlike chosen); on failure the
  * status and the age in minutes of the row-1 choice kept (none before any).
  */
 export function formatF2DaytypesLine(
@@ -74,7 +76,7 @@ export function formatF2DaytypesLine(
 	now: EpochMs,
 ): string {
 	if (outcome.status === "ok")
-		return `forecast f2 daytypes ms=${Math.round(outcome.ms)} rows=${entry(outcome.choice as RowChoice<unknown>)}`;
+		return `forecast f2 daytypes ms=${Math.round(outcome.ms)} nested=${outcome.nested ? 1 : 0} rows=${entry(outcome.choice as RowChoice<unknown>)}`;
 	const age =
 		keptAt === null ? "none" : String(Math.floor((now - keptAt) / 60_000));
 	return `forecast f2 daytypes status=${outcome.status} keptAgeMin=${age}`;

@@ -167,5 +167,48 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				clearInterval(handle);
 			}
 		}, 660_000);
+
+		it("runs the nested row-1 confirmation job on 84 days inside the refit timeout", async () => {
+			const { buildPaceSeries } = await import("../../engine/pace");
+			const days = 84;
+			const n = (days * 24 * 60 * 60_000) / BUCKET;
+			const historyFrom = T0 - n * BUCKET;
+			const history: DemandBucket[] = Array.from({ length: n }, (_, i) => {
+				const at = historyFrom + i * BUCKET;
+				const hour = new Date(at).getUTCHours();
+				const day = new Date(at).getUTCDay();
+				const work = day >= 1 && day <= 5 && hour >= 7 && hour < 17;
+				const units = work
+					? 1 + ((i * 7919) % 13) / 13
+					: ((i * 104729) % 5) / 50;
+				return { start: at, units, fableUnits: 0, requests: units > 0 ? 1 : 0 };
+			});
+			const series = buildPaceSeries({
+				history,
+				historyFrom,
+				now: T0,
+				readings: [],
+				accounts: ["a", "b"],
+				timeZone: "Europe/Prague",
+			});
+			const loadBefore = loadavg()
+				.map((x) => x.toFixed(2))
+				.join(" ");
+			const outcome = await createPaceRefitRunner(sourceRunner()).runDaytypes(
+				series,
+				T0,
+				DEMAND,
+				{ timeoutMs: 600_000, daytypes: null, pending: [0, 0, 0, 0, 0, 1, 1] },
+			);
+			expect(outcome.status).toBe("ok");
+			if (outcome.status === "ok") expect(outcome.nested).toBe(true);
+			console.info(
+				`real nested daytypes ms=${Math.round(outcome.ms)} loadBefore=${loadBefore} loadAfter=${loadavg()
+					.map((x) => x.toFixed(2))
+					.join(" ")}`,
+			);
+			console.info(formatF2DaytypesLine(outcome, null, T0));
+			expect(outcome.ms).toBeLessThan(PACE_REFIT_TIMEOUT_MS);
+		}, 660_000);
 	},
 );

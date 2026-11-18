@@ -15,7 +15,7 @@ const hasFinite = (l: Float64Array) => l.some((x) => Number.isFinite(x));
  * survives BH over every non-present candidate.
  */
 export function selectRow<V>(s: RowScores<V>): RowChoice<V> {
-	const m = s.candidates.length;
+	const m = Math.max(s.candidates.length, s.m ?? 0);
 	const floor = floorOf(m);
 	const P = s.presentIndex;
 	const present = s.candidates[P] as V;
@@ -82,7 +82,11 @@ export function selectRow<V>(s: RowScores<V>): RowChoice<V> {
 
 	const others = s.candidates.map((_, c) => c).filter((c) => c !== P);
 	const ps = others.map((c) => (kept.includes(c) ? signFlipP(diff(P, c)) : 1));
-	const rejected = bh(ps, Q);
+	// a family size above the candidates counts its untested members as p = 1
+	const rejected = bh(
+		[...ps, ...Array.from({ length: m - 1 - ps.length }, () => 1)],
+		Q,
+	);
 	const chosenAt = others.indexOf(chosenIdx);
 	const p = chosenAt < 0 ? 1 : (ps[chosenAt] as number);
 

@@ -128,6 +128,13 @@ describe("forecast jobs: the main refit job", () => {
 });
 
 describe("forecast jobs: the row-1 job", () => {
+	const row1 = (
+		series: PaceSeries,
+	): SeriesJobPayload & {
+		daytypes: RowChoice<Partition> | null;
+		pending: Partition | null;
+	} => ({ ...payloadOf(series), daytypes: null, pending: null });
+
 	it("returns the choice selectRow(scoreDaytypes) gives on the same input", () => {
 		const series = synthetic(35);
 		const expected = selectRow(
@@ -139,14 +146,66 @@ describe("forecast jobs: the row-1 job", () => {
 			}),
 		);
 		expect(expected.m).toBeGreaterThan(1);
-		expect(daytypesJob(payloadOf(series))).toEqual(expected);
+		const out = daytypesJob(row1(series));
+		expect(out.nested).toBe(false);
+		// a switch is stored as pending while the present partition stays served (R3-2)
+		expect(out.choice).toEqual(
+			expected.on ? { ...expected, served: PRESENT_PARTITION } : expected,
+		);
+		expect(out.pending).toEqual(expected.on ? expected.chosen : null);
 	}, 120_000);
 
 	it("fits every candidate partition, the present one included", () => {
 		const series = synthetic(35);
 		const { fits, make } = countingFitter();
-		const choice = daytypesJob(payloadOf(series), make);
-		expect(fits.length).toBe(choice.m);
+		const out = daytypesJob(row1(series), make);
+		expect(fits.length).toBe(out.choice.m);
 		expect(fits).toContain(partitionKey(PRESENT_PARTITION));
+	});
+
+	it("with a pending partition: no family fit, the nested comparison of present and pending only", () => {
+		const series = synthetic(35);
+		const { fits, make } = countingFitter();
+		const nested: string[] = [];
+		const makeNested = (_s: PaceSeries, _now: EpochMs) => (p: Partition) => {
+			nested.push(partitionKey(p));
+			return { units: [-1, -2], loss: [1, 1] };
+		};
+		const out = daytypesJob(
+			{ ...row1(series), daytypes: storedChoice, pending: MON_FRI },
+			make,
+			makeNested,
+		);
+		expect(fits).toEqual([]);
+		expect(nested.sort()).toEqual(
+			[partitionKey(PRESENT_PARTITION), partitionKey(MON_FRI)].sort(),
+		);
+		expect(out.nested).toBe(true);
+		expect(out.pending).toBeNull();
+		// the stored choice served MON_FRI; a failed confirmation does not switch away from it
+		expect(out.choice.served).toEqual(MON_FRI);
+	});
+
+	it("the stored choice is the partition served while a new switch waits as pending", () => {
+		const series = synthetic(35);
+		const fitter =
+			(_s: PaceSeries, _now: EpochMs): PartitionFitter =>
+			(p) =>
+				({
+					oof: {
+						units: Array.from({ length: 12 }, (_, k) => -1 - k),
+						loss: Array.from({ length: 12 }, (_, k) =>
+							partitionKey(p) === partitionKey(MON_FRI)
+								? 1
+								: partitionKey(p) === partitionKey(PRESENT_PARTITION)
+									? 5 + (k % 3)
+									: 9,
+						),
+					},
+				}) as unknown as PaceFitState;
+		const out = daytypesJob(row1(series), fitter);
+		expect(out.choice.on).toBe(true);
+		expect(out.choice.served).toEqual(PRESENT_PARTITION);
+		expect(out.pending).toEqual(MON_FRI);
 	});
 });

@@ -1,3 +1,5 @@
+import { floorOf } from "../pace/fit";
+import { paceGrammar } from "../pace/grammar";
 import {
 	normalizePartition,
 	PRESENT_PARTITION,
@@ -5,8 +7,11 @@ import {
 } from "./partition";
 import type { Partition } from "./types";
 
-/** A block of a refinement needs this many clean days of its weekdays in the window (source §9). */
-export const MIN_BLOCK_CLEAN_DAYS = 10;
+/**
+ * A block of a refinement needs this many clean days of its weekdays in the
+ * window (source §9): E4's evidence floor, floorOf(grammar size) (R3-7).
+ */
+export const MIN_BLOCK_CLEAN_DAYS = floorOf(paceGrammar().length);
 
 /** Clean (uncensored) complete days per weekday, 0 = Monday. */
 export function cleanDaysByWeekday(

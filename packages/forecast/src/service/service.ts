@@ -237,12 +237,14 @@ export function createForecastService(
 	 */
 	let daytypesState: {
 		choice: RowChoice<Partition>;
+		/** A switch waiting for the next row-1 job's nested confirmation (R3-2); same settings rule as the choice. */
+		pending: Partition | null;
 		key: string;
 		at: EpochMs;
 	} | null = null;
 	const storedDaytypes = (demand: RefitDemandSettings) =>
 		daytypesState && daytypesState.key === demandKey(demand)
-			? daytypesState.choice
+			? daytypesState
 			: null;
 	let refitRunning: Promise<void> | null = null;
 	let refitAbort: AbortController | null = null;
@@ -507,7 +509,7 @@ export function createForecastService(
 		const outcome = await refitWith.runner.run(series, now, demand, {
 			timeoutMs,
 			signal,
-			daytypes: storedDaytypes(demand),
+			daytypes: storedDaytypes(demand)?.choice ?? null,
 		});
 		if (stopped) return;
 		// One synchronous swap: a forecast sees the old fit and learned demand or the new pair, never a mix.
@@ -525,16 +527,23 @@ export function createForecastService(
 		// Row 1 in its own job, after the main job whatever its outcome, inside
 		// the same refit cycle: it never overlaps the main job or itself. A
 		// success is used by the next main refit; a failure keeps the last choice.
+		const stored = storedDaytypes(demand);
 		const daytypes = await refitWith.runner.runDaytypes(
 			daytypesSeries,
 			now,
 			demand,
-			{ timeoutMs, signal },
+			{
+				timeoutMs,
+				signal,
+				daytypes: stored?.choice ?? null,
+				pending: stored?.pending ?? null,
+			},
 		);
 		if (stopped) return;
 		if (daytypes.status === "ok") {
 			daytypesState = {
 				choice: daytypes.choice,
+				pending: daytypes.pending,
 				key: demandKey(demand),
 				at: now,
 			};

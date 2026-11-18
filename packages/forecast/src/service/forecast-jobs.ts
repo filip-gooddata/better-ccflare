@@ -1,19 +1,25 @@
 import {
+	type DaytypesResult,
 	learnDaytypes,
 	learnDemand,
+	makeNestedScorer,
 	makePartitionFitter,
-	type Partition,
+	type NestedScorer,
 	type PartitionFitter,
-	type RowChoice,
+	PRESENT_PARTITION,
 } from "../engine/learn";
 import type { PaceSeries } from "../engine/pace/types";
 import type { EpochMs } from "../types";
-import type { ForecastWorkerJobs } from "./forecast-worker-runner";
+import type {
+	ForecastWorkerJobs,
+	SeriesPayload,
+} from "./forecast-worker-runner";
 
 /** What both refit jobs receive: the pooled series (buffers transferred), the fit instant and the demand settings. */
-export type SeriesJobPayload = ForecastWorkerJobs["daytypes"]["payload"];
+export type SeriesJobPayload = SeriesPayload;
 
 type FitterFactory = (series: PaceSeries, now: EpochMs) => PartitionFitter;
+type NestedFactory = (series: PaceSeries, now: EpochMs) => NestedScorer;
 
 function split({
 	start,
@@ -44,16 +50,26 @@ export function refitJob(
 	return { pace: fitWithPartition(learned.partition), learned };
 }
 
-/** The row-1 job: every candidate partition fitted and scored, then selected. */
+/**
+ * The row-1 job (DESIGN-F2 R3-2): with nothing pending, every candidate
+ * partition fitted, scored and selected, a switch stored as pending; with a
+ * pending partition, the nested comparison of present vs pending instead.
+ */
 export function daytypesJob(
-	payload: SeriesJobPayload,
+	payload: ForecastWorkerJobs["daytypes"]["payload"],
 	makeFitter: FitterFactory = makePartitionFitter,
-): RowChoice<Partition> {
-	const { series, now, settings } = split(payload);
-	return learnDaytypes({
-		...settings,
-		series,
-		now,
-		fitWithPartition: makeFitter(series, now),
-	});
+	makeNested: NestedFactory = makeNestedScorer,
+): DaytypesResult {
+	const { daytypes, pending, ...rest } = payload;
+	const { series, now, settings } = split(rest);
+	return learnDaytypes(
+		{
+			...settings,
+			series,
+			now,
+			fitWithPartition: makeFitter(series, now),
+			nestedLoss: makeNested(series, now),
+		},
+		{ served: daytypes?.served ?? PRESENT_PARTITION, pending },
+	);
 }

@@ -1,10 +1,17 @@
 import { describe, expect, it } from "bun:test";
+import { floorOf } from "../../pace/fit";
+import { paceGrammar } from "../../pace/grammar";
 import { PRESENT_PARTITION, partitionKey } from "../partition";
 import {
 	cleanDaysByWeekday,
+	MIN_BLOCK_CLEAN_DAYS,
 	pairDistance,
 	partitionFamily,
 } from "../partition-family";
+
+it("the clean-day block threshold is the evidence floor of the E4 grammar (R3-7)", () => {
+	expect(MIN_BLOCK_CLEAN_DAYS).toBe(floorOf(paceGrammar().length));
+});
 
 // four weeks: any split leaves a block of one weekday (4) or two (8) below 10
 const FEW = [4, 4, 4, 4, 4, 4, 4];

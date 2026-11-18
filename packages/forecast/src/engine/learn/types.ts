@@ -26,6 +26,12 @@ export interface RowScores<V> {
 	units: number[];
 	/** loss[c][u]: out-of-fold loss of candidate c aggregated over unit u (NaN = unscored). */
 	loss: Float64Array[];
+	/**
+	 * Family size when the candidates are a subset of a larger searched family
+	 * (row 1's nested confirmation, R3-2): m, the floor and BH (the family's
+	 * other members as p = 1) use it. Absent or smaller: the candidate count.
+	 */
+	m?: number;
 }
 
 export interface RowChoice<V> {
@@ -69,7 +75,15 @@ export interface LearnInput {
 	timeShiftMin: number;
 	/** Row 1: the full E4 fit under a candidate partition. The present partition returns the job's E4 fit. */
 	fitWithPartition: PartitionFitter;
+	/** Row 1 nested confirmation (R3-2): per held-out ISO week, the loss of a full E4 fit without that week. */
+	nestedLoss?: NestedScorer;
 }
+
+/** Row 1's nested out-of-fold loss of one partition (`nestedOof`): units are weeks as in `PaceFitState.oof`. */
+export type NestedScorer = (partition: Partition) => {
+	units: number[];
+	loss: number[];
+};
 
 /** Inputs of `presentDemand`: the settings each row's present value comes from. */
 export interface DemandSettings {
@@ -100,4 +114,14 @@ export interface LearnedDemand {
 	jitterMin: number;
 	/** Wall time of the learners, rounded ms; 0 for `presentDemand`. */
 	ms: number;
+}
+
+/** What one row-1 job returns: the choice to store, the partition waiting for confirmation, and which step ran. */
+export interface DaytypesResult {
+	/** The stored choice; its `served` is the partition the next main refit fits. */
+	choice: RowChoice<Partition>;
+	/** A switch the family scoring found, waiting for the next job's nested confirmation. */
+	pending: Partition | null;
+	/** True when this job ran the nested confirmation instead of family scoring. */
+	nested: boolean;
 }

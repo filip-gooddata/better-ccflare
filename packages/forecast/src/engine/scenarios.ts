@@ -8,7 +8,7 @@ import { addLocalDays, localDayKey, localDayStart, localParts } from "../time";
 import type { ForecastInput, PaceContext } from "../types";
 import { BUCKET_MS } from "../types";
 import { dayTypeOf, MIN_POOL_DAYS, poolFor } from "./days";
-import { isPresentPartition } from "./learn/partition";
+import { isPresentPartition, PRESENT_PARTITION } from "./learn/partition";
 import type { Partition, PoolTau } from "./learn/types";
 import type {
 	DayTable,
@@ -144,6 +144,19 @@ export function shrinkPool(
 		...d,
 		weight: (mine.has(d) ? (w * d.weight) / so : 0) + ((1 - w) * d.weight) / sa,
 	}));
+}
+
+/**
+ * The scenario day-pool partition (DESIGN-F2 R3-4): the partition of the E4
+ * state actually served, present when none is (pace off, or no fit yet). Not
+ * the learned demand's partition, so a fit of one partition never pairs with
+ * pools of another (e.g. after a demand setting changes, presentDemand is
+ * served while the last fit stays).
+ */
+export function servedPartition(input: ForecastInput): Partition {
+	if (!input.settings.paceConditioning || !input.demandModel)
+		return PRESENT_PARTITION;
+	return input.demandModel.dayTypes?.group ?? PRESENT_PARTITION;
 }
 
 /** Served pool rows of the scenario draw (DESIGN-F2 rows 1, 2); absent = present. */
@@ -301,7 +314,10 @@ export async function buildScenarios(
 				? Math.round((t - dayStart) / BUCKET_MS)
 				: Math.floor(localParts(t, tz).minuteOfDay / SLOT_MINUTES);
 		}
-		const pool = datePool(table, dayStart, input.pace, demand ?? {});
+		const pool = datePool(table, dayStart, input.pace, {
+			poolTau: demand?.poolTau,
+			partition: servedPartition(input),
+		});
 		const cumulative = new Float64Array(pool.length);
 		let acc = 0;
 		pool.forEach((d, i) => {

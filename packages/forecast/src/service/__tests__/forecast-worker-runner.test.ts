@@ -238,6 +238,8 @@ describe("forecast worker runner: the refit job", () => {
 			censored: s.censored.slice(),
 			now: T0,
 			...DEMAND,
+			daytypes: null,
+			pending: null,
 		});
 		const outcome = await createPaceRefitRunner(runner).runDaytypes(
 			s,
@@ -247,7 +249,9 @@ describe("forecast worker runner: the refit job", () => {
 		);
 		expect(outcome.status).toBe("ok");
 		if (outcome.status !== "ok") return;
-		expect(outcome.choice).toEqual(expected);
+		expect(outcome.choice).toEqual(expected.choice);
+		expect(outcome.pending).toEqual(expected.pending);
+		expect(outcome.nested).toBe(false);
 		expect(outcome.choice.row).toBe("daytypes");
 		expect(s.units.byteLength).toBe(0);
 	});
