@@ -37,7 +37,12 @@ export const REASON_MIN_GAIN_POINTS = REPORT_STEP_POINTS / 2;
 export interface PlanSearchOptions {
 	/** Monotonic clock in ms; default performance.now. */
 	now?: () => number;
-	/** On the `now` clock: combinations of two or more openings and moves stop once it has passed. None: unbounded. */
+	/**
+	 * On the `now` clock; none: unbounded. Checked before each simulation it may cut: combinations of
+	 * two or more openings, coordinate refinement and moves. A simulation admitted just before it
+	 * passes still runs (the search yields to the event loop first), and the work planForecast always
+	 * completes runs after it.
+	 */
 	deadline?: number;
 	/** The simulation; default simulate. A seam for tests that watch what the search keeps. */
 	simulate?: typeof simulate;
@@ -476,10 +481,9 @@ export async function planForecast(
 			),
 		);
 	}
-	const rows = openingRows(beams);
 	let combosEvaluated = 0;
 	const earners: Evaluated[] = [];
-	for (const row of rows) {
+	for (const row of openingCombinations(beams)) {
 		const opened = row.filter((x) => x >= 0).length;
 		if (opened >= 2 && !timeLeft()) break;
 		const openAt = [...baseline.plan.openAt];
@@ -508,8 +512,12 @@ export async function planForecast(
 			if (scannedAgainst[x] === others) continue;
 			scannedAgainst[x] = others;
 			const tried: Evaluated[] = [best];
+			let cut = false;
 			for (const at of [null, ...singleTimes[x]]) {
-				if (!timeLeft()) break refining;
+				if (!timeLeft()) {
+					cut = true;
+					break;
+				}
 				const candidate = await evaluate(withOpening(best.plan, j, at));
 				refine.evaluated++;
 				if (
@@ -526,6 +534,8 @@ export async function planForecast(
 				refine.improved++;
 				changed = true;
 			}
+			// Cut by the deadline: the best of the part scanned is kept, then the search moves on.
+			if (cut) break refining;
 		}
 	}
 
@@ -628,7 +638,10 @@ export async function planForecast(
 			stage1: grid.length,
 			stage2,
 			peaks,
-			combos: { evaluated: combosEvaluated, available: rows.length },
+			combos: {
+				evaluated: combosEvaluated,
+				available: openingCombinationCount(beams),
+			},
 			refine,
 			moves: { evaluated: movesEvaluated, available: moveCandidates.length },
 			cutByDeadline,
@@ -668,26 +681,47 @@ function rankedOpenings(
 
 /**
  * Opening combinations over the beams as rows of beam indices (-1: no opening), every row with at
- * least one opening: first those with exactly one (each a single already scored), then the rest in
- * order of the sum of their openings' beam positions (best singles first), then by the row itself.
+ * least one opening, generated lazily: first those with exactly one (each a single already scored),
+ * then the rest in order of the sum of their openings' beam positions (best singles first), then by
+ * the row itself (lexicographic, -1 first). Nothing is built beyond the rows taken.
  */
-function openingRows(beams: EpochMs[][]): number[][] {
-	let rows: number[][] = [[]];
-	for (const beam of beams)
-		rows = rows.flatMap((row) =>
-			[-1, ...beam.map((_, i) => i)].map((i) => [...row, i]),
-		);
-	const opened = (row: number[]) => row.filter((i) => i >= 0).length;
-	const rankSum = (row: number[]) =>
-		row.reduce((sum, i) => sum + (i >= 0 ? i : 0), 0);
-	return rows
-		.filter((row) => opened(row) > 0)
-		.sort(
-			(a, b) =>
-				Math.min(opened(a), 2) - Math.min(opened(b), 2) ||
-				rankSum(a) - rankSum(b) ||
-				a.reduce((d, i, x) => d || i - b[x], 0),
-		);
+export function* openingCombinations(
+	beams: readonly EpochMs[][],
+): Generator<number[]> {
+	const lens = beams.map((b) => b.length);
+	const longest = Math.max(0, ...lens);
+	for (let sum = 0; sum < longest; sum++)
+		for (let x = lens.length - 1; x >= 0; x--)
+			if (sum < lens[x]) yield lens.map((_, y) => (y === x ? sum : -1));
+	// Largest position sum still reachable from account x onwards.
+	const reach = lens.map((_, x) =>
+		lens.slice(x).reduce((total, len) => total + Math.max(len - 1, 0), 0),
+	);
+	const row: number[] = [];
+	function* withSum(
+		x: number,
+		left: number,
+		opened: number,
+	): Generator<number[]> {
+		if (x === lens.length) {
+			if (left === 0 && opened >= 2) yield [...row];
+			return;
+		}
+		for (let i = -1; i < lens[x]; i++) {
+			const part = Math.max(i, 0);
+			if (part > left) break;
+			if (left - part > (reach[x + 1] ?? 0)) continue;
+			row.push(i);
+			yield* withSum(x + 1, left - part, opened + (i >= 0 ? 1 : 0));
+			row.pop();
+		}
+	}
+	for (let sum = 0; sum <= (reach[0] ?? 0); sum++) yield* withSum(0, sum, 0);
+}
+
+/** How many rows openingCombinations yields: every choice per account, less the row with none. */
+export function openingCombinationCount(beams: readonly EpochMs[][]): number {
+	return beams.reduce((product, beam) => product * (beam.length + 1), 1) - 1;
 }
 
 /**
@@ -812,7 +846,7 @@ export function placementOf(
 	const ahead = plannedAt != null ? openingReason(gain) : null;
 	if (ahead) reason = ahead;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
-		reason = `low-point+${gain.toFixed(1)}`;
+		reason = `low-point+${gain.toFixed(REPORT_DECIMALS)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
 	else {
 		// The stage on which the second account dropped from the first account's tier (null inside

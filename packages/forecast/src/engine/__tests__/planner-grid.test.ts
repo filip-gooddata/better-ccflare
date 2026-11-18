@@ -4,6 +4,8 @@ import type { SimulationResult } from "../model";
 import { localMarks, localPeaks, refineMarks } from "../opening-grid";
 import {
 	openingBeam,
+	openingCombinationCount,
+	openingCombinations,
 	openingReason,
 	type PlanScore,
 	planForecast,
@@ -283,12 +285,19 @@ describe("the search keeps scores, not simulations", () => {
 			rate: (m, w) => (w <= 5 && m >= 480 && m < 960 ? 0.9 : 0),
 		});
 		const made: WeakRef<SimulationResult>[] = [];
+		let aliveMidSearch = Number.NaN;
 		const spy: typeof simulate = async (c, plan) => {
+			if (made.length === 60) {
+				// mid-search, before the 61st simulation: earlier ones the search no longer needs are gone
+				Bun.gc(true);
+				aliveMidSearch = made.filter((ref) => ref.deref() !== undefined).length;
+			}
 			const result = await simulate(c, plan);
 			made.push(new WeakRef(result));
 			return result;
 		};
 		const value = await planForecast(ctx, { simulate: spy });
+		expect(aliveMidSearch).toBeLessThanOrEqual(4);
 		// One simulation per candidate, and one more for the chosen plan unless it is the baseline.
 		expect(value.candidates).toBeGreaterThan(value.search.stage1);
 		expect(made.length).toBeGreaterThanOrEqual(value.candidates);
@@ -299,5 +308,135 @@ describe("the search keeps scores, not simulations", () => {
 		expect(alive).toBeLessThanOrEqual(4);
 		expect(value.result.traces.length).toBe(5);
 		expect(value.baseline.result.traces.length).toBe(5);
+	}, 60_000);
+});
+
+describe("opening combinations are generated lazily, in order of single score", () => {
+	/** The order before the generator: the whole product, sorted. */
+	function sortedProduct(lens: number[]): number[][] {
+		let rows: number[][] = [[]];
+		for (const len of lens)
+			rows = rows.flatMap((row) =>
+				[-1, ...Array.from({ length: len }, (_, i) => i)].map((i) => [
+					...row,
+					i,
+				]),
+			);
+		const opened = (row: number[]) => row.filter((i) => i >= 0).length;
+		const rankSum = (row: number[]) =>
+			row.reduce((sum, i) => sum + (i >= 0 ? i : 0), 0);
+		return rows
+			.filter((row) => opened(row) > 0)
+			.sort(
+				(a, b) =>
+					Math.min(opened(a), 2) - Math.min(opened(b), 2) ||
+					rankSum(a) - rankSum(b) ||
+					a.reduce((d, i, x) => d || i - b[x], 0),
+			);
+	}
+	const beamsOf = (lens: number[]) =>
+		lens.map((len) => Array.from({ length: len }, (_, i) => 1000 + i));
+
+	test("the same rows in the same order as sorting the whole product", () => {
+		for (const lens of [[1], [3], [2, 3], [3, 1, 4], [2, 2, 2], [1, 1, 1, 1]]) {
+			const beams = beamsOf(lens);
+			expect([...openingCombinations(beams)]).toEqual(sortedProduct(lens));
+			expect(openingCombinationCount(beams)).toBe(sortedProduct(lens).length);
+		}
+		expect([...openingCombinations([])]).toEqual([]);
+		expect(openingCombinationCount([])).toBe(0);
+	});
+
+	test("six accounts with eight peaks each: the first rows come without building the product", () => {
+		const beams = beamsOf([8, 8, 8, 8, 8, 8]);
+		expect(openingCombinationCount(beams)).toBe(9 ** 6 - 1);
+		const first: number[][] = [];
+		for (const row of openingCombinations(beams)) {
+			first.push(row);
+			if (first.length === 60) break;
+		}
+		// 48 single rows, then the two-opening rows with position sum 0, last two accounts first
+		expect(first.slice(0, 2)).toEqual([
+			[-1, -1, -1, -1, -1, 0],
+			[-1, -1, -1, -1, 0, -1],
+		]);
+		expect(first[48]).toEqual([-1, -1, -1, -1, 0, 0]);
+		expect(first[49]).toEqual([-1, -1, -1, 0, -1, 0]);
+	});
+});
+
+/** The 2026-11-12 shape on few days: both accounts closed, work from 11:00, a heavier afternoon. */
+function nov12Few() {
+	const now = prague(12, 7, 30);
+	const weekReset = prague(13, 20);
+	return makeCtx({
+		now,
+		days: 5,
+		spread: 0.1,
+		accounts: [
+			account({ id: "acct-a", weekUsed: 10, weekReset }),
+			account({ id: "acct-b", weekUsed: 10, weekReset }),
+		],
+		kW: { "acct-a": 0.05, "acct-b": 0.05 },
+		rate: (m, w) => {
+			if (w > 5) return 0;
+			if (m >= 660 && m < 795) return 0.68;
+			if (m >= 795 && m < 960) return 0.945;
+			return 0;
+		},
+		settings: { prewarm: true },
+		workStartMinute: 660,
+	});
+}
+
+describe("a deadline that passes during refinement", () => {
+	test("keeps the best of the part already scanned", async () => {
+		const ctx = nov12Few();
+		// A clock that advances one tick per reading: the search reads it once at the start, before
+		// each combination of two or more openings, each refinement candidate and each move, and at
+		// the end, so the same context gives the same readings.
+		const counting = () => {
+			let reads = 0;
+			return () => reads++;
+		};
+		const full = await planForecast(ctx, { now: counting() });
+		expect(full.search.refine.improved).toBeGreaterThanOrEqual(1);
+		expect(full.search.moves.evaluated).toBe(0);
+		const multiRows =
+			full.search.elapsedMs + 1 - 2 - full.search.refine.evaluated;
+		const cutAt = async (refineCandidates: number) =>
+			planForecast(ctx, {
+				now: counting(),
+				deadline: multiRows + 1 + refineCandidates,
+			});
+		const none = await cutAt(0);
+		expect(none.search.refine.evaluated).toBe(0);
+		expect(none.search.cutByDeadline).toBe(true);
+		const part = await cutAt(60);
+		expect(part.search.refine.evaluated).toBe(60);
+		expect(part.search.cutByDeadline).toBe(true);
+		expect(part.search.refine.improved).toBe(1);
+		expect(part.score.lowPoint).toBeGreaterThan(none.score.lowPoint);
+		expect(Object.keys(part.plan.openAt).sort()).toEqual(["acct-a", "acct-b"]);
+	}, 60_000);
+});
+
+describe("moves: every warm session with recent use, not the first three", () => {
+	test("five warm sessions on the open account give ten move candidates, all tried", async () => {
+		const ctx = threeAccounts();
+		const now = ctx.now;
+		const sessions = [5, 4, 3, 2, 1].map((units, i) =>
+			session({
+				sessionId: `s${i + 1}`,
+				accountId: "acct-a",
+				lastRequestAt: now - (i + 1) * 10_000,
+				recentUnits: units,
+			}),
+		);
+		const { search } = await planForecast({
+			...ctx,
+			input: { ...ctx.input, sessions },
+		});
+		expect(search.moves).toEqual({ evaluated: 10, available: 10 });
 	}, 60_000);
 });
