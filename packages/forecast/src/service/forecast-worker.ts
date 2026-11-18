@@ -1,4 +1,4 @@
-import { fitPaceModel } from "../engine/pace";
+import { daytypesJob, refitJob } from "./forecast-jobs";
 import type {
 	ForecastJobName,
 	ForecastWorkerJobs,
@@ -18,15 +18,18 @@ const handlers: {
 		payload: ForecastWorkerJobs[J]["payload"],
 	) => ForecastWorkerJobs[J]["result"];
 } = {
-	refit: ({ start, units, censored, timeZone, now }) =>
-		fitPaceModel({ start, units, censored, timeZone }, now),
+	refit: (payload) => refitJob(payload),
+	daytypes: (payload) => daytypesJob(payload),
 };
 
 self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
 	const { id, job, payload } = event.data;
 	let reply: ForecastWorkerReply;
 	try {
-		const handler = handlers[job];
+		// The request union pairs each job with its payload; TypeScript cannot correlate the two through the index.
+		const handler = handlers[job] as
+			| ((p: typeof payload) => unknown)
+			| undefined;
 		if (!handler) throw new TypeError("forecast-worker: unknown job");
 		reply = { id, ok: true, result: handler(payload) };
 	} catch (error) {

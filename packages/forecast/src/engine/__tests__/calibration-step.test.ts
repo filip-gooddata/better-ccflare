@@ -52,7 +52,6 @@ function settings(): ForecastSettings {
 		openMinGainPoints: 1,
 		historyHalfLifeDays: HALF_LIFE_DAYS,
 		historyLookbackDays: LOOKBACK_DAYS,
-		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,

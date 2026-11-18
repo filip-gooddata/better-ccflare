@@ -26,7 +26,8 @@ describe("why there is no forecast (amendment 3, C2)", () => {
 		);
 		expect(detail?.rule).toBe("history");
 		if (detail?.rule !== "history") return;
-		expect(detail.minRecordedDays).toBe(5);
+		// F2 row 3: active days against floorOf(grammar size)
+		expect(detail.minRecordedDays).toBe(10);
 		expect(detail.minPoolDays).toBe(3);
 		expect(detail.recordedDays).toBeLessThan(5);
 		expect(["workday", "weekdays"]).toContain(detail.pool);

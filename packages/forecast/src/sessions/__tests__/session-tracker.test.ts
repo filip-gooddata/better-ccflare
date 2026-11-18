@@ -158,6 +158,68 @@ describe("createSessionTracker", () => {
 		expect(live[0].recentUnits).toBe(0);
 	});
 
+	it("warmUnits of a 5-minute-cache session sums its trailing 5 minutes", () => {
+		let now = T0 + 33 * MIN;
+		const tracker = createSessionTracker({ now: () => now });
+		const a = { inputTokens: 1000, outputTokens: 2000, ...write(500, 0) };
+		const b = { inputTokens: 500, ...write(100, 0) };
+		tracker.observe(event("s1", T0, a));
+		tracker.observe(event("s1", T0 + 30 * MIN, b));
+		const s = tracker.get("s1");
+		expect(s?.cacheTtlMs).toBe(CACHE_TTL_5M_MS);
+		expect(s?.warmUnits).toBeCloseTo(demandUnits(usage(b)), 12);
+		expect(s?.recentUnits).toBeCloseTo(
+			demandUnits(usage(a)) + demandUnits(usage(b)),
+			12,
+		);
+		now = T0 + 35 * MIN;
+		expect(tracker.get("s1")?.warmUnits).toBe(0);
+	});
+
+	it("warmUnits of a 1-hour-cache session sums its trailing 60 minutes", () => {
+		let now = T0 + 33 * MIN;
+		const tracker = createSessionTracker({ now: () => now });
+		const a = { inputTokens: 1000, outputTokens: 2000, ...write(0, 500) };
+		const b = { inputTokens: 500, ...write(0, 100) };
+		tracker.observe(event("s1", T0, a));
+		tracker.observe(event("s1", T0 + 30 * MIN, b));
+		expect(tracker.get("s1")?.cacheTtlMs).toBe(CACHE_TTL_1H_MS);
+		expect(tracker.get("s1")?.warmUnits).toBeCloseTo(
+			demandUnits(usage(a)) + demandUnits(usage(b)),
+			12,
+		);
+		now = T0 + 61 * MIN;
+		expect(tracker.get("s1")?.warmUnits).toBeCloseTo(demandUnits(usage(b)), 12);
+	});
+
+	it("warmUnits uses the trailing 60 minutes while the cache lifetime is unknown", () => {
+		const now = T0 + 33 * MIN;
+		const tracker = createSessionTracker({ now: () => now });
+		tracker.observe(event("s1", T0));
+		tracker.observe(event("s1", T0 + 30 * MIN));
+		const s = tracker.get("s1");
+		expect(s?.cacheTtlMs).toBeNull();
+		expect(s?.warmUnits).toBeCloseTo(2 * demandUnits(usage()), 12);
+	});
+
+	it("keeps 60 minutes of events, so a session turning to 1-hour writes counts its older requests", () => {
+		const now = T0 + 50 * MIN;
+		const tracker = createSessionTracker({ now: () => now });
+		const a = { inputTokens: 1000, ...write(100, 0) };
+		const b = { inputTokens: 1000, ...write(100, 0) };
+		const c = { inputTokens: 10, ...write(0, 1000) };
+		tracker.observe(event("s1", T0, a));
+		tracker.observe(event("s1", T0 + 20 * MIN, b));
+		expect(tracker.get("s1")?.cacheTtlMs).toBe(CACHE_TTL_5M_MS);
+		tracker.observe(event("s1", T0 + 49 * MIN, c));
+		const s = tracker.get("s1");
+		expect(s?.cacheTtlMs).toBe(CACHE_TTL_1H_MS);
+		expect(s?.warmUnits).toBeCloseTo(
+			demandUnits(usage(a)) + demandUnits(usage(b)) + demandUnits(usage(c)),
+			12,
+		);
+	});
+
 	it("live() lists sessions with a request in the trailing maxIdleMs, newest last", () => {
 		const tracker = createSessionTracker({ now: () => T0 });
 		tracker.observe(event("old", T0 - 20 * MIN));

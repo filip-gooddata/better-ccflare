@@ -12,6 +12,7 @@ import type {
 import { BUCKET_MS } from "../../types";
 import { poolFor } from "../days";
 import { createForecastEngine, prepareEngineContext } from "../engine";
+import { presentDemand } from "../learn";
 import type { EngineContext } from "../model";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
@@ -339,5 +340,20 @@ describe("cost", () => {
 			`[engine] REPORT median compute ${times[3]?.toFixed(0)} ms (runs ${times.map((t) => t.toFixed(0)).join(",")}); response bytes: replay ${replayBytes}, Monday 07:00 ${mondayBytes}`,
 		);
 		expect(mondayResponse.week?.times.at(-1)).toBe(prague(22, 15));
+	});
+});
+
+describe("served demand (F2)", () => {
+	test("learnedDemand = presentDemand(settings) and learnedDemand omitted give the same result", async () => {
+		const input = buildInput(replayFixture());
+		const omitted = await engine.compute(input);
+		const present = await engine.compute({
+			...input,
+			learnedDemand: presentDemand(input.settings),
+		});
+		expect(omitted.available).toBe(true);
+		expect(present).toEqual(omitted);
+		const nulled = await engine.compute({ ...input, learnedDemand: null });
+		expect(nulled).toEqual(omitted);
 	});
 });

@@ -211,6 +211,35 @@ describe("forecast inputs line (amendment 4, D2)", () => {
 		expect(line).not.toContain("more=");
 	});
 
+	it("writes the day-type groups of a learned partition (F2 row 1) and masks anything else", () => {
+		const cells = [
+			"mon-fri",
+			"sat-mon",
+			"tue+thu-sun",
+			"all",
+			"wed",
+			"x y",
+			"mon-x",
+		].map((dayType, i) => ({
+			band: "1-2d",
+			dayType,
+			hour: i,
+			feature: "C:day-1",
+			units: 3,
+		}));
+		const d = detail();
+		const line = inputsLine(
+			{
+				...d,
+				paceModel: d.paceModel ? { ...d.paceModel, belowFloor: cells } : null,
+			},
+			NOW,
+		);
+		expect(line).toContain(
+			"e4floor count=7 1-2d:mon-fri:0:C:day-1:3 1-2d:sat-mon:1:C:day-1:3 1-2d:tue+thu-sun:2:C:day-1:3 1-2d:all:3:C:day-1:3 1-2d:wed:4:C:day-1:3 1-2d:?:5:C:day-1:3 1-2d:?:6:C:day-1:3 pool=",
+		);
+	});
+
 	it("ends with the planner's S for the chosen plan and for on demand (amendment 5, E5)", () => {
 		const line = inputsLine(
 			{

@@ -49,7 +49,6 @@ export function settings(
 		openMinGainPoints: 1,
 		historyHalfLifeDays: 14,
 		historyLookbackDays: 56,
-		recentTauMin: 45,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,
@@ -96,6 +95,7 @@ export function session(
 		coldAt: null,
 		contextTokens: 100_000,
 		recentUnits: 1,
+		warmUnits: 1,
 		...over,
 	};
 }

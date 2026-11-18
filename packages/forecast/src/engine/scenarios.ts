@@ -5,9 +5,11 @@
  */
 import { interquartileRange, sampleStandardDeviation } from "simple-statistics";
 import { addLocalDays, localDayKey, localDayStart, localParts } from "../time";
-import type { ForecastInput } from "../types";
+import type { ForecastInput, PaceContext } from "../types";
 import { BUCKET_MS } from "../types";
-import { dayTypeOf, poolFor } from "./days";
+import { dayTypeOf, MIN_POOL_DAYS, poolFor } from "./days";
+import { isPresentPartition, PRESENT_PARTITION } from "./learn/partition";
+import type { Partition, PoolTau } from "./learn/types";
 import type {
 	DayTable,
 	Horizon,
@@ -64,7 +66,8 @@ export interface ScaleKernel {
 }
 
 /**
- * Scale kernel of a pool. h = scaleBandwidth(pool) (unchanged). m and s² are the
+ * Scale kernel of a pool. h = scaleBandwidth(pool), times 2^(k/2) when F2 row 18
+ * serves a bandwidth step k other than 0. m and s² are the
  * mean and variance of the log daily totals under the draw's own recency weights,
  * s² = Σw·(L − m)² ÷ Σw: the variance of the distribution that is resampled, not a
  * sample estimate of some other one, so the shrunk kernel keeps exactly that
@@ -72,8 +75,11 @@ export interface ScaleKernel {
  * the bandwidth; a drawn zero-total day stays 0 whatever its scale. No positive day
  * (or no positive weight) gives m = s² = 0.
  */
-export function scaleKernel(pool: RecordedDay[]): ScaleKernel {
-	const bandwidth = scaleBandwidth(pool);
+export function scaleKernel(pool: RecordedDay[], bandwidthK = 0): ScaleKernel {
+	const bandwidth =
+		bandwidthK === 0
+			? scaleBandwidth(pool)
+			: scaleBandwidth(pool) * 2 ** (bandwidthK / 2);
 	let sw = 0;
 	let swl = 0;
 	for (const d of pool)
@@ -112,6 +118,87 @@ export function scaleLogShift(
 	if (!(s2 > 0)) return 0;
 	const m = kernel.mean;
 	return m + (logTotal - m + h * eps) / Math.sqrt(1 + (h * h) / s2) - logTotal;
+}
+
+/**
+ * Row 2 shrinkage draw: w·own + (1 − w)·all with w = n/(n + τ), n = own days;
+ * w = 0 when n = 0, w = 1 when τ = 0 and n > 0, τ = ∞ gives w = 0. Each of
+ * the two parts keeps its days' relative recency weights; the result is one
+ * weighted pool over the days with positive weight.
+ */
+export function shrinkPool(
+	own: RecordedDay[],
+	all: RecordedDay[],
+	tau: number,
+): RecordedDay[] {
+	const n = own.length;
+	const w = n === 0 ? 0 : tau === 0 ? 1 : n / (n + tau);
+	if (w === 1) return own;
+	if (w === 0) return all;
+	let so = 0;
+	for (const d of own) so += d.weight;
+	let sa = 0;
+	for (const d of all) sa += d.weight;
+	const mine = new Set(own);
+	return all.map((d) => ({
+		...d,
+		weight: (mine.has(d) ? (w * d.weight) / so : 0) + ((1 - w) * d.weight) / sa,
+	}));
+}
+
+/**
+ * The scenario day-pool partition (DESIGN-F2 R3-4): the partition of the E4
+ * state actually served, present when none is (pace off, or no fit yet). Not
+ * the learned demand's partition, so a fit of one partition never pairs with
+ * pools of another (e.g. after a demand setting changes, presentDemand is
+ * served while the last fit stays).
+ */
+export function servedPartition(input: ForecastInput): Partition {
+	if (!input.settings.paceConditioning || !input.demandModel)
+		return PRESENT_PARTITION;
+	return input.demandModel.dayTypes?.group ?? PRESENT_PARTITION;
+}
+
+/** Served pool rows of the scenario draw (DESIGN-F2 rows 1, 2); absent = present. */
+export interface PoolDemand {
+	partition?: Partition;
+	poolTau?: PoolTau;
+}
+
+/**
+ * The draw pool of a future date. Present (E4 partition, hard 3): the date's
+ * day-type pool after the monday+workday pooling, or every recorded day when
+ * that pool is empty. A partition other than the present groups the date with
+ * the recorded days whose weekday shares its group; under hard 3 a group below
+ * MIN_POOL_DAYS days draws from every recorded day. A numeric τ draws the
+ * shrinkage mixture of the own group (day type, or partition group) and all days.
+ */
+export function datePool(
+	table: DayTable,
+	dayStart: number,
+	pace: PaceContext,
+	demand: PoolDemand = {},
+): RecordedDay[] {
+	const tau = demand.poolTau ?? "hard3";
+	const partition = demand.partition;
+	const present = !partition || isPresentPartition(partition);
+	if (present && tau === "hard3") {
+		const pool = poolFor(table, dayTypeOf(dayStart, pace));
+		// no day of this type in the history range at all: all recorded days (see buildScenarios)
+		return pool.length === 0 ? table.days : pool;
+	}
+	let own: RecordedDay[];
+	if (present) {
+		const type = dayTypeOf(dayStart, pace);
+		own = table.days.filter((d) => d.type === type);
+	} else {
+		const groupOf = (t: number) =>
+			partition[localParts(t, pace.timeZone).isoWeekday - 1];
+		const group = groupOf(dayStart);
+		own = table.days.filter((d) => groupOf(d.start) === group);
+	}
+	if (tau === "hard3") return own.length >= MIN_POOL_DAYS ? own : table.days;
+	return shrinkPool(own, table.days, tau);
 }
 
 /** Index of each wall-clock slot (minute of day ÷ bucket) in a recorded day; -1 for a slot the day skipped. */
@@ -162,7 +249,8 @@ function pick(cumulative: Float64Array, x: number): number {
  * from that date's pool with probability proportional to its weight; with noise,
  * scale it by exp(scaleLogShift(...)) (shrunk by default, see scaleLogShift; a
  * zero-total day has no log total and gets no scale noise), and shift it by a
- * uniform whole number of buckets within ±timeShiftMin; then scale every bucket,
+ * uniform whole number of buckets within ±timeShiftMin (F2 row 20's served
+ * jitter bound when input.learnedDemand is set); then scale every bucket,
  * Fable part included, by today's pace m(h) = paceMultiplierAt(pace, h), with h
  * the minutes from now to the bucket start (0 for the bucket holding now). The
  * light, typical and heavy lines are read from these scaled days. Off or unfitted
@@ -179,7 +267,9 @@ function pick(cumulative: Float64Array, x: number): number {
  * history range holds no day of that type at all (a short history): a calendar
  * day without demand is still a recorded day with total 0, so a weekend without
  * work is in the weekend pool. Planning is against the heavy day, so the error
- * leans toward more demand.
+ * leans toward more demand. F2: input.learnedDemand, when set, serves the
+ * pool (rows 1, 2, see datePool), the bandwidth step (row 18) and the jitter
+ * bound (row 20); at its present values every draw is as without it.
  */
 export async function buildScenarios(
 	input: ForecastInput,
@@ -197,10 +287,10 @@ export async function buildScenarios(
 		Math.max(0, Math.floor((horizon.simEnd - 1 - start) / BUCKET_MS)) + 1;
 	const end = start + bucketCount * BUCKET_MS;
 	const simulated = Math.max(0, Math.floor(settings.simulatedDays));
-	const shiftMax = Math.max(
-		0,
-		Math.floor((settings.timeShiftMin * 60_000) / BUCKET_MS),
-	);
+	const demand = input.learnedDemand;
+	const jitterMin = demand ? demand.jitterMin : settings.timeShiftMin;
+	const bandwidthK = demand ? demand.bandwidthK : 0;
+	const shiftMax = Math.max(0, Math.floor((jitterMin * 60_000) / BUCKET_MS));
 
 	const maps = new Map<RecordedDay, Int32Array | null>();
 	const bandwidths: Record<string, number> = {};
@@ -224,9 +314,10 @@ export async function buildScenarios(
 				? Math.round((t - dayStart) / BUCKET_MS)
 				: Math.floor(localParts(t, tz).minuteOfDay / SLOT_MINUTES);
 		}
-		let pool = poolFor(table, dayTypeOf(dayStart, input.pace));
-		// no day of this type in the history range at all: all recorded days (see above)
-		if (pool.length === 0) pool = table.days;
+		const pool = datePool(table, dayStart, input.pace, {
+			poolTau: demand?.poolTau,
+			partition: servedPartition(input),
+		});
 		const cumulative = new Float64Array(pool.length);
 		let acc = 0;
 		pool.forEach((d, i) => {
@@ -237,7 +328,7 @@ export async function buildScenarios(
 			if (!maps.has(d)) maps.set(d, slotIndex(d, tz));
 			return maps.get(d) ?? null;
 		});
-		const kernel = scaleKernel(pool);
+		const kernel = scaleKernel(pool, bandwidthK);
 		bandwidths[key] = kernel.bandwidth;
 		dates.push({
 			key,

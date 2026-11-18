@@ -5,7 +5,13 @@
  * again at the next usage poll.
  */
 import { addLocalDays, atLocalMinute, localDayStart } from "../time";
-import type { EpochMs, MoveAdvice, PlacementAdvice, Plan } from "../types";
+import type {
+	EpochMs,
+	LiveSession,
+	MoveAdvice,
+	PlacementAdvice,
+	Plan,
+} from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { moveCostUnits } from "./move-cost";
 import { levelOf } from "./percentile";
@@ -364,6 +370,17 @@ function bestOf(candidates: Evaluated[]): Evaluated | null {
 	);
 }
 
+/**
+ * Warm sessions worth trying a move for: those with units over their own cache lifetime
+ * (DESIGN-F2 "P warm window"), most first, at most MAX_MOVE_SESSIONS.
+ */
+export function moveCandidates(warm: LiveSession[]): LiveSession[] {
+	return warm
+		.filter((s) => s.warmUnits > 0)
+		.sort((a, b) => b.warmUnits - a.warmUnits)
+		.slice(0, MAX_MOVE_SESSIONS);
+}
+
 export async function planForecast(ctx: EngineContext): Promise<{
 	plan: Plan;
 	result: SimulationResult;
@@ -454,10 +471,7 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	// 3. At most one move of one warm live session; it pays its move cost inside the simulation.
 	let move: MoveAdvice | null = null;
 	const indexOf = new Map(ctx.accounts.map((a, j) => [a.accountId, j]));
-	const movable = warmSessions(ctx)
-		.filter((s) => s.recentUnits > 0)
-		.sort((a, b) => b.recentUnits - a.recentUnits)
-		.slice(0, MAX_MOVE_SESSIONS);
+	const movable = moveCandidates(warmSessions(ctx));
 	const moves: Evaluated[] = [];
 	const noMove = best;
 	for (const session of movable) {

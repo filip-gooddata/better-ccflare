@@ -64,9 +64,13 @@ export function createSessionTracker(
 					? CACHE_TTL_1H_MS
 					: CACHE_TTL_5M_MS
 				: null;
+		const warmWindowMs = cacheTtlMs ?? RECENT_WINDOW_MS;
 		let recentUnits = 0;
+		let warmUnits = 0;
 		for (const r of e.recent) {
-			if (r.at > now - RECENT_WINDOW_MS && r.at <= now) recentUnits += r.units;
+			if (r.at > now || r.at <= now - RECENT_WINDOW_MS) continue;
+			recentUnits += r.units;
+			if (r.at > now - warmWindowMs) warmUnits += r.units;
 		}
 		return {
 			sessionId: e.sessionId,
@@ -77,6 +81,7 @@ export function createSessionTracker(
 			coldAt: cacheTtlMs === null ? null : e.lastRequestAt + cacheTtlMs,
 			contextTokens: e.contextTokens,
 			recentUnits,
+			warmUnits,
 		};
 	}
 

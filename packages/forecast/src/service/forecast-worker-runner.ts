@@ -1,5 +1,25 @@
+import type {
+	DaytypesResult,
+	LearnedDemand,
+	Partition,
+	RowChoice,
+} from "../engine/learn/types";
 import type { PaceFitState } from "../engine/pace/types";
 import type { EpochMs } from "../types";
+
+/** The pooled series (buffers transferred), the instant it is fitted at, and the settings the learners start from. */
+export interface SeriesPayload {
+	start: EpochMs;
+	units: Float64Array;
+	censored: Uint8Array;
+	timeZone: string;
+	now: EpochMs;
+	workDays: number;
+	historyLookbackDays: number;
+	historyHalfLifeDays: number;
+	workStartSharePct: number;
+	timeShiftMin: number;
+}
 
 /**
  * Jobs the forecast worker runs off the main thread, by name: what goes in and
@@ -7,16 +27,27 @@ import type { EpochMs } from "../types";
  * are plain data. A new job adds an entry here and a handler in forecast-worker.ts.
  */
 export interface ForecastWorkerJobs {
-	/** E4 refit: the pooled series (buffers transferred) and the instant it is fitted at. */
+	/**
+	 * E4 refit and F2 rows 2-8 in one job. E4 is fitted once, with the
+	 * partition of `daytypes` (the last stored row-1 choice; null before the
+	 * first, which fits the present partition). `pace` is that fit.
+	 */
 	refit: {
-		payload: {
-			start: EpochMs;
-			units: Float64Array;
-			censored: Uint8Array;
-			timeZone: string;
-			now: EpochMs;
+		payload: SeriesPayload & { daytypes: RowChoice<Partition> | null };
+		result: { pace: PaceFitState; learned: LearnedDemand };
+	};
+	/**
+	 * F2 row 1 (day types, DESIGN-F2 R3-2): `daytypes` is the stored choice
+	 * (its served partition is served now) and `pending` the switch waiting
+	 * for confirmation. Nothing pending: one full E4 fit per family partition,
+	 * scored and selected. Pending: the nested comparison of present vs pending.
+	 */
+	daytypes: {
+		payload: SeriesPayload & {
+			daytypes: RowChoice<Partition> | null;
+			pending: Partition | null;
 		};
-		result: PaceFitState;
+		result: DaytypesResult;
 	};
 }
 
