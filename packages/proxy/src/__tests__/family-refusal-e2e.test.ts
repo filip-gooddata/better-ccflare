@@ -128,6 +128,25 @@ function usage(reading: Reading) {
 	return data as never;
 }
 
+/**
+ * Usage readings that land with the upstream call: the fetch stand-in writes
+ * them to the usage cache before answering, the way a poll lags a refusal.
+ */
+const freshOnCall = new Map<string, unknown>();
+
+/**
+ * Telemetry that lags the upstream, as in the measured incident: selection
+ * reads the family at 99 % (a full family is never forwarded to), and the
+ * full reading arrives with the first upstream call to that account.
+ */
+function setLaggingUsage(account: string, reading: Reading): void {
+	const lagging: Reading = reading.fable
+		? { ...reading, fable: [Math.min(reading.fable[0], 99), reading.fable[1]] }
+		: reading;
+	usageCache.set(account, usage(lagging));
+	freshOnCall.set(account, usage(reading));
+}
+
 /** `gooddata` as measured at 11:54 CET. */
 const measuredGooddata = (): Reading => ({
 	fiveHour: [79, FIVE_HOUR_RESET_GD],
@@ -244,6 +263,11 @@ function installUpstream(handler: (call: Call) => Response) {
 		}
 		const call = { account, model };
 		calls.push(call);
+		const fresh = freshOnCall.get(account);
+		if (fresh !== undefined) {
+			usageCache.set(account, fresh as never);
+			freshOnCall.delete(account);
+		}
 		return handler(call);
 	}) as unknown as typeof fetch;
 	return calls;
@@ -422,6 +446,7 @@ afterEach(() => {
 	setForceAccountModel(false);
 	globalThis.fetch = originalFetch;
 	usageCache.clear();
+	freshOnCall.clear();
 	clearFamilyExhaustionCache();
 	clearFamilyBlocks();
 	clearVisionCapability();
@@ -431,7 +456,7 @@ afterEach(() => {
 
 describe("scenario 1: the measured incident replayed", () => {
 	it("blocks Fable on gooddata only, replays the upstream 429, keeps Opus on gooddata, sends Fable elsewhere", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, FIVE_HOUR_RESET_AI, "five_hour");
@@ -502,7 +527,7 @@ describe("scenario 1: the measured incident replayed", () => {
 
 describe("scenario 1b: a family 429 after the account's model list", () => {
 	it("blocks Fable without a bench when every model in the list is Fable", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, FIVE_HOUR_RESET_AI, "five_hour");
@@ -609,7 +634,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 	});
 
 	it("still benches the account when the model list spans families", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		installUpstream(({ account, model }) => {
@@ -637,7 +662,12 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 
 describe("scenario 2: sticky sessions after a family 429", () => {
 	it("moves the Fable session to gooddata-ai and rebinds it; the Opus session stays on gooddata", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		// Fable reads 99 % while the sessions are placed; the full reading
+		// lands with the refused call.
+		usageCache.set(
+			GD,
+			usage({ ...measuredGooddata(), fable: [99, FABLE_RESET_GD] }),
+		);
 		usageCache.set(
 			AI,
 			usage({
@@ -671,6 +701,7 @@ describe("scenario 2: sticky sessions after a family 429", () => {
 		const opusSession = await placeOnGd(OPUS, "opus");
 
 		gdFableOut = true;
+		freshOnCall.set(GD, usage(measuredGooddata()));
 		const before = calls.length;
 		const moved = (await send(
 			ctx,
@@ -704,15 +735,12 @@ describe("scenario 2: sticky sessions after a family 429", () => {
 describe("scenario 3: Fable out on every account", () => {
 	it("returns an upstream 429 unchanged, benches neither account, and still routes Opus", async () => {
 		const aiFableReset = NOW + 20 * HOUR;
-		usageCache.set(GD, usage(measuredGooddata()));
-		usageCache.set(
-			AI,
-			usage({
-				fiveHour: [30, NOW + 3 * HOUR],
-				weeklyAll: [60, aiFableReset],
-				fable: [100, aiFableReset],
-			}),
-		);
+		setLaggingUsage(GD, measuredGooddata());
+		setLaggingUsage(AI, {
+			fiveHour: [30, NOW + 3 * HOUR],
+			weeklyAll: [60, aiFableReset],
+			fable: [100, aiFableReset],
+		});
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, aiFableReset, "seven_day_fable");
 		const calls = installUpstream(({ account, model }) => {
@@ -758,10 +786,10 @@ describe("scenario 4: an account-wide refusal", () => {
 	// five-hour window, or the poll that lands with the 429 reads 100 %.
 	for (const variant of ["claim header", "fresh usage reading"] as const) {
 		it(`benches gooddata on a five-hour 429 and stops routing Opus there (${variant})`, async () => {
-			usageCache.set(
-				GD,
-				usage({ ...measuredGooddata(), fiveHour: [97, FIVE_HOUR_RESET_GD] }),
-			);
+			setLaggingUsage(GD, {
+				...measuredGooddata(),
+				fiveHour: [97, FIVE_HOUR_RESET_GD],
+			});
 			usageCache.set(
 				AI,
 				usage({ ...measuredGooddataAi(), fiveHour: [10, NOW + 4 * HOUR] }),

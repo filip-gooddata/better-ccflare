@@ -359,7 +359,7 @@ describe("collectLimitBlockedAccounts", () => {
 		expect(collect([makeAccount("a")])).toEqual([]);
 	});
 
-	it("lists the family limit only when the family filter is on, at the latest family reset", () => {
+	it("lists a full family in every mode, at the latest family reset", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -370,10 +370,36 @@ describe("collectLimitBlockedAccounts", () => {
 				],
 			}),
 		);
-		expect(collect([a], { capacityRouting: false })).toEqual([]);
-		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
-			{ kind: "family", family: "opus", resetAt: NOW + 30 * HOUR },
+		for (const capacityRouting of [false, true]) {
+			expect(limitsOf(collect([a], { capacityRouting }), "a")).toEqual([
+				{ kind: "family", family: "opus", resetAt: NOW + 30 * HOUR },
+			]);
+		}
+	});
+
+	it("lists a full family row with no reset as a family limit with an unknown reset", () => {
+		const a = makeAccount("a");
+		usageCache.set("a", {
+			five_hour: win(10, NOW + HOUR),
+			seven_day: win(10, NOW + 48 * HOUR),
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: null,
+					scope: { model: { id: null, display_name: "Opus" }, surface: null },
+				},
+			],
+		} as never);
+		expect(limitsOf(collect([a], { capacityRouting: false }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: null },
 		]);
+	});
+
+	it("leaves a reactive family mark out while capacity routing is off", () => {
+		const a = makeAccount("a");
+		markFamilyExhausted("a", "opus", NOW);
+		expect(collect([a], { capacityRouting: false })).toEqual([]);
 	});
 
 	it("does not count overage reported enabled as family capacity", () => {
@@ -478,6 +504,69 @@ describe("selectAllLimitedTarget", () => {
 		const target = await selectAllLimitedTarget(ctx, makeMeta(), MODEL);
 		expect(target?.id).toBe("a");
 		expect(pick.calls[0].map((e) => e.account.id)).toEqual(["a"]);
+	});
+});
+
+describe("selectAccountsForRequest: a full limit is never a candidate", () => {
+	it("excludes an account whose family telemetry is full while capacity routing is off", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set(
+			"a",
+			usage({ family: [{ percent: 100, resetAt: NOW + 10 * HOUR }] }),
+		);
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("keeps an account with only a reactive family mark while capacity routing is off", async () => {
+		const a = makeAccount("a");
+		markFamilyExhausted("a", "opus", NOW);
+		const ctx = makeCtx({
+			accounts: [a],
+			strategy: availabilityStrategy(),
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["a"]);
+	});
+
+	it("excludes an account whose stale full five-hour window hides a full weekly window", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set(
+			"a",
+			usage({
+				fiveHour: win(100, NOW - HOUR),
+				sevenDay: win(100, NOW + 30 * HOUR),
+			}),
+		);
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("keeps a full account out of normal selection whatever the bypass-session header says", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+		});
+		const meta = makeMeta({
+			headers: { "x-better-ccflare-bypass-session": "true" },
+		});
+		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
 	});
 });
 

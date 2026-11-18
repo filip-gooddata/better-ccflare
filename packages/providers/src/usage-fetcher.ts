@@ -879,12 +879,19 @@ export function getRepresentativeUsageResetMs(
  * provider exposes no utilization surface at all. Callers must fall back to
  * the usage-free check rather than read null as "not exhausted by telemetry".
  *
+ * Anthropic and Codex: when any hard window (five-hour or weekly) is still
+ * full — >= 100% with a future or unknown reset — the snapshot reports that
+ * window, so a stale full window picked as representative can never hide a
+ * window that is still full (see {@link fullHardWindowSnapshot}). `now`
+ * decides "future" for that check only.
+ *
  * `provider` is taken as given: callers holding a nullable `account.provider`
  * apply their own `?? "anthropic"` default before calling.
  */
 export function getRepresentativeUsageSnapshotForProvider(
 	data: AnyUsageData | null | undefined,
 	provider: string,
+	now: number = Date.now(),
 ): AccountUsageSnapshot | null {
 	if (!data) return null;
 	if (provider === "zai") {
@@ -897,7 +904,45 @@ export function getRepresentativeUsageSnapshotForProvider(
 		if (!winning) return null;
 		return { utilization: winning.percentage, resetMs: winning.resetAt };
 	}
-	return plainUsageSnapshot(data, provider);
+	return (
+		fullHardWindowSnapshot(data, provider, now) ??
+		plainUsageSnapshot(data, provider)
+	);
+}
+
+/**
+ * The still-full hard window of an Anthropic or Codex payload, or null when
+ * none is. A hard window is the five-hour or the all-models weekly one
+ * (extra_usage is not: it has no reset and is not a plan limit); it is still
+ * full at >= 100% with a reset after `now` or no usable reset at all. Among
+ * several, an unknown reset wins (the account cannot be shown to come back),
+ * else the latest reset (it serves again only once every full window has
+ * reset). Utilization and reset come from that same window.
+ */
+function fullHardWindowSnapshot(
+	data: AnyUsageData,
+	provider: string,
+	now: number,
+): AccountUsageSnapshot | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	let picked: StrategyUsageWindow | null = null;
+	for (const window of [
+		extractFiveHourWindow(data, provider),
+		extractWeeklyWindow(data, provider),
+	]) {
+		if (!window || window.utilization < 100) continue;
+		if (window.resetsAt !== null && window.resetsAt <= now) continue;
+		if (
+			picked === null ||
+			(picked.resetsAt !== null &&
+				(window.resetsAt === null || window.resetsAt > picked.resetsAt))
+		) {
+			picked = window;
+		}
+	}
+	return picked
+		? { utilization: picked.utilization, resetMs: picked.resetsAt }
+		: null;
 }
 
 /**

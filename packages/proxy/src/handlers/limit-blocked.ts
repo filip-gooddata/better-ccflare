@@ -50,12 +50,14 @@ import type { ProxyContext } from "./proxy-types";
  *   `weekly`.
  * - `family`: the model-family filter in selectAccountsForRequest. A standing
  *   family block counts in every mode, with the block's own end as its reset.
- *   Telemetry and the reactive 429 mark count only when capacity routing is
- *   on (isAccountExhaustedForModel; extra usage plays no part there either). A telemetry reset is the LATEST exhausted
- *   family row, since the account serves the family again only once every
- *   row has reset. A reactive 429 mark carries only a TTL guess, not a reset,
- *   so it counts as unknown (null) unless exhausted telemetry rows give the
- *   real one.
+ *   Full family telemetry counts in every mode too
+ *   (isAccountExhaustedForModel; extra usage plays no part there either);
+ *   only the reactive 429 mark needs capacity routing on. A telemetry reset
+ *   is the LATEST exhausted family row, since the account serves the family
+ *   again only once every row has reset, and unknown (null) when a full row
+ *   carries no usable reset. A reactive 429 mark carries only a TTL guess,
+ *   not a reset, so it counts as unknown (null) unless exhausted telemetry
+ *   rows give the real one.
  */
 export function collectLimitBlockedAccounts(
 	accounts: Account[],
@@ -160,9 +162,14 @@ function familyLimitInForce(
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };
-	if (!capacityRoutingEnabled) return null;
 
 	const usage = usageCache.get(account.id);
+	const telemetry = isAccountExhaustedForModel(usage, model, now);
+	if (telemetry.exhausted) {
+		return { kind: "family", family, resetAt: telemetry.resetAt };
+	}
+	if (!capacityRoutingEnabled) return null;
+
 	const exhaustedRows = usage
 		? extractModelFamilyWindows(
 				usage,
@@ -178,14 +185,6 @@ function familyLimitInForce(
 			? Math.max(...exhaustedRows.map((row) => row.resetsAt as number))
 			: null;
 
-	const telemetry = isAccountExhaustedForModel(usage, model, now);
-	if (telemetry.exhausted) {
-		return {
-			kind: "family",
-			family,
-			resetAt: latestRowReset ?? telemetry.resetAt,
-		};
-	}
 	if (getFamilyExhaustionOrigin(account.id, family, now)) {
 		return { kind: "family", family, resetAt: latestRowReset };
 	}

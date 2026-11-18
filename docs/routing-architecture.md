@@ -32,10 +32,8 @@ flowchart TD
     A["Incoming proxied request<br/>(e.g. POST /v1/messages)"] --> B{"Forced account header?<br/>(x-better-ccflare-account-id)"}
     B -->|"Yes, account usable"| C["Use forced account only —<br/>skips strategy and capacity filter"]
     B -->|"No / unusable"| D["Strategy.select()<br/>per configured lb_strategy"]
-    D --> E{"Model-capacity routing<br/>mode = exhausted?"}
-    E -->|"Yes"| F["Drop accounts capacity-excluded<br/>for the request's model family"]
-    E -->|"No"| G["Ordered candidate accounts"]
-    F --> G
+    D --> F["Drop accounts excluded for the request's model family<br/>(family block or full family telemetry: every mode;<br/>recent out_of_credits mark: mode = exhausted)"]
+    F --> G["Ordered candidate accounts"]
     C --> H["applyUsageThrottling<br/>(5h / weekly pacing-line gate)"]
     G --> H
     H --> I{"Any account available<br/>after throttling?"}
@@ -266,15 +264,15 @@ flowchart TD
 
 ## Model-Capacity Routing
 
-When `model_scoped_capacity_routing` is set to `exhausted`, accounts whose weekly per-model-family cap (e.g. a Fable/Opus/Sonnet-specific quota) is provably exhausted are excluded from routing for requests of that family — in both normal and combo-slot routing. Exclusion has two independent signals: a **telemetry-confirmed** one (the account's own usage payload shows every relevant weekly-scoped row at ≥100% with a future reset; paid overage never counts, and `use_extra_usage` no longer does anything) and a **reactive** one (a recently observed `out_of_credits` 429 sidelines the account for that family for a short, fixed TTL to bridge the telemetry poll interval). The filter fails open on telemetry ambiguity — an unknown model family or missing/dropped telemetry rows never cause an exclusion — because a false exclusion removes a working account while a false pass only costs one extra 429 round-trip. Only when excluding accounts empties an otherwise non-empty candidate pool does the request get the structured `model_family_exhausted` response instead of falling through to the generic pool-exhausted path; under `session-pace` the all-limited rule forwards the request to the account usable first instead. [Family blocks](#family-blocks) are a third signal that applies whatever this setting is.
+Accounts whose weekly per-model-family cap (e.g. a Fable/Opus/Sonnet-specific quota) is exhausted are excluded from routing for requests of that family — in both normal and combo-slot routing. Exclusion has two independent signals: a **telemetry-confirmed** one, which applies whatever `model_scoped_capacity_routing` is (the account's own usage payload shows every relevant weekly-scoped row at ≥100% with a future or unknown reset; a full row with no usable reset counts as full; paid overage never counts, and `use_extra_usage` no longer does anything), and a **reactive** one, only when `model_scoped_capacity_routing` is set to `exhausted` (a recently observed `out_of_credits` 429 sidelines the account for that family for a short, fixed TTL to bridge the telemetry poll interval). The telemetry check fails open only on unknown utilization — an unknown model family, a family row with no percent, a reset already past, or no telemetry — because a false pass forwards to an account whose family limit is full, where upstream may bill the request as overage. Only when excluding accounts empties an otherwise non-empty candidate pool does the request get the structured `model_family_exhausted` response instead of falling through to the generic pool-exhausted path; under `session-pace` the all-limited rule forwards the request to the account usable first instead. [Family blocks](#family-blocks) are a third signal that applies whatever this setting is.
 
 ```mermaid
 flowchart TD
-    A["Model-scoped capacity routing<br/>mode = exhausted?"] -->|"No"| B["Filter is a no-op"]
-    A -->|"Yes"| C["Resolve the request model's family:<br/>fable / opus / sonnet / haiku"]
-    C --> D{"Telemetry: EVERY weekly_scoped row<br/>for this family is >= 100% with a<br/>future reset? (Overage never<br/>counts; use_extra_usage<br/>does nothing.)"}
+    C["Resolve the request model's family:<br/>fable / opus / sonnet / haiku"] --> D{"Telemetry (every mode): EVERY<br/>weekly_scoped row for this family is<br/>>= 100% with a future or unknown<br/>reset? (Overage never counts;<br/>use_extra_usage does nothing.)"}
     D -->|"Yes"| E["Exclude —<br/>origin: telemetry_confirmed"]
-    D -->|"No (fails open on unknown<br/>family or missing telemetry)"| F{"Reactive negative cache:<br/>a recent out_of_credits 429<br/>for this (account, family)?<br/>(~5 minute TTL)"}
+    D -->|"No (fails open on unknown<br/>family, missing percent, past<br/>reset or no telemetry)"| A{"Model-scoped capacity routing<br/>mode = exhausted?"}
+    A -->|"No"| H
+    A -->|"Yes"| F{"Reactive negative cache:<br/>a recent out_of_credits 429<br/>for this (account, family)?<br/>(~5 minute TTL)"}
     F -->|"Yes"| G["Exclude —<br/>origin: recent_upstream_rejection"]
     F -->|"No"| H["Account stays in<br/>the candidate pool"]
     E --> I{"Did excluding accounts empty an<br/>otherwise non-empty candidate pool?"}
@@ -298,7 +296,7 @@ Reset times cannot be used: on an account whose weekly Fable and overall weekly 
 
 A family refusal calls `blockFamily(account, family, until = family reset)`, logs `[ccflare] account=<name> family_block family=<f> until=<ISO> source=<header|usage> detail=<…>`, writes no account cooldown and fails over. An account-wide refusal benches the account as before (`cooldown_applied reason=model_fallback_429`). An unclassified one logs `[ccflare] account=<name> family_refusal_unclassified detail=<…>` and then benches the account as before.
 
-A standing block excludes the account for that family in selection regardless of `model_scoped_capacity_routing` (log token `family_blocked`); other families still route to it, and a sticky session of the blocked family moves to another account. When no account can serve the family, the request takes the all-limited path (`session-pace` `rule=all-exhausted`) to the account usable first and the client gets Anthropic's own 429; that refusal does not bench the account for other families. The synthesized `model_family_exhausted` response remains only for strategies without the all-limited rule. The dashboard's Force Reset clears an account's family blocks. Blocks are in memory only: after a restart the account's own `weekly_scoped` telemetry (with `model_scoped_capacity_routing=exhausted`) keeps the family out.
+A standing block excludes the account for that family in selection regardless of `model_scoped_capacity_routing` (log token `family_blocked`); other families still route to it, and a sticky session of the blocked family moves to another account. When no account can serve the family, the request takes the all-limited path (`session-pace` `rule=all-exhausted`) to the account usable first and the client gets Anthropic's own 429; that refusal does not bench the account for other families. The synthesized `model_family_exhausted` response remains only for strategies without the all-limited rule. The dashboard's Force Reset clears an account's family blocks. Blocks are in memory only: after a restart the account's own `weekly_scoped` telemetry keeps the family out.
 
 ```mermaid
 flowchart TD

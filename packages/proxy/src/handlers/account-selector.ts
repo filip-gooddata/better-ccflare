@@ -448,12 +448,13 @@ export function isComboSessionFallbackDisabled(ctx: ProxyContext): boolean {
 
 /**
  * Whether `account` should be excluded from routing for `model`'s family.
- * A standing family block (origin "family_blocked") excludes in every mode;
- * the remaining checks run only when capacity routing is on: either its
- * cached usage telemetry shows a fully exhausted (>=100%, future
- * reset) weekly_scoped cap for that family (origin "telemetry_confirmed"),
- * or the family was recently observed exhausted via an out_of_credits 429
- * (negative cache — origin as recorded by markFamilyExhausted, normally
+ * A standing family block (origin "family_blocked") excludes in every mode,
+ * and so does cached usage telemetry showing a fully exhausted (>=100%,
+ * future or unknown reset) weekly_scoped cap for that family (origin
+ * "telemetry_confirmed"): a full limit has no capacity whatever the mode.
+ * Only the reactive check runs just when capacity routing is on: the family
+ * was recently observed exhausted via an out_of_credits 429 (negative cache
+ * — origin as recorded by markFamilyExhausted, normally
  * "recent_upstream_rejection"). Telemetry is checked first: it's the
  * stronger signal and is what should surface if both happen to agree.
  */
@@ -488,9 +489,6 @@ function isAccountCapacityExcluded(
 		return { excluded: true, resetAt: block.until, origin: "family_blocked" };
 	}
 	if (!family) return { excluded: false, resetAt: null, origin: null };
-	if (!capacityRoutingEnabled) {
-		return { excluded: false, resetAt: null, origin: null };
-	}
 
 	const usageResult = isAccountExhaustedForModel(
 		usageCache.get(account.id),
@@ -503,6 +501,9 @@ function isAccountCapacityExcluded(
 			resetAt: usageResult.resetAt,
 			origin: "telemetry_confirmed",
 		};
+	}
+	if (!capacityRoutingEnabled) {
+		return { excluded: false, resetAt: null, origin: null };
 	}
 	const negativeCacheOrigin = getFamilyExhaustionOrigin(
 		account.id,
@@ -594,12 +595,12 @@ export async function getOrderedAccounts(
 		// at once and keeps a capped account from being picked, retried, and
 		// model-cycled until every model 429s.
 		//
-		// The auto-refresh scheduler's probes must still get through: that is
-		// how a capped account's window-reset is detected, and a capped account
-		// is neither `paused` nor `rate_limited_until`, so nothing else would
-		// let it back in.
-		const isAutoRefreshBypass =
-			meta.headers?.get("x-better-ccflare-bypass-session") === "true";
+		// No header lifts this filter: a full limit is final, and
+		// `x-better-ccflare-bypass-session` is client-settable. Auto-refresh
+		// probes and keepalive replays name their account with
+		// `x-better-ccflare-account-id` and take the forced-account path, which
+		// never reaches this list.
+		//
 		// Deliberately narrow: this removes ONLY usage-capped accounts. The
 		// paused / requires_reauth / rate_limited_until checks stay where they
 		// already are, inside the strategies, because some of them rely on
@@ -607,15 +608,13 @@ export async function getOrderedAccounts(
 		// account before deciding anything). Filtering those here too would
 		// silently change strategy behaviour, which is not what this fix is for.
 		const now = Date.now();
-		const candidates = isAutoRefreshBypass
-			? allAccounts
-			: allAccounts.filter((account) => {
-					const usage = usageSnapshot(account);
-					return (
-						usage === null ||
-						!isUsageExhausted(usage.utilization, usage.resetMs, now)
-					);
-				});
+		const candidates = allAccounts.filter((account) => {
+			const usage = usageSnapshot(account);
+			return (
+				usage === null ||
+				!isUsageExhausted(usage.utilization, usage.resetMs, now)
+			);
+		});
 		// `all` stays the raw, unfiltered DB read (not `candidates`) — the
 		// cooldown-masking sweep in selectAccountsForRequest walks `all` to
 		// find accounts sidelined only by a short rate-limit cooldown, and a
@@ -984,8 +983,9 @@ export async function selectAccountsForRequest(
 						// Per-slot capacity check uses the slot's own model override
 						// (not the combo family's request model), since slots can carry
 						// distinct concrete models within the same family.
-						// A family block excludes the slot even with capacity routing
-						// off; the telemetry and negative-cache checks need it on.
+						// A family block or full family telemetry excludes the slot
+						// even with capacity routing off; the negative-cache check
+						// needs it on.
 						if (
 							isAccountCapacityExcluded(
 								account,
@@ -1296,9 +1296,9 @@ export async function selectAccountsForRequest(
 	// cap for this model's family is exhausted. Only when the filter empties
 	// an otherwise non-empty candidate list do we record exhaustion info —
 	// an empty candidate list from the strategy itself is the ordinary
-	// pool_exhausted case and must not be relabeled. Family blocks apply in
-	// every mode; the telemetry and negative-cache checks only when capacity
-	// routing is on (isAccountCapacityExcluded).
+	// pool_exhausted case and must not be relabeled. Family blocks and full
+	// family telemetry apply in every mode; the negative-cache check only when
+	// capacity routing is on (isAccountCapacityExcluded).
 	if (model) {
 		const family = getModelFamily(model);
 		if (family) {

@@ -1,6 +1,5 @@
 import { getModelFamily } from "@better-ccflare/core";
 import type { AnyUsageData } from "@better-ccflare/providers";
-import { collectWindows } from "./usage-throttling";
 
 export interface ModelExhaustionResult {
 	exhausted: boolean;
@@ -42,85 +41,102 @@ export function resolveOverageStatus(
 	return "unknown";
 }
 
+interface RawFamilyRow {
+	percent: unknown;
+	resetsAt: unknown;
+}
+
 /**
- * Counts the RAW weekly_scoped limits[] rows attributable to `family`,
- * regardless of whether their percent/resets_at values are usable. The
- * normalizer ({@link collectWindows}) silently drops rows with a missing
- * percent or an unparsable/absent reset — fresh windows legitimately carry
- * `resets_at: null` — so the "ALL rows exhausted" check below must compare
- * against this raw count: a dropped partial row is unproven capacity, and
- * unproven capacity means fail open, not "exhausted by omission".
+ * The RAW weekly_scoped limits[] rows attributable to `family`, whatever
+ * their percent/resets_at values. Read directly rather than through
+ * collectWindows, which drops rows with a missing percent or an
+ * absent/unparsable reset: a full row with no usable reset is still full.
  */
-function countRawScopedFamilyRows(
+function rawScopedFamilyRows(
 	usageData: AnyUsageData | null | undefined,
 	family: string,
-): number {
+): RawFamilyRow[] {
 	const limits = (usageData as { limits?: unknown[] } | null | undefined)
 		?.limits;
-	if (!Array.isArray(limits)) return 0;
-	let count = 0;
+	if (!Array.isArray(limits)) return [];
+	const rows: RawFamilyRow[] = [];
 	for (const entry of limits) {
 		const row = entry as {
 			kind?: string;
+			percent?: unknown;
+			resets_at?: unknown;
 			scope?: { model?: { display_name?: string | null } | null } | null;
 		} | null;
 		if (!row || row.kind !== "weekly_scoped") continue;
 		const name = row.scope?.model?.display_name?.trim();
 		if (!name) continue;
-		if (getModelFamily(name) === family) count++;
+		if (getModelFamily(name) === family) {
+			rows.push({ percent: row.percent, resetsAt: row.resets_at });
+		}
 	}
-	return count;
+	return rows;
+}
+
+function parseRowReset(resetsAt: unknown): number | null {
+	if (typeof resetsAt !== "string" || !resetsAt) return null;
+	const ms = new Date(resetsAt).getTime();
+	return Number.isFinite(ms) ? ms : null;
 }
 
 /**
  * Checks whether the account's weekly per-model (weekly_scoped) cap for the
  * given model's family is fully exhausted: EVERY weekly_scoped row for that
- * family is at percent >= 100 with a reset still in the future (a single
- * non-exhausted row — e.g. a distinct surface — means the family still has
- * usable capacity). Paid overage is never capacity: a full family is
- * exhausted whatever the overage, extra-usage or spend signals and the
- * (ignored) "use extra usage" setting say — the same rule the account-level
- * five-hour/weekly gating uses. resolveOverageStatus reads those signals for
- * logging only.
+ * family is at percent >= 100 with a reset in the future or unknown (a
+ * single non-exhausted row — e.g. a distinct surface — means the family
+ * still has usable capacity). A full row whose `resets_at` is missing or
+ * unparsable counts as exhausted with an unknown reset. Paid overage is
+ * never capacity: a full family is exhausted whatever the overage,
+ * extra-usage or spend signals and the (ignored) "use extra usage" setting
+ * say — the same rule the account-level five-hour/weekly gating uses.
+ * resolveOverageStatus reads those signals for logging only.
  *
- * Fails open (returns {exhausted:false}) whenever the family can't be
- * confidently attributed: unknown request-model family, a scoped row whose
- * display name has no known family mapping, a reset that has already
- * passed (stale telemetry), a family row the normalizer had to drop
- * (missing percent / unusable reset — see {@link countRawScopedFamilyRows}),
- * or missing telemetry altogether. A false positive here removes a working
- * account from rotation; a false negative just costs one extra 429
- * round-trip, so the asymmetry favors not excluding.
+ * `resetAt` is the LATEST row reset, since the account serves the family
+ * again only once every full row has reset; it is null when any full row's
+ * reset is unknown.
+ *
+ * Fails open (returns {exhausted:false}) whenever utilization is unknown or
+ * the family can't be attributed: unknown request-model family, no scoped
+ * row whose display name maps to the family, a family row with no numeric
+ * percent, a row whose reset has already passed (stale telemetry), or
+ * missing telemetry altogether. A false negative is not cheap: it forwards
+ * to an account whose family limit is full, and upstream may then bill the
+ * request as overage. So a full row is never discounted for lacking a reset;
+ * only unknown utilization or a reset already past fails open.
  */
 export function isAccountExhaustedForModel(
 	usageData: AnyUsageData | null | undefined,
 	model: string | null | undefined,
 	now: number = Date.now(),
 ): ModelExhaustionResult {
+	const notExhausted = { exhausted: false, resetAt: null };
 	const family = model ? getModelFamily(model) : null;
-	if (!family) return { exhausted: false, resetAt: null };
+	if (!family) return notExhausted;
 
-	const familyRows = collectWindows(usageData ?? null).filter(
-		(window) => window.scoped && window.modelFamily === family,
-	);
-	if (familyRows.length === 0) return { exhausted: false, resetAt: null };
+	const rows = rawScopedFamilyRows(usageData, family);
+	if (rows.length === 0) return notExhausted;
 
-	// A raw family row the normalizer dropped (missing percent, resets_at
-	// null/unparsable) is unproven capacity — "all remaining rows exhausted"
-	// would be exhaustion by omission, so fail open instead.
-	if (countRawScopedFamilyRows(usageData, family) !== familyRows.length) {
-		return { exhausted: false, resetAt: null };
+	let latestReset: number | null = null;
+	let unknownReset = false;
+	for (const row of rows) {
+		if (typeof row.percent !== "number" || !Number.isFinite(row.percent)) {
+			return notExhausted;
+		}
+		if (row.percent < 100) return notExhausted;
+		const resetMs = parseRowReset(row.resetsAt);
+		if (resetMs === null) {
+			unknownReset = true;
+			continue;
+		}
+		if (resetMs <= now) return notExhausted;
+		if (latestReset === null || resetMs > latestReset) latestReset = resetMs;
 	}
 
-	const exhaustedRows = familyRows.filter(
-		(window) => window.utilization >= 100 && window.resetAtMs > now,
-	);
-	if (exhaustedRows.length !== familyRows.length) {
-		return { exhausted: false, resetAt: null };
-	}
-
-	const resetAt = Math.min(...exhaustedRows.map((window) => window.resetAtMs));
-	return { exhausted: true, resetAt };
+	return { exhausted: true, resetAt: unknownReset ? null : latestReset };
 }
 
 // ── Negative cache ────────────────────────────────────────────────────────────

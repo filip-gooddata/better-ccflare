@@ -362,6 +362,82 @@ describe("isAccountExhaustedForModel", () => {
 			).toBe(false);
 		});
 	});
+
+	// A full family row whose reset is missing or unparsable is still full:
+	// letting it through would bill overage, so it counts as exhausted with
+	// an unknown reset. A row with no percent stays unknown utilization.
+	describe("full family rows with no usable reset", () => {
+		const fableRow = (
+			percent: number | undefined,
+			resetsAt: string | null | undefined,
+			surface: string,
+		) => ({
+			kind: "weekly_scoped",
+			...(percent === undefined ? {} : { percent }),
+			...(resetsAt === undefined ? {} : { resets_at: resetsAt }),
+			scope: { model: { id: null, display_name: "Fable" }, surface },
+		});
+		const laterReset = new Date(NOW + 4 * 24 * 60 * 60 * 1000).toISOString();
+
+		it("counts a 100% row with resets_at null as exhausted with an unknown reset", () => {
+			const data = { limits: [fableRow(100, null, "cli")] } as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: null,
+			});
+		});
+
+		it("counts a 100% row with no resets_at field or an unparsable one as exhausted", () => {
+			for (const resetsAt of [undefined, "not-a-date"]) {
+				const data = { limits: [fableRow(100, resetsAt, "cli")] } as never;
+				expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual(
+					{ exhausted: true, resetAt: null },
+				);
+			}
+		});
+
+		it("reports an unknown reset when any full row has no reset", () => {
+			const data = {
+				limits: [fableRow(100, futureReset, "cli"), fableRow(120, null, "api")],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: null,
+			});
+		});
+
+		it("reports the latest reset when every full row has one", () => {
+			const data = {
+				limits: [
+					fableRow(100, futureReset, "cli"),
+					fableRow(100, laterReset, "api"),
+				],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: new Date(laterReset).getTime(),
+			});
+		});
+
+		it("stays not exhausted when a row has no percent", () => {
+			const data = {
+				limits: [fableRow(100, null, "cli"), fableRow(undefined, null, "api")],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: false,
+				resetAt: null,
+			});
+		});
+
+		it("stays not exhausted when a full row's reset has passed", () => {
+			const data = {
+				limits: [fableRow(100, null, "cli"), fableRow(100, pastReset, "api")],
+			} as never;
+			expect(
+				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+			).toBe(false);
+		});
+	});
 });
 
 // ── resolveOverageStatus (v3 tri-state resolver, codex-3) ──────────────────────
