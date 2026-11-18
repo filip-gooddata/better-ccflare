@@ -1,11 +1,11 @@
-> This is a copy of spec revision 9 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 10 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 9 · 2026-11-18 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 10 · 2026-11-18 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -86,11 +86,14 @@ is run through the same routing plan the proxy is following (including the windo
 
 A level `pNN` is "the NNth percentile of demand": at each time point, the value that the pooled quota left is at or
 above in (100 − NN) % of the simulated days. `light` = p10, `typical` = p50 (the median, not a mean profile),
-`heavy` = p90. `fan` holds the other levels, by default every 2 percentile points: `p12 p14 … p48` and
-`p52 p54 … p88` (38 keys; 41 lines with `light`, `typical`, `heavy`). The list of fan levels is a setting
-(`forecast.fanLevels`); adding a level adds a key and changes no existing key.
+`heavy` = p90. `fan` holds the other levels. Which levels, and how many, is a setting of the proxy
+(`FORECAST_FAN_LEVELS`, config `forecast_fan_levels`: a count or a list). By default it holds six keys,
+`p12 p24 p38 p62 p76 p88` (nine lines with `light`, `typical`, `heavy`); a count of 38 gives every 2 percentile
+points, `p12 p14 … p48` and `p52 p54 … p88`. The fan can also be empty. **A client must read the levels from
+the keys of `fan` in each response and must not assume a count or a spacing.** Adding a level adds a key and
+changes no existing key.
 
-**Ordering is guaranteed for all 41 lines**: all levels are percentiles of the same simulated quantity at the same
+**Ordering is guaranteed for all lines**: all levels are percentiles of the same simulated quantity at the same
 time point, so at every index `light ≥ p12 ≥ p14 ≥ … ≥ p48 ≥ typical ≥ p52 ≥ … ≥ p88 ≥ heavy`. Equality is possible
 wherever all simulated days agree, such as at 0 and at the full pool, and with little history the lines may nearly
 coincide. At `computedAt` all levels are equal as a consequence (every simulated day starts from the same
@@ -153,7 +156,7 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `day.past` | `{ times, values }`: pooled 5-hour quota left from local midnight to `computedAt`, one entry per change in the readings, jumps as two entries. Starts later than midnight when the proxy has no earlier readings. An account in a cooldown that is running at `computedAt` counts 0 from the cooldown's start (a jump on the axis), so a running stop shows from its start; a cooldown that has ended is not in the line. |
 | `day.times` | Time axis of the projection: `computedAt`, then every 5 minutes on the clock, to the end of the local day, plus the exact time of every jump and of every point where a level reaches 0. |
 | `day.light`, `day.typical`, `day.heavy` | Projected pooled 5-hour quota left per level, aligned with `day.times`. |
-| `day.fan` | `{ "p12": [...], "p14": [...], ... }`: the other levels (38 keys by default), aligned with `day.times`. No stops for these. |
+| `day.fan` | `{ "p12": [...], "p24": [...], ... }`: the other levels, as many as the setting gives (six by default; read the keys, do not assume a count), aligned with `day.times`. No stops for these. |
 | `day.stops` | `{ light, typical, heavy }`, each a list of `{ start, end }` in time order (section 5). |
 | `day.stopNow` | `{ start, end }` or `null` (section 5). |
 | `day.pastStops` | List of `{ start, end }`, today's ended stops. |
@@ -175,7 +178,7 @@ most 150 to 250 kB uncompressed; about 80 to 90 kB measured on the test fixtures
 
 State: 2026-11-12 13:20 CET. Account `1d05…` is at 100 % of its 5-hour window (reset 16:00), `28f6…` at 6 %
 (reset 18:10). The arrays are shortened to the points that matter; a real response has every 5-minute (day) or
-hourly (week) point in between. `fan` is shortened to six of its 38 keys. The numbers are illustrative.
+hourly (week) point in between. `fan` shows six keys. The numbers are illustrative.
 
 ```json
 {
@@ -294,6 +297,11 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 10, 2026-11-18 (ships in the build that carries it): no field added, removed, renamed or retyped.
+  The fan levels are a setting that takes a count or a list; the default is six keys (`p12 p24 p38 p62 p76
+  p88`) instead of 38. A client reads the levels from each response's `fan` keys and assumes no count.
+  `contractVersion` stays 1.
 
 - Revision 9, 2026-11-18 (ships in pace.12): two optional fields added in `day` and `week`, nothing removed,
   renamed or retyped. `stopChance`: the chance of being stopped at some point in the block's span, over the
