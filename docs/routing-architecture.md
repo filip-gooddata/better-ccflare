@@ -421,3 +421,9 @@ Settings, defaults and formats: [Forecast Settings](./configuration.md#forecast-
 - `routing: false` at start: session-pace is not given the advisor until a restart. With the advisor attached at start, every call also checks the current `enabled` and `routing` values and gives no advice when either is off.
 
 *Source: `packages/forecast/src/service/` (computation, freshness, advisor, endpoint provider), `packages/forecast/src/prewarm/` (scheduler and runner), `packages/load-balancer/src/strategies/session-pace.ts` (advice), `apps/server/src/forecast-wiring.ts` (construction).*
+
+## Marking an account out from response headers
+
+Every Anthropic response (a 200 or a 429) is checked before its body reaches the client. When it carries `anthropic-ratelimit-unified-overage-in-use: true`, a `5h-utilization` or `7d-utilization` of 1.0 or more, a `5h-status` or `7d-status` of `rejected`, or an overall `unified-status` of `rejected`, the proxy writes the header numbers into the in-memory usage cache at once (the window that crossed, or for overage and an overall rejection the window named by `representative-claim`, at 100 % until its reset) and asks the usage fetcher to re-read that account without waiting for the next poll; re-reads are throttled to one per account every 30 seconds. Overage in use also benches the account (`rate_limited_reason = overage_in_use`) until `unified-reset`; the account is not paused, and the opt-in auto-pause on overage keeps working as before. The next selection, even one in the same event-loop turn, then skips the account. The response that carried the headers is never cut: it streams to the client in full, so the request that tips an account over is still served.
+
+*Source: `packages/proxy/src/handlers/header-mark-out.ts`, called from `processProxyResponse` in `packages/proxy/src/handlers/response-processor.ts`.*

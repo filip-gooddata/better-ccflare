@@ -133,6 +133,12 @@ export type RateLimitReason =
 	 *  dashboard visibility only — nothing is written to
 	 *  `accounts.rate_limited_until`, so the account stays routable. */
 	| "upstream_402_out_of_credits"
+	/** An Anthropic response carried `anthropic-ratelimit-unified-overage-in-use:
+	 *  true`: it was served from extra usage, so a plan limit is spent. The
+	 *  account is benched until `anthropic-ratelimit-unified-reset` so the next
+	 *  request goes elsewhere; the response itself is served in full. Not a
+	 *  failure, so it does NOT trip the circuit breaker. */
+	| "overage_in_use"
 	/** Transient upstream server error — HTTP 500/502/503/504 from any provider.
 	 *  Not a quota signal and not specific to the account, but in production a
 	 *  single organization returned 500 for a minute at a time while sibling
