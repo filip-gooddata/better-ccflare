@@ -981,3 +981,97 @@ describe("buildScenarios served demand (F2)", () => {
 		expect(await satSum(4)).toBeGreaterThan(0);
 	});
 });
+
+describe("scenario pools follow the served E4 partition (R3-4)", () => {
+	const ONE: number[] = [0, 0, 0, 0, 0, 0, 0];
+	function setup(over: Partial<ForecastSettings> = {}) {
+		const input = makeInput(NOW, {
+			simulatedDays: 30,
+			paceConditioning: true,
+			...over,
+		});
+		const table = buildDayTable(input);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		return { input, table, horizon };
+	}
+	/** A served E4 state fitted under `group` (only its partition is read here). */
+	const fitUnder = (group: number[] | null) =>
+		(group
+			? { dayTypes: { names: ["all"], group } }
+			: {}) as unknown as ForecastInput["demandModel"];
+	const run = (input: ForecastInput, s: ReturnType<typeof setup>) =>
+		buildScenarios(input, s.table, s.horizon, {}, PLAIN);
+
+	test("a learned partition with no E4 state served draws the present pools", async () => {
+		const s = setup();
+		const plain = await run(s.input, s);
+		const learned = await run(
+			{
+				...s.input,
+				demandModel: null,
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(learned).toEqual(plain);
+	});
+
+	test("a learned partition differing from the served E4 state's draws the state's pools", async () => {
+		const s = setup();
+		const plain = await run({ ...s.input, demandModel: fitUnder(null) }, s);
+		const learned = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(null),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(learned).toEqual(plain);
+	});
+
+	test("settings change: present learned demand with an E4 fit of another partition draws that fit's pools", async () => {
+		const s = setup();
+		const paired = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		const present = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(null),
+				learnedDemand: presentDemand(s.input.settings),
+			},
+			s,
+		);
+		expect(paired).not.toEqual(present);
+		// the service serves presentDemand(new settings) while the last fit (under ONE) stays served
+		const transition = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: presentDemand(s.input.settings),
+			},
+			s,
+		);
+		expect(transition).toEqual(paired);
+	});
+
+	test("pace off serves no E4 state: present pools whatever state is stored", async () => {
+		const s = setup({ paceConditioning: false });
+		const plain = await run(s.input, s);
+		const off = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(off).toEqual(plain);
+	});
+});
