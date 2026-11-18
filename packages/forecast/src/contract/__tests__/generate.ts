@@ -1,5 +1,5 @@
 import type { ForecastBlock, ForecastResponse } from "../../types";
-import { DEFAULT_FAN_LEVELS, fanKey } from "../levels";
+import { fanKey, fanLevelsForCount } from "../levels";
 
 const ACCOUNT_A = "acct-a";
 const ACCOUNT_B = "acct-b";
@@ -73,9 +73,9 @@ function block(
 	};
 }
 
-/** A full-size response with all 41 lines (default fan), about 300 day and 170 week points. */
+/** A full-size response with 41 lines (a fan of 38 levels unless given), about 300 day and 170 week points. */
 export function generateFullResponse(
-	fanLevels: readonly number[] = DEFAULT_FAN_LEVELS,
+	fanLevels: readonly number[] = fanLevelsForCount(38),
 ): ForecastResponse {
 	const computedAt = Date.UTC(2026, 10, 12, 12, 20);
 	return {

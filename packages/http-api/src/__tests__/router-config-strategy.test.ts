@@ -82,7 +82,10 @@ describe("APIRouter — GET /api/config/strategy", () => {
 			strategy: "session_pace",
 			strategySource: "env",
 			sessionPace: pace,
-			forecastSettings,
+			forecastSettings: {
+				...forecastSettings,
+				fanLevelCount: forecastSettings.fanLevels.length,
+			},
 			forecast: { path: "/api/forecast", contractVersion: 1 },
 		};
 		expect(await res?.json()).toEqual(expected);
