@@ -86,18 +86,21 @@ function hourFloor(at: EpochMs, timeZone: string): EpochMs {
 	return day + Math.floor((at - day) / HOUR_MS) * HOUR_MS;
 }
 
+/** Printed values are tenths of a point. */
+const PRINT_SCALE = 10;
+
 /** One decimal, after the percentiles. Rounding is monotone, so the ordering of the lines survives it. */
 function round1(value: number): number {
-	return Math.max(0, Math.round(value * 10) / 10);
+	return Math.max(0, Math.round(value * PRINT_SCALE) / PRINT_SCALE);
 }
 
 /**
  * A level line to one decimal, with 0.0 kept for 0: a value above the zero
- * cutoff prints at least 0.1, so a stop starts and ends where its printed line
- * leaves 0. Still monotone, so the ordering of the lines survives.
+ * cutoff prints at least one print step (0.1), so a stop starts and ends where
+ * its printed line leaves 0. Still monotone, so the ordering of the lines survives.
  */
 function roundLevel(value: number, cutoff: number): number {
-	return value <= cutoff ? 0 : Math.max(0.1, round1(value));
+	return value <= cutoff ? 0 : Math.max(1 / PRINT_SCALE, round1(value));
 }
 
 function roundSeries(series: Series): Series {
