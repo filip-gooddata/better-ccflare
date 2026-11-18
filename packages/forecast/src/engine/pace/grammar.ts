@@ -1,4 +1,4 @@
-import { DAY_BUCKETS, type PaceCalendar } from "./calendar";
+import { DAY_BUCKETS, type PaceCalendar, PRESENT_GROUP } from "./calendar";
 import type { PaceCandidate } from "./types";
 
 /** Pseudo-count (units) inside every log ratio (sandbox lib.ts C_UNITS). */
@@ -111,7 +111,10 @@ export class GrammarContext {
 			if (ds.length < 7) return null;
 			const sel = workdays
 				? ds.filter(
-						(d) => cal.dtype[(days[d] as { first: number }).first] === 0,
+						(d) =>
+							PRESENT_GROUP[
+								cal.wd[(days[d] as { first: number }).first] as number
+							] === 0,
 					)
 				: ds;
 			if (!sel.length) return null;

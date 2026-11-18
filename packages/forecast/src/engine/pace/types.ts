@@ -71,6 +71,18 @@ export interface PaceFitState {
 		dayType: PaceDayTypeName;
 		hour: number;
 	}[];
+	/**
+	 * The weekday partition the state segments by: group id per weekday (0 = Monday) and each
+	 * group's name, by id. Absent: E4's present calendar (`PRESENT_GROUP`, names `DAY_TYPES`).
+	 */
+	dayTypes?: { names: string[]; group: number[] };
+	/**
+	 * Out-of-fold squared error of the served model (F2 row 1's switching loss): per held-out
+	 * ISO week (unit id -1 - week key, ascending), the sum over every band's test rows of
+	 * (y - served exponent)^2, the exponent as applyPace serves it from a fold refit of the
+	 * served cell, 0 where the band serves the plain line. Set by fitPaceModel.
+	 */
+	oof?: { units: number[]; loss: number[] };
 	/** Slot means (288 local five-minute slots) per served day type, from the complete days before the fit. */
 	baseline: Record<PaceDayTypeName, number[]>;
 	/** Per band in PACE_BANDS order: the pooled selection and its established hour cells. */
@@ -85,7 +97,8 @@ export interface PaceFitState {
 	}[];
 }
 
-export type PaceDayTypeName = "workday" | "monday" | "weekend";
+/** A served day type: E4's present "workday" | "monday" | "weekend", or a group name from `groupNames` when the state segments by another weekday partition (`PaceFitState.dayTypes`). */
+export type PaceDayTypeName = string;
 
 /**
  * One generated candidate as plain data (the apply path evaluates it).
