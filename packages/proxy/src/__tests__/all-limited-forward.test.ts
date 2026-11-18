@@ -396,11 +396,15 @@ async function expectBuiltLimit429(
 	expect(response.headers.get("content-type")).toContain("application/json");
 	expect(response.headers.get("x-should-retry")).toBe("true");
 	if (expected.cooldown) {
-		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-status"),
+		).toBeNull();
 		expect(
 			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
 		).toBeNull();
-		expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-reset"),
+		).toBeNull();
 	} else {
 		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
 			"rejected",
@@ -544,7 +548,10 @@ describe("session-pace with every account out on limits", () => {
 		const response = await send(ctx);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR, cooldown: true });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	it("answers a bypass-session request without a forced account with the local 429", async () => {
@@ -562,7 +569,10 @@ describe("session-pace with every account out on limits", () => {
 		);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR, cooldown: true });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	for (const session of ["mapped-session", "new-session", null]) {
@@ -857,7 +867,10 @@ describe("refusals on the rule path (point 6)", () => {
 		const { ctx, writes, row } = makeCtx([a, b], paceStrategy());
 
 		for (let i = 0; i < 4; i++) {
-			await expectBuiltLimit429(await send(ctx), { resetAt: NOW + HOUR, cooldown: true });
+			await expectBuiltLimit429(await send(ctx), {
+				resetAt: NOW + HOUR,
+				cooldown: true,
+			});
 		}
 
 		expect(perAccount(calls)).toEqual({});
@@ -1212,7 +1225,10 @@ describe("session-pace with every account out on limits and capacity routing on"
 		const response = await send(ctx);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR, cooldown: true });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	it("answers count_tokens with the local 429", async () => {

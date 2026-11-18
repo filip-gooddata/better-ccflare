@@ -264,8 +264,7 @@ export function rememberLimitRefusal(
 		headers: new Headers(refusal.headers),
 		body: refusal.body.slice(),
 		resetMs,
-		claim:
-			refusal.headers.get(CLAIM_HEADER)?.trim().toLowerCase() || null,
+		claim: refusal.headers.get(CLAIM_HEADER)?.trim().toLowerCase() || null,
 		capturedAt: now,
 	});
 }
