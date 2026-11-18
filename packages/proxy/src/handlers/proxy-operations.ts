@@ -94,6 +94,10 @@ function resolveForwardToClient(ctx: ProxyContext) {
 }
 
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import {
+	observeLimitHeaders,
+	readingsBeforeHeaderMark,
+} from "./header-mark-out";
 
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
@@ -1579,7 +1583,15 @@ export async function proxyWithAccount(
 						undefined,
 						signal,
 					),
-			);
+			).then((response) => {
+				// Every upstream answer, before any classification or forwarding:
+				// a response that shows the account out marks it for the next
+				// request. Headers only; the body is left to the caller.
+				observeLimitHeaders(response, account, {
+					keepalive: isInternalProbe(req.headers, ctx, "keepalive"),
+				});
+				return response;
+			});
 		};
 		if (
 			process.env.DEBUG?.includes("proxy") ||
@@ -2703,7 +2715,7 @@ export async function proxyWithAccount(
 				const refusal = isClaudeProvider
 					? classifyRefusalScope({
 							headers: rawResponse.headers,
-							usageData: usageCache.get(account.id),
+							usageData: readingsBeforeHeaderMark(account.id),
 							model: requestedModel,
 							now: Date.now(),
 							headerResetAt: resetIsInferred ? null : cooldown.until,
@@ -3427,7 +3439,7 @@ export async function proxyWithAccount(
 							isClaudeProvider && lastAttemptedModel
 								? classifyRefusalScope({
 										headers: rawResponse.headers,
-										usageData: usageCache.get(account.id),
+										usageData: readingsBeforeHeaderMark(account.id),
 										model: lastAttemptedModel,
 										now: Date.now(),
 										headerResetAt: resetIsInferred ? null : cooldown.until,

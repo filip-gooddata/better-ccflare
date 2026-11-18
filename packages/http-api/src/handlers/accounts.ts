@@ -113,6 +113,9 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	// so this set stays a faithful mirror of the union and a future path that
 	// does persist it cannot be silently nulled.
 	"upstream_402_out_of_credits",
+	// Written to accounts.rate_limited_reason when a response reports overage
+	// in use: the account is benched until the unified reset.
+	"overage_in_use",
 ]);
 
 function toRateLimitReason(v: string | null): RateLimitReason | null {

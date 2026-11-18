@@ -742,6 +742,9 @@ describe("requests that own their routing never reach failover path C", () => {
 	for (const [label, headers] of cases) {
 		it(`answers ${label} that gets a 429 as today, with no second forward`, async () => {
 			const run = async (strategy: LoadBalancingStrategy) => {
+				// Each run starts from no readings: the 429 a run gets marks its account
+				// in the usage cache, which would otherwise carry into the next run.
+				usageCache.clear();
 				const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 				const b = makeAccount("b");
 				const calls = installUpstream((account) =>

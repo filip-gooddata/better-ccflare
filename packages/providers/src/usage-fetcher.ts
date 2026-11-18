@@ -1677,7 +1677,21 @@ class UsageCache {
 				return { success: false, retryAfterMs: result.retryAfterMs };
 			} else {
 				// Default to Anthropic usage data
+				// Same stale-poll guard as Codex: the traffic path marks an account
+				// full from response headers (proxy header-mark-out.ts) while a poll
+				// may already be on the wire; that poll's older reading must not
+				// put the account back in rotation.
+				const generationBefore = this.generations.get(accountId) ?? 0;
 				const result = await fetchUsageData(token);
+				if (
+					result.data &&
+					(this.generations.get(accountId) ?? 0) !== generationBefore
+				) {
+					log.debug(
+						`Discarding Anthropic usage poll for account ${accountId}: another writer updated the cache while the request was in flight`,
+					);
+					return { success: true, retryAfterMs: null };
+				}
 				if (result.data) {
 					// Snapshot before clearing — needed for the capacity-restored guard below.
 					const wasRateLimited = this.usageRateLimitedUntil.has(accountId);

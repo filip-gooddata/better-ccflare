@@ -22,6 +22,7 @@ import {
 	tryGetUsageCollector,
 } from "../usage-collector";
 import { drainBody } from "./discard-body-cancel";
+import { applyOverageCooldown } from "./header-mark-out";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import {
 	applyRateLimitCooldown,
@@ -623,6 +624,11 @@ export async function processProxyResponse(
 			});
 		}
 	}
+
+	// After the clear above, so a response served on extra usage benches the
+	// account for the next request instead of being undone by its own
+	// success. Reads headers only; the body still streams to the client.
+	applyOverageCooldown(response, account, ctx);
 
 	return false;
 }

@@ -52,6 +52,11 @@
  *   reseller credits). The account is never benched (credits can return at
  *   any moment or at an unobservable rollover) and stays routable; the
  *   request fails over. Does NOT trip the breaker.
+ * - `overage_in_use` — an Anthropic response carried
+ *   `anthropic-ratelimit-unified-overage-in-use: true`: it was served from
+ *   extra usage, so a plan limit is spent. The account is benched until the
+ *   unified reset so the next request goes elsewhere; the response itself is
+ *   served in full. Expected, so it does NOT trip the breaker.
  */
 import type { RateLimitReason } from "./account";
 
@@ -69,6 +74,7 @@ export const RATE_LIMIT_REASONS: readonly RateLimitReason[] = [
 	"org_permission_denied",
 	"upstream_5xx_server_error",
 	"upstream_402_out_of_credits",
+	"overage_in_use",
 ] as const;
 
 export function isRateLimitReason(value: string): value is RateLimitReason {
