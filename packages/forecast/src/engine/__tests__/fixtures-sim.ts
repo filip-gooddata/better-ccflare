@@ -204,18 +204,43 @@ export function indexAt(times: EpochMs[], at: EpochMs): number {
 	return i;
 }
 
-/** Longest gap between event-loop turns while `work` runs, and the number of turns. */
-export async function measureYield<T>(
-	work: () => Promise<T>,
-): Promise<{ value: T; longestMs: number; turns: number; wallMs: number }> {
+/** CPU time (user + system) this thread has used, in milliseconds. */
+function threadCpuMs(): number {
+	const { user, system } = process.threadCpuUsage();
+	return (user + system) / 1000;
+}
+
+/**
+ * Longest gap between event-loop turns while `work` runs, as wall-clock time
+ * (`longestMs`) and as CPU time this thread spent in the gap (`longestCpuMs`),
+ * and the number of turns. Slice limits are asserted on the CPU time: under
+ * machine load the OS can take the thread mid-slice, which stretches the wall
+ * clock without our code holding the thread. The clock is per thread, so a
+ * forecast worker thread running alongside does not count.
+ */
+export async function measureYield<T>(work: () => Promise<T>): Promise<{
+	value: T;
+	longestMs: number;
+	longestCpuMs: number;
+	turns: number;
+	wallMs: number;
+}> {
 	let done = false;
 	let last = performance.now();
+	let lastCpu = threadCpuMs();
 	let longest = 0;
+	let longestCpu = 0;
 	let turns = 0;
-	const tick = () => {
+	const sample = () => {
 		const t = performance.now();
+		const cpu = threadCpuMs();
 		longest = Math.max(longest, t - last);
+		longestCpu = Math.max(longestCpu, cpu - lastCpu);
 		last = t;
+		lastCpu = cpu;
+	};
+	const tick = () => {
+		sample();
 		turns++;
 		if (!done) setImmediate(tick);
 	};
@@ -224,6 +249,6 @@ export async function measureYield<T>(
 	const value = await work();
 	const wallMs = performance.now() - started;
 	done = true;
-	longest = Math.max(longest, performance.now() - last);
-	return { value, longestMs: longest, turns, wallMs };
+	sample();
+	return { value, longestMs: longest, longestCpuMs: longestCpu, turns, wallMs };
 }

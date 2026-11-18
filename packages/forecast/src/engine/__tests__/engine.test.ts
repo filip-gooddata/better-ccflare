@@ -328,16 +328,15 @@ describe("cost", () => {
 		"yields to the event loop; no synchronous slice much longer than 25 ms",
 		async () => {
 			const input = buildInput(replayFixture());
-			const { value, longestMs, turns, wallMs } = await measureYield(() =>
-				engine.compute(input),
-			);
+			const { value, longestMs, longestCpuMs, turns, wallMs } =
+				await measureYield(() => engine.compute(input));
 			expect(value.available).toBe(true);
 			console.info(
-				`[engine] compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+				`[engine] compute: wall ${wallMs.toFixed(0)} ms, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} event-loop turns`,
 			);
 			expect(turns).toBeGreaterThan(20);
 			// design target about 25 ms; slack for a loaded test machine
-			expect(longestMs).toBeLessThan(40);
+			expect(longestCpuMs).toBeLessThan(40);
 		},
 		FULL_GRID_TIMEOUT_MS,
 	);
@@ -347,14 +346,13 @@ describe("cost", () => {
 		async () => {
 			const production = createForecastEngine();
 			const input = buildInput(replayFixture());
-			const { value, longestMs, turns, wallMs } = await measureYield(() =>
-				production.compute(input),
-			);
+			const { value, longestMs, longestCpuMs, turns, wallMs } =
+				await measureYield(() => production.compute(input));
 			expect(value.available).toBe(true);
 			console.info(
-				`[engine] production compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+				`[engine] production compute: wall ${wallMs.toFixed(0)} ms, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} event-loop turns`,
 			);
-			expect(longestMs).toBeLessThan(40);
+			expect(longestCpuMs).toBeLessThan(40);
 		},
 		FULL_GRID_TIMEOUT_MS,
 	);
@@ -401,15 +399,14 @@ describe("cost", () => {
 					ladder: { start: SCENARIO_LADDER_TOP, top: SCENARIO_LADDER_TOP },
 				},
 			});
-			const { value, longestMs, turns, wallMs } = await measureYield(() =>
-				top.compute(input),
-			);
+			const { value, longestMs, longestCpuMs, turns, wallMs } =
+				await measureYield(() => top.compute(input));
 			expect(value.available).toBe(true);
 			expect(counted).toEqual([SCENARIO_LADDER_TOP, SCENARIO_LADDER_TOP]);
 			console.info(
-				`[engine] top-rung learned compute: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} event-loop turns`,
+				`[engine] top-rung learned compute: wall ${wallMs.toFixed(0)} ms, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} event-loop turns`,
 			);
-			expect(longestMs).toBeLessThan(40);
+			expect(longestCpuMs).toBeLessThan(40);
 		},
 		FULL_GRID_TIMEOUT_MS,
 	);

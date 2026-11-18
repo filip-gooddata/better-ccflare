@@ -71,6 +71,37 @@ interface LineSpec {
 	text?: string;
 }
 
+/**
+ * Longest gap between 1 ms timer callbacks: wall clock (`wall`) and the CPU
+ * time this thread spent in the gap (`cpu`). Slice limits are asserted on the
+ * CPU time, which machine load cannot stretch; the clock is per thread, so
+ * file reads on other threads do not count.
+ */
+function gapMeter(): () => { wall: number; cpu: number } {
+	const cpuNow = () => {
+		const { user, system } = process.threadCpuUsage();
+		return (user + system) / 1000;
+	};
+	let wall = 0;
+	let cpu = 0;
+	let last = performance.now();
+	let lastCpu = cpuNow();
+	const sample = () => {
+		const t = performance.now();
+		const c = cpuNow();
+		wall = Math.max(wall, t - last);
+		cpu = Math.max(cpu, c - lastCpu);
+		last = t;
+		lastCpu = c;
+	};
+	const timer = setInterval(sample, 1);
+	return () => {
+		clearInterval(timer);
+		sample();
+		return { wall, cpu };
+	};
+}
+
 function assistantLine(spec: LineSpec): string {
 	const usage: Record<string, unknown> = {
 		input_tokens: spec.input ?? 100,
@@ -698,21 +729,18 @@ describe("resumability", () => {
 			assistantLine({ at: T0, messageId: "small" }),
 		]);
 		const store = new FakeStore();
-		let maxGap = 0;
-		let last = performance.now();
-		const timer = setInterval(() => {
-			const t = performance.now();
-			maxGap = Math.max(maxGap, t - last);
-			last = t;
-		}, 1);
+		const stop = gapMeter();
 		const result = await runTranscriptBackfill(deps(store));
-		clearInterval(timer);
+		const gap = stop();
+		console.info(
+			`[backfill] long line: longest slice wall ${gap.wall.toFixed(1)} ms cpu ${gap.cpu.toFixed(1)} ms`,
+		);
 		expect(result.responses).toBe(2);
 		expect(store.sorted()[0]?.units).toBeCloseTo(
 			demandUnits(usageOf(big)) + demandUnits(usageOf({ at: T0 })),
 			12,
 		);
-		expect(maxGap).toBeLessThan(60);
+		expect(gap.cpu).toBeLessThan(60);
 	});
 
 	test("the marker is written only after every row is upserted", async () => {
@@ -762,14 +790,9 @@ describe("event loop", () => {
 
 		async function measure(
 			overrides: Partial<TranscriptBackfillDeps>,
-		): Promise<{ maxGap: number; responses: number }> {
-			let maxGap = 0;
-			let last = performance.now();
-			const timer = setInterval(() => {
-				const t = performance.now();
-				maxGap = Math.max(maxGap, t - last);
-				last = t;
-			}, 1);
+		): Promise<{ maxGap: number; maxCpuGap: number; responses: number }> {
+			const stop = gapMeter();
+			let gap: { wall: number; cpu: number } | undefined;
 			try {
 				const result = await runTranscriptBackfill(
 					deps(new FakeStore(), {
@@ -778,15 +801,23 @@ describe("event loop", () => {
 						...overrides,
 					}),
 				);
-				return { maxGap, responses: result.responses + result.afterCutover };
+				gap = stop();
+				console.info(
+					`[backfill] chunked read: longest slice wall ${gap.wall.toFixed(1)} ms cpu ${gap.cpu.toFixed(1)} ms`,
+				);
+				return {
+					maxGap: gap.wall,
+					maxCpuGap: gap.cpu,
+					responses: result.responses + result.afterCutover,
+				};
 			} finally {
-				clearInterval(timer);
+				if (!gap) stop();
 			}
 		}
 
 		const control = await measure({ sliceBudgetMs: 1e9 });
 		expect(control.responses).toBe(60_000);
-		expect(control.maxGap).toBeGreaterThan(60);
+		expect(control.maxCpuGap).toBeGreaterThan(60);
 
 		// The default slice budget is 30 ms; one line's scan and the timer's own
 		// latency come on top, so 60 ms leaves slack for a loaded machine.
@@ -794,8 +825,8 @@ describe("event loop", () => {
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const sliced = await measure({});
 			expect(sliced.responses).toBe(60_000);
-			gaps.push(sliced.maxGap);
-			if (sliced.maxGap < 60) break;
+			gaps.push(sliced.maxCpuGap);
+			if (sliced.maxCpuGap < 60) break;
 		}
 		expect(Math.min(...gaps)).toBeLessThan(60);
 	}, 60_000);

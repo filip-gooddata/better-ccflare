@@ -26,6 +26,7 @@ import {
 	scaleKernel,
 	scaleLogShift,
 } from "../scenarios";
+import { measureYield } from "./fixtures-sim";
 
 const TZ = "Europe/Prague";
 // Thursday 2026-11-12 10:00 CET
@@ -685,33 +686,21 @@ describe("buildScenarios", () => {
 
 	test("defaults (400 days, a week horizon): wall time and longest slice between yields", async () => {
 		const { input, table, horizon } = setup(NOW);
-		let last = performance.now();
-		let longest = 0;
-		let running = true;
-		const tick = () => {
-			const t = performance.now();
-			longest = Math.max(longest, t - last);
-			last = t;
-			if (running) setImmediate(tick);
-		};
-		setImmediate(tick);
-		const t0 = performance.now();
-		const sc = await buildScenarios(
-			input,
-			table,
-			horizon,
-			{ noise: true },
-			PLAIN,
+		const {
+			value: sc,
+			wallMs,
+			longestMs,
+			longestCpuMs,
+		} = await measureYield(() =>
+			buildScenarios(input, table, horizon, { noise: true }, PLAIN),
 		);
-		const wall = performance.now() - t0;
-		running = false;
 		console.log(
-			`buildScenarios defaults: ${sc.units.length} days × ${sc.bucketCount} buckets, wall ${wall.toFixed(1)} ms, longest slice ${longest.toFixed(1)} ms`,
+			`buildScenarios defaults: ${sc.units.length} days × ${sc.bucketCount} buckets, wall ${wallMs.toFixed(1)} ms, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms`,
 		);
 		expect(sc.units.length).toBe(400);
 		expect(horizon.simEnd - NOW).toBe(7 * DAY);
 		// design target: no slice much longer than 25 ms; slack for a loaded machine
-		expect(longest).toBeLessThan(40);
+		expect(longestCpuMs).toBeLessThan(40);
 	});
 });
 

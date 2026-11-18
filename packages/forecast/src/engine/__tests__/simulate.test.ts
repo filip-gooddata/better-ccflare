@@ -516,15 +516,14 @@ describe("simulate", () => {
 			accounts: [account({ id: "acct-a" }), account({ id: "acct-b" })],
 			rate: (m, w) => (w <= 5 && m > 540 && m < 1080 ? 0.7 : 0),
 		});
-		const { value, longestMs, turns, wallMs } = await measureYield(() =>
-			simulate(ctx, onDemandPlan(ctx)),
-		);
+		const { value, longestMs, longestCpuMs, turns, wallMs } =
+			await measureYield(() => simulate(ctx, onDemandPlan(ctx)));
 		console.log(
-			`simulate 400 days, ${value.axis.times.length} samples: wall ${wallMs.toFixed(0)} ms, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
+			`simulate 400 days, ${value.axis.times.length} samples: wall ${wallMs.toFixed(0)} ms, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} turns`,
 		);
 		expect(value.traces).toHaveLength(400);
 		expect(turns).toBeGreaterThanOrEqual(19);
-		expect(longestMs).toBeLessThan(50);
+		expect(longestCpuMs).toBeLessThan(50);
 	});
 });
 

@@ -58,12 +58,11 @@ function nov12(prewarm = true) {
 describe("planForecast: 2026-11-12 shape", () => {
 	test("opening a window early lifts the heavy low point and removes the heavy stop", async () => {
 		const ctx = nov12(true);
-		const { value, wallMs, longestMs, turns } = await measureYield(() =>
-			planForecast(ctx),
-		);
+		const { value, wallMs, longestMs, longestCpuMs, turns } =
+			await measureYield(() => planForecast(ctx));
 		const { plan, score, baseline, candidates } = value;
 		console.log(
-			`planForecast 400 days: wall ${wallMs.toFixed(0)} ms, ${candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
+			`planForecast 400 days: wall ${wallMs.toFixed(0)} ms, ${candidates} candidates, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} turns`,
 		);
 		console.log(
 			`baseline: low point ${baseline.score.lowPoint.toFixed(1)}; plan: low point ${score.lowPoint.toFixed(1)}, openAt ${JSON.stringify(
@@ -105,7 +104,7 @@ describe("planForecast: 2026-11-12 shape", () => {
 		expect(plan.workStartMinute).toBe(660);
 		expect(plan.moves).toEqual([]);
 		expect(compareScores(score, baseline.score)).toBeLessThan(0);
-		expect(longestMs).toBeLessThan(60);
+		expect(longestCpuMs).toBeLessThan(60);
 	}, 30_000);
 
 	test("with pre-warm off nothing opens ahead: no demand before 11:00, so no opening gains openMinGainPoints", async () => {
@@ -399,16 +398,15 @@ describe("planForecast cost", () => {
 			settings: { prewarm: true },
 			workStartMinute: 540,
 		});
-		const { value, wallMs, longestMs, turns } = await measureYield(() =>
-			planForecast(ctx),
-		);
+		const { value, wallMs, longestMs, longestCpuMs, turns } =
+			await measureYield(() => planForecast(ctx));
 		console.log(
-			`planForecast week horizon: ${value.result.axis.times.length} samples, wall ${wallMs.toFixed(0)} ms, ${value.candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
+			`planForecast week horizon: ${value.result.axis.times.length} samples, wall ${wallMs.toFixed(0)} ms, ${value.candidates} candidates, longest slice wall ${longestMs.toFixed(1)} ms cpu ${longestCpuMs.toFixed(1)} ms, ${turns} turns`,
 		);
 		// One closed account: the baseline, 96 quarter hours and their refinement, the peaks, a refinement
 		// scan and the preferences; the deadline, not a list, bounds the search in service.
 		expect(value.candidates).toBe(109);
-		expect(longestMs).toBeLessThan(60);
+		expect(longestCpuMs).toBeLessThan(60);
 		expect(wallMs).toBeLessThan(5000);
 	}, 30_000);
 });
