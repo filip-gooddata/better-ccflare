@@ -123,8 +123,10 @@ function alikeRun(
 	fill: EpochMs,
 	after: (t: EpochMs) => number,
 	units = 1,
+	settings: Parameters<typeof makeCtx>[0]["settings"] = {},
 ): ReturnType<typeof buildResponse> {
 	const ctx = makeCtx({
+		settings,
 		accounts: [
 			account("acct-a", { fiveHour: { usedPct: 94, resetsAt: RESET_A } }),
 			account("acct-b", { fiveHour: { usedPct: 6, resetsAt: RESET_B } }),
@@ -210,6 +212,30 @@ describe("zero cutoff: accounts × (100 − FULL_POINTS)", () => {
 		expect(day?.heavy[day.times.indexOf(at(13, 30))]).toBe(0.1);
 		expect(day?.heavy[day.times.indexOf(at(13, 55))]).toBe(0.1);
 		expect(day?.heavy[day.times.indexOf(at(14))]).toBe(0);
+		expect(validateForecastResponse(response)).toEqual([]);
+	});
+
+	test("the cutoff and the 0.1 floor apply to every fan level the setting gives", () => {
+		const fanLevels = [3, 37, 63, 97];
+		const response = alikeRun(at(13, 30), (t) => (t < at(14) ? 0.03 : 0), 1, {
+			fanLevels,
+		});
+		const day = response.day;
+		expect(Object.keys(day?.fan ?? {}).sort()).toEqual(
+			["p3", "p37", "p63", "p97"].sort(),
+		);
+		for (const key of Object.keys(day?.fan ?? {})) {
+			const line = day?.fan[key] ?? [];
+			expect([key, line[day?.times.indexOf(at(13, 30)) ?? -1]]).toEqual([
+				key,
+				0.1,
+			]);
+			expect([key, line[day?.times.indexOf(at(13, 55)) ?? -1]]).toEqual([
+				key,
+				0.1,
+			]);
+			expect([key, line[day?.times.indexOf(at(14)) ?? -1]]).toEqual([key, 0]);
+		}
 		expect(validateForecastResponse(response)).toEqual([]);
 	});
 
