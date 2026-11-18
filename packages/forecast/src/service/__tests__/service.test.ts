@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,6 +39,7 @@ import {
 	type UsageDetailDb,
 	type UsageTokenRow,
 } from "../../history/usage-detail";
+import { PACE_EXPORT_ENV, paceExportIo } from "../../pace-export/export";
 import {
 	FakeRunner,
 	FakeStore,
@@ -2414,6 +2415,113 @@ const paceOff = {
 const paceOn = {
 	paceConditioning: true,
 } as unknown as Partial<ForecastSettings>;
+
+describe("forecast service: pace series export at refit", () => {
+	const exportLines = (h: { infos: string[]; warns: string[] }) =>
+		[...h.infos, ...h.warns].filter((m) =>
+			m.startsWith("forecast pace export"),
+		);
+	async function untilExportLine(h: { infos: string[]; warns: string[] }) {
+		for (let i = 0; i < 200 && exportLines(h).length === 0; i++)
+			await new Promise((r) => setTimeout(r, 5));
+	}
+	async function withExportEnv(
+		value: string | undefined,
+		run: () => Promise<void>,
+	) {
+		const saved = process.env[PACE_EXPORT_ENV];
+		if (value === undefined) delete process.env[PACE_EXPORT_ENV];
+		else process.env[PACE_EXPORT_ENV] = value;
+		try {
+			await run();
+		} finally {
+			if (saved === undefined) delete process.env[PACE_EXPORT_ENV];
+			else process.env[PACE_EXPORT_ENV] = saved;
+		}
+	}
+
+	it("off by default: the refit runs as before and the export touches no file", async () => {
+		const writeFile = spyOn(paceExportIo, "writeFile");
+		try {
+			await withExportEnv(undefined, async () => {
+				const h = refitHarness();
+				await h.service.runOnce();
+				await flush();
+				expect(h.runner.calls).toHaveLength(1);
+				expect(Array.from(h.runner.calls[0]?.series.units ?? [])).toEqual([
+					1.5, 2.5,
+				]);
+				expect(exportLines(h)).toEqual([]);
+				await h.service.stop();
+			});
+			expect(writeFile).not.toHaveBeenCalled();
+		} finally {
+			writeFile.mockRestore();
+		}
+	});
+
+	it("on: writes the series the main job gets and logs one ok line", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "svc-pace-export-"));
+		try {
+			const target = join(dir, "series.json");
+			await withExportEnv(target, async () => {
+				const h = refitHarness();
+				await h.service.runOnce();
+				await flush();
+				await untilExportLine(h);
+				expect(h.runner.calls).toHaveLength(1);
+				expect(Array.from(h.runner.calls[0]?.series.units ?? [])).toEqual([
+					1.5, 2.5,
+				]);
+				const file = JSON.parse(await Bun.file(target).text());
+				expect(file.now).toBe(T0);
+				expect(file.buckets.units).toEqual([1.5, 2.5]);
+				expect(file.buckets.censored).toEqual([0, 1]);
+				expect(file.historyFrom).toBe(h.seriesInputs[0]?.historyFrom);
+				expect(file.accountCount).toBe(h.seriesInputs[0]?.accounts.length);
+				expect(file.timeZone).toBe(h.seriesInputs[0]?.timeZone);
+				expect(exportLines(h)).toEqual([
+					`forecast pace export ok buckets=2 days=0 hash=${String(file.hash).slice(0, 16)}`,
+				]);
+				await h.service.stop();
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("a failed export logs one line and leaves the refit unchanged", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "svc-pace-export-"));
+		try {
+			await withExportEnv(join(dir, "missing", "series.json"), async () => {
+				const h = refitHarness();
+				await h.service.runOnce();
+				await flush();
+				await untilExportLine(h);
+				expect(exportLines(h)).toEqual([
+					"forecast pace export failed code=ENOENT",
+				]);
+				expect(h.runner.calls).toHaveLength(1);
+				expect(Array.from(h.runner.calls[0]?.series.units ?? [])).toEqual([
+					1.5, 2.5,
+				]);
+				await h.runner.finish({
+					status: "ok",
+					state: fitState(T0),
+					learned: learnedAt(),
+					ms: 4000,
+				});
+				expect(h.refitLines()).toHaveLength(1);
+				expect(h.refitLines()[0]).toStartWith("forecast e4 refit status=ok");
+				expect(h.learnLines()).toHaveLength(1);
+				expect(exportLines(h)).toHaveLength(1);
+				await h.service.stop();
+			});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
 
 describe("forecast service: E4 refit in the worker", () => {
 	it("refits at start-up; forecasts get null until the fit lands, then the new state", async () => {
