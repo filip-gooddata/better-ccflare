@@ -11,6 +11,15 @@ const BUCKET = 300_000;
 const sourceRunner = () =>
 	createForecastWorkerRunner({ embeddedCode: async () => "" });
 
+/** Demand settings sent with every refit request (the forecast defaults). */
+const DEMAND = {
+	workDays: 5,
+	historyLookbackDays: 84,
+	historyHalfLifeDays: 14,
+	workStartSharePct: 5,
+	timeShiftMin: 30,
+};
+
 describe("forecast worker: the real worker module", () => {
 	it("answers a refit job with a fitted state or a fit error, never a worker failure", async () => {
 		const n = 288;
@@ -22,10 +31,23 @@ describe("forecast worker: the real worker module", () => {
 				timeZone: "Europe/Prague",
 			},
 			T0,
+			DEMAND,
 			{ timeoutMs: 60_000 },
 		);
 		if (outcome.status === "error") expect(outcome.reason).toBe("fit-error");
-		else expect(outcome.status).toBe("ok");
+		else {
+			expect(outcome.status).toBe("ok");
+			expect(outcome.learned.choices.map((c) => c.row)).toEqual([
+				"daytypes",
+				"pool",
+				"lookback",
+				"halflife",
+				"wsshare",
+				"wssample",
+				"bandwidth",
+				"jitter",
+			]);
+		}
 	});
 });
 
@@ -40,6 +62,7 @@ describe("forecast worker: the default loader", () => {
 				timeZone: "Europe/Prague",
 			},
 			T0,
+			DEMAND,
 			{ timeoutMs: 60_000 },
 		);
 		if (outcome.status === "error") expect(outcome.reason).toBe("fit-error");
@@ -90,6 +113,7 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				const outcome = await createPaceRefitRunner(sourceRunner()).run(
 					series,
 					T0,
+					DEMAND,
 					{ timeoutMs: 600_000 },
 				);
 				expect(outcome.status).toBe("ok");
