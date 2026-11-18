@@ -44,10 +44,26 @@ export function presentDemand(settings: DemandSettings): LearnedDemand {
 	};
 }
 
-/** Runs every row learner and the selector; returns the served values. Runs inside the refit worker job. */
-export function learnDemand(input: LearnInput): LearnedDemand {
+/**
+ * Row 1 (day types): scores every candidate partition with its own full E4 fit
+ * and selects. Runs in its own worker job, after the main refit job, because
+ * one fit per candidate is too slow for the main job (REPORT.md section 4).
+ */
+export function learnDaytypes(input: LearnInput): RowChoice<Partition> {
+	return selectRow(scoreDaytypes(input));
+}
+
+/**
+ * Runs rows 2-8 and the selector; returns the served values. Runs inside the
+ * main refit worker job. Row 1 is not scored here: `daytypes` is the last
+ * choice the row-1 job stored (null before its first success), and the served
+ * partition is its served partition, else the present one. Calls no fitter.
+ */
+export function learnDemand(
+	input: LearnInput,
+	daytypes: RowChoice<Partition> | null,
+): LearnedDemand {
 	const t0 = performance.now();
-	const daytypes = selectRow(scoreDaytypes(input));
 	const pool = selectRow(scorePool(input));
 	const lookback = selectRow(scoreLookback(input));
 	const halflife = selectRow(scoreHalflife(input));
@@ -56,7 +72,7 @@ export function learnDemand(input: LearnInput): LearnedDemand {
 	const bandwidth = selectRow(scoreBandwidth(input));
 	const jitter = selectRow(scoreJitter(input));
 	const choices = [
-		daytypes,
+		...(daytypes ? [daytypes] : []),
 		pool,
 		lookback,
 		halflife,
@@ -67,7 +83,7 @@ export function learnDemand(input: LearnInput): LearnedDemand {
 	] as RowChoice<unknown>[];
 	return {
 		choices,
-		partition: daytypes.served as Partition,
+		partition: daytypes?.served ?? PRESENT_PARTITION,
 		poolTau: pool.served as PoolTau,
 		lookbackDays: lookback.served,
 		halfLifeDays: halflife.served,

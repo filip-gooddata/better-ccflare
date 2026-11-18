@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { PaceSeries } from "../../engine/pace/types";
+import { daytypesJob, refitJob } from "../forecast-jobs";
 import {
 	createForecastWorkerRunner,
 	type ForecastWorkerRunner,
@@ -182,7 +183,73 @@ describe("forecast worker runner: the refit job", () => {
 			bandwidthK: 0,
 			jitterMin: 30,
 		});
-		expect(outcome.learned.choices.length).toBe(8);
+		// No row-1 job has run: the main job carries no row-1 choice and fits the present partition.
+		expect(outcome.learned.choices.map((c) => c.row)).toEqual([
+			"pool",
+			"lookback",
+			"halflife",
+			"wsshare",
+			"wssample",
+			"bandwidth",
+			"jitter",
+		]);
+		expect(outcome.learned.ms).toBeGreaterThanOrEqual(0);
+	});
+
+	it("the real worker serves the stored row-1 partition's fit in the main job", async () => {
+		const runner = createForecastWorkerRunner({
+			workerUrl: new URL("../forecast-worker.ts", import.meta.url).href,
+			embeddedCode: async () => "",
+		});
+		const s = series("Europe/Prague", 288 * 3);
+		const payload = { ...s, now: T0, ...DEMAND };
+		const stored = daytypesJob({
+			...payload,
+			units: s.units.slice(),
+			censored: s.censored.slice(),
+		});
+		const switched = { ...stored, served: [0, 0, 0, 0, 0, 1, 1] };
+		const expectedPace = refitJob({
+			...payload,
+			units: s.units.slice(),
+			censored: s.censored.slice(),
+			daytypes: switched,
+		}).pace;
+		const outcome = await createPaceRefitRunner(runner).run(s, T0, DEMAND, {
+			timeoutMs: 60_000,
+			daytypes: switched,
+		});
+		expect(outcome.status).toBe("ok");
+		if (outcome.status !== "ok") return;
+		expect(outcome.learned.partition).toEqual([0, 0, 0, 0, 0, 1, 1]);
+		expect(outcome.learned.choices[0]).toEqual(switched);
+		expect(outcome.state).toEqual(expectedPace);
+	});
+
+	it("the real worker answers the row-1 job with the choice the in-thread job gives", async () => {
+		const runner = createForecastWorkerRunner({
+			workerUrl: new URL("../forecast-worker.ts", import.meta.url).href,
+			embeddedCode: async () => "",
+		});
+		const s = series("Europe/Prague", 288 * 3);
+		const expected = daytypesJob({
+			...s,
+			units: s.units.slice(),
+			censored: s.censored.slice(),
+			now: T0,
+			...DEMAND,
+		});
+		const outcome = await createPaceRefitRunner(runner).runDaytypes(
+			s,
+			T0,
+			DEMAND,
+			{ timeoutMs: 60_000 },
+		);
+		expect(outcome.status).toBe("ok");
+		if (outcome.status !== "ok") return;
+		expect(outcome.choice).toEqual(expected);
+		expect(outcome.choice.row).toBe("daytypes");
+		expect(s.units.byteLength).toBe(0);
 	});
 
 	it("reports a missing worker module as worker-error", async () => {

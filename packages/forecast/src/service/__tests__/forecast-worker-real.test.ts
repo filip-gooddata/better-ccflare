@@ -1,8 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { loadavg } from "node:os";
 import type { DemandBucket } from "../../types";
+import { formatF2DaytypesLine, formatF2LearnLine } from "../f2-learn-log";
 import { createForecastWorkerRunner } from "../forecast-worker-runner";
 import { paceRefitLine } from "../pace-refit-log";
-import { createPaceRefitRunner } from "../pace-refit-runner";
+import {
+	createPaceRefitRunner,
+	PACE_REFIT_TIMEOUT_MS,
+} from "../pace-refit-runner";
 
 const T0 = Date.UTC(2026, 10, 16, 9, 0);
 const BUCKET = 300_000;
@@ -37,8 +42,8 @@ describe("forecast worker: the real worker module", () => {
 		if (outcome.status === "error") expect(outcome.reason).toBe("fit-error");
 		else {
 			expect(outcome.status).toBe("ok");
+			// No stored row-1 choice yet: the main job carries rows 2-8 only.
 			expect(outcome.learned.choices.map((c) => c.row)).toEqual([
-				"daytypes",
 				"pool",
 				"lookback",
 				"halflife",
@@ -100,6 +105,11 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				accounts: ["a", "b"],
 				timeZone: "Europe/Prague",
 			});
+			const row1Series = {
+				...series,
+				units: series.units.slice(),
+				censored: series.censored.slice(),
+			};
 			let last = performance.now();
 			let maxGap = 0;
 			let ticks = 0;
@@ -122,7 +132,36 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 					`real refit ms=${Math.round(outcome.ms)} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)}`,
 				);
 				console.info(paceRefitLine(outcome, null, T0));
+				if (outcome.status === "ok")
+					console.info(
+						formatF2LearnLine(outcome.learned, outcome.ms, { mainJob: true }),
+					);
 				expect(ticks).toBeGreaterThanOrEqual(Math.floor(outcome.ms / 40));
+				expect(maxGap).toBeLessThan(250);
+				// The main job fits E4 once (row 1 runs in its own job): far inside the timeout.
+				expect(outcome.ms).toBeLessThan(PACE_REFIT_TIMEOUT_MS / 4);
+				console.info(
+					`load after main job ${loadavg()
+						.map((x) => x.toFixed(2))
+						.join(" ")}`,
+				);
+				const row1Started = performance.now();
+				const row1 = await createPaceRefitRunner(sourceRunner()).runDaytypes(
+					row1Series,
+					T0,
+					DEMAND,
+					{ timeoutMs: 600_000 },
+				);
+				expect(row1.status).toBe("ok");
+				console.info(
+					`real daytypes ms=${Math.round(row1.ms)} wallMs=${Math.round(performance.now() - row1Started)} maxGapMs=${maxGap.toFixed(1)}`,
+				);
+				console.info(formatF2DaytypesLine(row1, null, T0));
+				console.info(
+					`load after row-1 job ${loadavg()
+						.map((x) => x.toFixed(2))
+						.join(" ")}`,
+				);
 				expect(maxGap).toBeLessThan(250);
 			} finally {
 				clearInterval(handle);

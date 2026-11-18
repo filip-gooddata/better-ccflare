@@ -1,13 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
 	type LearnedDemand,
-	type LearnInput,
 	learnDemand,
+	type Partition,
 	presentDemand,
 	type RowChoice,
 } from "../../engine/learn";
 import type { PaceSeries } from "../../engine/pace/types";
-import { formatF2LearnLine } from "../f2-learn-log";
+import { formatF2DaytypesLine, formatF2LearnLine } from "../f2-learn-log";
 
 const SETTINGS = {
 	historyLookbackDays: 84,
@@ -34,37 +34,63 @@ const choice = <V>(c: Partial<RowChoice<V>> & { row: string; present: V }) =>
 		...c,
 	}) as RowChoice<unknown>;
 
+/** A main-job input; rows 2-8 fit nothing, and the main job scores no row 1. */
+const INPUT = {
+	series: {
+		start: 0,
+		units: new Float64Array(0),
+		censored: new Uint8Array(0),
+		timeZone: "UTC",
+	} as PaceSeries,
+	now: 0,
+	workDays: 5,
+	...SETTINGS,
+	fitWithPartition: () => {
+		throw new Error("the main job scores no row 1");
+	},
+};
+
 const learned = (choices: RowChoice<unknown>[]): LearnedDemand => ({
 	...presentDemand(SETTINGS),
 	choices,
 });
 
 describe("forecast f2 learn log line", () => {
-	it("prints every stub row at its present value in registry order", () => {
-		const input: LearnInput = {
-			series: {
-				start: 0,
-				units: new Float64Array(0),
-				censored: new Uint8Array(0),
-				timeZone: "UTC",
-			} as PaceSeries,
-			now: 0,
-			workDays: 5,
-			...SETTINGS,
-			fitWithPartition: () => {
-				throw new Error("stub rows fit nothing");
-			},
-		};
-		expect(formatF2LearnLine(learnDemand(input), 1234.4)).toBe(
+	it("before the first row-1 job prints daytypes as na, then every other row at its present value with its own floor in registry order", () => {
+		expect(
+			formatF2LearnLine(learnDemand(INPUT, null), 1234.4, { mainJob: true }),
+		).toBe(
 			"forecast f2 learn ms=1234 rows=" +
-				"daytypes:0111122/0111122/na/na/na/0/0/0/4/0," +
-				"pool:h3/h3/na/na/na/0/0/0/4/0," +
-				"lookback:84/84/na/na/na/0/0/0/4/0," +
-				"halflife:14/14/na/na/na/0/0/0/4/0," +
-				"wsshare:5/5/na/na/na/0/0/0/4/0," +
-				"wssample:10/10/na/na/na/0/0/0/4/0," +
-				"bandwidth:0/0/na/na/na/0/0/0/4/0," +
-				"jitter:30/30/na/na/na/0/0/0/4/0",
+				"daytypes:na/na/na/na/na/na/na/na/na/na," +
+				"pool:h3/h3/na/na/na/0/0/0/7/0," +
+				"lookback:84/84/na/na/na/0/0/0/6/0," +
+				"halflife:14/14/na/na/na/0/0/0/6/0," +
+				"wsshare:5/5/na/na/na/0/0/0/6/0," +
+				"wssample:10/10/na/na/na/0/0/0/5/0," +
+				"bandwidth:0/0/na/na/na/0/0/0/7/0," +
+				"jitter:30/30/na/na/na/0/0/0/7/0",
+		);
+	});
+
+	it("prints the stored row-1 choice first when the main job carries one", () => {
+		const stored = choice<Partition>({
+			row: "daytypes",
+			present: [1, 0, 0, 0, 0, 2, 2],
+			chosen: [0, 0, 0, 0, 0, 1, 1],
+			served: [0, 0, 0, 0, 0, 1, 1],
+			presentLoss: 2,
+			chosenLoss: 1.5,
+			gain: 0.5,
+			se: 0.125,
+			units: 6,
+			on: true,
+		}) as RowChoice<Partition>;
+		expect(
+			formatF2LearnLine(learnDemand(INPUT, stored), 10, {
+				mainJob: true,
+			}).split(",")[0],
+		).toBe(
+			"forecast f2 learn ms=10 rows=daytypes:0000011/0000011/na/2/1.5/0.5/0.125/6/4/1",
 		);
 	});
 
@@ -149,5 +175,46 @@ describe("forecast f2 learn log line", () => {
 		expect(line).toBe(
 			"forecast f2 learn ms=1 rows=bad_row_x:na/na/na/na/na/0/0/0/4/0",
 		);
+	});
+});
+
+describe("forecast f2 daytypes log line", () => {
+	const stored = choice<Partition>({
+		row: "daytypes",
+		present: [1, 0, 0, 0, 0, 2, 2],
+		chosen: [0, 0, 0, 0, 0, 1, 1],
+		runnerUp: [1, 0, 0, 0, 0, 2, 2],
+		served: [1, 0, 0, 0, 0, 2, 2],
+		presentLoss: 2,
+		chosenLoss: 1.9,
+		gain: 0.1,
+		se: 0.25,
+		units: 6,
+	}) as RowChoice<Partition>;
+	const T = Date.UTC(2026, 10, 18, 10, 0);
+
+	it("on success prints the job time and the row-1 entry in the f2 learn format", () => {
+		expect(
+			formatF2DaytypesLine(
+				{ status: "ok", choice: stored, ms: 58048.6 },
+				null,
+				T,
+			),
+		).toBe(
+			"forecast f2 daytypes ms=58049 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
+		);
+	});
+
+	it("on a timeout or error prints the status and the age of the kept choice", () => {
+		expect(
+			formatF2DaytypesLine({ status: "timeout", ms: 120_000 }, null, T),
+		).toBe("forecast f2 daytypes status=timeout keptAgeMin=none");
+		expect(
+			formatF2DaytypesLine(
+				{ status: "error", reason: "fit-error", ms: 3 },
+				T - 125 * 60_000,
+				T,
+			),
+		).toBe("forecast f2 daytypes status=error keptAgeMin=125");
 	});
 });

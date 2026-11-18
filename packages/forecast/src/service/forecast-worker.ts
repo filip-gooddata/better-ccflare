@@ -1,4 +1,4 @@
-import { learnDemand, makePartitionFitter } from "../engine/learn";
+import { daytypesJob, refitJob } from "./forecast-jobs";
 import type {
 	ForecastJobName,
 	ForecastWorkerJobs,
@@ -18,19 +18,18 @@ const handlers: {
 		payload: ForecastWorkerJobs[J]["payload"],
 	) => ForecastWorkerJobs[J]["result"];
 } = {
-	refit: ({ start, units, censored, timeZone, now, ...settings }) => {
-		const series = { start, units, censored, timeZone };
-		const fitWithPartition = makePartitionFitter(series, now);
-		const learned = learnDemand({ ...settings, series, now, fitWithPartition });
-		return { pace: fitWithPartition(learned.partition), learned };
-	},
+	refit: (payload) => refitJob(payload),
+	daytypes: (payload) => daytypesJob(payload),
 };
 
 self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
 	const { id, job, payload } = event.data;
 	let reply: ForecastWorkerReply;
 	try {
-		const handler = handlers[job];
+		// The request union pairs each job with its payload; TypeScript cannot correlate the two through the index.
+		const handler = handlers[job] as
+			| ((p: typeof payload) => unknown)
+			| undefined;
 		if (!handler) throw new TypeError("forecast-worker: unknown job");
 		reply = { id, ok: true, result: handler(payload) };
 	} catch (error) {

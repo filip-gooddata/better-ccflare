@@ -1,6 +1,24 @@
-import type { LearnedDemand } from "../engine/learn/types";
+import type {
+	LearnedDemand,
+	Partition,
+	RowChoice,
+} from "../engine/learn/types";
 import type { PaceFitState } from "../engine/pace/types";
 import type { EpochMs } from "../types";
+
+/** The pooled series (buffers transferred), the instant it is fitted at, and the settings the learners start from. */
+interface SeriesPayload {
+	start: EpochMs;
+	units: Float64Array;
+	censored: Uint8Array;
+	timeZone: string;
+	now: EpochMs;
+	workDays: number;
+	historyLookbackDays: number;
+	historyHalfLifeDays: number;
+	workStartSharePct: number;
+	timeShiftMin: number;
+}
 
 /**
  * Jobs the forecast worker runs off the main thread, by name: what goes in and
@@ -9,24 +27,18 @@ import type { EpochMs } from "../types";
  */
 export interface ForecastWorkerJobs {
 	/**
-	 * E4 refit and the F2 demand learners in one job: the pooled series (buffers
-	 * transferred), the instant it is fitted at, and the settings the learners
-	 * start from. `pace` is the fit of the served partition.
+	 * E4 refit and F2 rows 2-8 in one job. E4 is fitted once, with the
+	 * partition of `daytypes` (the last stored row-1 choice; null before the
+	 * first, which fits the present partition). `pace` is that fit.
 	 */
 	refit: {
-		payload: {
-			start: EpochMs;
-			units: Float64Array;
-			censored: Uint8Array;
-			timeZone: string;
-			now: EpochMs;
-			workDays: number;
-			historyLookbackDays: number;
-			historyHalfLifeDays: number;
-			workStartSharePct: number;
-			timeShiftMin: number;
-		};
+		payload: SeriesPayload & { daytypes: RowChoice<Partition> | null };
 		result: { pace: PaceFitState; learned: LearnedDemand };
+	};
+	/** F2 row 1 (day types): one full E4 fit per candidate partition, scored and selected. */
+	daytypes: {
+		payload: SeriesPayload;
+		result: RowChoice<Partition>;
 	};
 }
 

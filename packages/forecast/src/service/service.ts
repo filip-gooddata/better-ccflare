@@ -1,5 +1,9 @@
 import { presentDemand } from "../engine/learn";
-import type { LearnedDemand } from "../engine/learn/types";
+import type {
+	LearnedDemand,
+	Partition,
+	RowChoice,
+} from "../engine/learn/types";
 import { buildPaceSeries } from "../engine/pace";
 import type {
 	PaceFitState,
@@ -42,7 +46,7 @@ import type {
 	PrewarmStatus,
 	SessionTrackerLike,
 } from "../types";
-import { formatF2LearnLine } from "./f2-learn-log";
+import { formatF2DaytypesLine, formatF2LearnLine } from "./f2-learn-log";
 import {
 	backfillLine,
 	createAvailabilityLog,
@@ -223,6 +227,21 @@ export function createForecastService(
 			return learnedState.learned;
 		return presentDemand(demand);
 	};
+	/**
+	 * F2 row 1: the last successful row-1 job's choice, the demand settings it
+	 * was learned under and the instant it was fitted at. The main refit job
+	 * fits E4 with its served partition while the settings match, else with
+	 * the present partition (none stored, or a demand setting changed since).
+	 */
+	let daytypesState: {
+		choice: RowChoice<Partition>;
+		key: string;
+		at: EpochMs;
+	} | null = null;
+	const storedDaytypes = (demand: RefitDemandSettings) =>
+		daytypesState && daytypesState.key === demandKey(demand)
+			? daytypesState.choice
+			: null;
 	let refitRunning: Promise<void> | null = null;
 	let refitAbort: AbortController | null = null;
 	let refitHandle: unknown = null;
@@ -476,9 +495,17 @@ export function createForecastService(
 			return;
 		}
 		if (stopped) return;
+		// The row-1 job gets its own copy: the main job transfers these buffers.
+		const daytypesSeries: PaceSeries = {
+			...series,
+			units: series.units.slice(),
+			censored: series.censored.slice(),
+		};
+		const timeoutMs = refitWith.timeoutMs ?? PACE_REFIT_TIMEOUT_MS;
 		const outcome = await refitWith.runner.run(series, now, demand, {
-			timeoutMs: refitWith.timeoutMs ?? PACE_REFIT_TIMEOUT_MS,
+			timeoutMs,
 			signal,
+			daytypes: storedDaytypes(demand),
 		});
 		if (stopped) return;
 		// One synchronous swap: a forecast sees the old fit and learned demand or the new pair, never a mix.
@@ -489,7 +516,31 @@ export function createForecastService(
 		logger.info(paceRefitLine(outcome, paceState, clock.now()));
 		// F2 line only for a job that returned learned demand; a failure keeps the last one silently.
 		if (outcome.status === "ok")
-			logger.info(formatF2LearnLine(outcome.learned, outcome.ms));
+			logger.info(
+				formatF2LearnLine(outcome.learned, outcome.ms, { mainJob: true }),
+			);
+
+		// Row 1 in its own job, after the main job whatever its outcome, inside
+		// the same refit cycle: it never overlaps the main job or itself. A
+		// success is used by the next main refit; a failure keeps the last choice.
+		const daytypes = await refitWith.runner.runDaytypes(
+			daytypesSeries,
+			now,
+			demand,
+			{ timeoutMs, signal },
+		);
+		if (stopped) return;
+		if (daytypes.status === "ok") {
+			daytypesState = {
+				choice: daytypes.choice,
+				key: demandKey(demand),
+				at: now,
+			};
+			logger.info(formatF2DaytypesLine(daytypes, now, clock.now()));
+		} else
+			logger.warn(
+				formatF2DaytypesLine(daytypes, daytypesState?.at ?? null, clock.now()),
+			);
 	};
 
 	/** Arms the next refit one cadence from now, then refits unless one runs or the setting is off. */
