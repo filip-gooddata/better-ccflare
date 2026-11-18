@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { localParts } from "../../time";
+import type { SimulationResult } from "../model";
 import { localMarks, localPeaks, refineMarks } from "../opening-grid";
 import {
 	openingBeam,
@@ -9,7 +10,6 @@ import {
 	REASON_MIN_GAIN_POINTS,
 	REPORT_STEP_POINTS,
 } from "../planner";
-import type { SimulationResult } from "../model";
 import { simulate } from "../simulate";
 import { account, HOUR, MIN, makeCtx, prague, session } from "./fixtures-sim";
 
