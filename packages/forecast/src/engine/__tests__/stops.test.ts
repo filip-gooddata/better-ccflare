@@ -212,6 +212,15 @@ describe("zero cutoff: accounts × (100 − FULL_POINTS)", () => {
 		expect(day?.heavy[day.times.indexOf(at(14))]).toBe(0);
 		expect(validateForecastResponse(response)).toEqual([]);
 	});
+
+	test("a stop that ends on a small positive value ends there, which prints 0.1", () => {
+		const response = alikeRun(at(14), (t) => (t < at(15) ? 0 : 0.03));
+		const day = response.day;
+		expect(day?.stops.heavy).toEqual([{ start: at(14), end: at(15) }]);
+		expect(day?.heavy[day.times.indexOf(at(14, 55))]).toBe(0);
+		expect(day?.heavy[day.times.indexOf(at(15))]).toBe(0.1);
+		expect(validateForecastResponse(response)).toEqual([]);
+	});
 });
 
 describe("shortfall: spill rule", () => {
