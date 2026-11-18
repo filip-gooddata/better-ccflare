@@ -178,6 +178,7 @@ describe("selectRow", () => {
 		expect(c.m).toBe(2);
 		expect(c.floor).toBe(floorOf(2));
 		expect(c.p).toBe(1);
+		expect(c.runnerUpLoss).toBeNaN();
 	});
 
 	it("serves the present with no-units for a row with no units at all", () => {
@@ -206,6 +207,7 @@ describe("selectRow", () => {
 		});
 		expect(c.presentLoss).toBeNaN();
 		expect(c.chosenLoss).toBeNaN();
+		expect(c.runnerUpLoss).toBeNaN();
 	});
 
 	it("serves the present with no-units when the present has no finite loss", () => {
@@ -244,5 +246,51 @@ describe("selectRow", () => {
 		const c = selectRow(row([...clear(20), extra]));
 		expect(c.units).toBe(18);
 		expect(c.runnerUp).toBe("P");
+	});
+
+	it("reports the runner-up mean loss on the units every kept candidate scored", () => {
+		const extra: Cand = {
+			id: "C",
+			pref: 2,
+			loss: rep(20, (u) => (u === 0 || u === 7 ? NAN : 3)),
+		};
+		const cands = [...clear(20), extra];
+		const c = selectRow(row(cands));
+		const pLoss = (cands[0] as Cand).loss;
+		const shared = pLoss.filter((_, u) => u !== 0 && u !== 7);
+		const sharedMean = shared.reduce((a, b) => a + b, 0) / shared.length;
+		const allMean = pLoss.reduce((a, b) => a + b, 0) / pLoss.length;
+		expect(c.runnerUp).toBe("P");
+		expect(c.runnerUpLoss).toBeCloseTo(sharedMean, 12);
+		expect(Math.abs(sharedMean - allMean)).toBeGreaterThan(1e-6);
+		expect(c.runnerUpLoss).toBe(c.presentLoss);
+	});
+
+	it("reports the runner-up mean loss when the present is kept", () => {
+		const c = selectRow(
+			row([
+				{ id: "P", pref: 0, loss: [1, 2, 3, 4] },
+				{ id: "A", pref: 1, loss: [2, 4, 6, 8] },
+			]),
+		);
+		expect(c.chosen).toBe("P");
+		expect(c.runnerUp).toBe("A");
+		expect(c.runnerUpLoss).toBe(5);
+		expect(c.chosenLoss).toBe(2.5);
+	});
+
+	it("reports no runner-up loss for a row with a single scored candidate", () => {
+		const c = selectRow({
+			row: "solo",
+			candidates: [7],
+			presentIndex: 0,
+			preference: [0],
+			units: [0, 1, 2],
+			loss: [Float64Array.from([1, 2, 3])],
+		});
+		expect(c.reason).toBe("present-best");
+		expect(c.units).toBe(3);
+		expect(c.runnerUp).toBeNull();
+		expect(c.runnerUpLoss).toBeNaN();
 	});
 });
