@@ -587,9 +587,11 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		);
 
 		const first = await send(ctx, makeRequest(FABLE));
+		// The first Fable refusal blocks the family on gooddata; the second
+		// Fable model in the list is then not sent (the attempt gate), since
+		// upstream would serve it from extra usage.
 		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
 			FABLE,
-			"claude-fable-5-2",
 		]);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
@@ -628,9 +630,11 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		);
 
 		await send(ctx, makeRequest(OPUS));
+		// The first Fable refusal blocks the family on gooddata; the second
+		// Fable model in the list is then not sent (the attempt gate), since
+		// upstream would serve it from extra usage.
 		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
 			FABLE,
-			"claude-fable-5-2",
 		]);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
@@ -639,7 +643,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		// The next mapped Opus request must not reach gooddata while the Fable
 		// block it would run into stands.
 		await send(ctx, makeRequest(OPUS));
-		expect(calls.filter((c) => c.account === GD)).toHaveLength(2);
+		expect(calls.filter((c) => c.account === GD)).toHaveLength(1);
 		expect(
 			logged(`family_blocked: excluding ${GD} for fable`).length,
 		).toBeGreaterThan(0);

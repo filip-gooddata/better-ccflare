@@ -132,12 +132,16 @@ describe("issue #273 — Group A: helper contract", () => {
 // return — it drains the classifier's `retried` argument rather than the
 // outer `response` binding that argument happens to alias, so the site keeps
 // draining the right body if the helper is ever called with another response.
+// 25-27 are the attempt gate's skips before the codex-continuation,
+// thinking-signature and cache_control recovery retries: the account filled
+// up, so the rejected response is discarded and the attempt fails over
+// instead of re-sending.
 // ---------------------------------------------------------------------------
 
-const EXPECTED_SITE_COUNT = 24;
+const EXPECTED_SITE_COUNT = 27;
 
 describe("issue #273 — Group B: call-site coverage in proxy-operations.ts", () => {
-	it("proxy-operations.ts has exactly 24 cancelDiscardedResponseBody call sites", () => {
+	it("proxy-operations.ts has exactly 27 cancelDiscardedResponseBody call sites", () => {
 		const source = readFileSync(
 			"packages/proxy/src/handlers/proxy-operations.ts",
 			"utf-8",

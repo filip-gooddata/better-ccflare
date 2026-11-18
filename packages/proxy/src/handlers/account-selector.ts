@@ -21,7 +21,9 @@ import type {
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import {
+	collectLimitBlockedAccounts,
 	fullLimitAnswer,
+	type LocalLimitAnswer,
 	markLocalLimitAnswer,
 	selectAllLimitedAnswer,
 } from "./limit-blocked";
@@ -963,6 +965,15 @@ export async function selectAccountsForRequest(
 					}> = [];
 					const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
 					const capacityNow = Date.now();
+					// Slots left out because their account is full for the slot's
+					// effective model, with that account's local 429. A combo whose
+					// every slot is unusable, at least one of them full, answers with
+					// the limit instead of the fallback-disabled 503.
+					const fullSlots: Array<{
+						account: Account;
+						model: string | undefined;
+						answer: LocalLimitAnswer;
+					}> = [];
 
 					// Slots are already ordered by priority ASC from the repository
 					for (const slot of combo.slots) {
@@ -973,6 +984,24 @@ export async function selectAccountsForRequest(
 							log.warn(
 								`Combo slot references unknown account ${slot.account_id}`,
 							);
+							continue;
+						}
+
+						// Full means five-hour, weekly, or the slot model's family at
+						// 100 % (the slot's own model, the request's for a passthrough
+						// slot). Such a slot is never routed; the checks below would
+						// leave it out too, but only this one keeps its answer.
+						const slotModelForLimit = slot.model || model;
+						const slotFullAnswer =
+							!account.paused && permittedAccountIds.has(account.id)
+								? fullLimitAnswer(account, ctx, slotModelForLimit, capacityNow)
+								: null;
+						if (slotFullAnswer) {
+							fullSlots.push({
+								account,
+								model: slotModelForLimit,
+								answer: slotFullAnswer,
+							});
 							continue;
 						}
 
@@ -1189,6 +1218,30 @@ export async function selectAccountsForRequest(
 						log.warn(
 							`All ${combo.slots.length} combo slots unavailable for ${combo.name}, session fallback disabled by the Combo Session Fallback setting (Settings → Advanced)`,
 						);
+						// Every slot unusable and at least one full: the local 429 of
+						// the full slot the all-limited rule ranks first (each read
+						// with its own model), not the generic 503. Nothing is sent.
+						const slotFull = fullSlots[0];
+						if (slotFull) {
+							const blocked = fullSlots.flatMap((entry) =>
+								collectLimitBlockedAccounts(
+									[entry.account],
+									ctx,
+									meta,
+									entry.model,
+									capacityNow,
+								),
+							);
+							const target =
+								blocked.length > 0 && ctx.strategy.selectWhenAllLimited
+									? ctx.strategy.selectWhenAllLimited(blocked, meta)
+									: null;
+							markLocalLimitAnswer(
+								meta,
+								fullSlots.find((entry) => entry.account.id === target?.id)
+									?.answer ?? slotFull.answer,
+							);
+						}
 						return [];
 					}
 
