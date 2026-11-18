@@ -3972,7 +3972,7 @@ function describeKeptLimitHolds(kept: KeptLimitHolds): string {
 	const parts: string[] = [];
 	if (kept.overageBench) {
 		parts.push(
-			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage reading shows five-hour and weekly below 100%.`,
+			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%.`,
 		);
 	}
 	if (kept.familyBlocks.length > 0) {

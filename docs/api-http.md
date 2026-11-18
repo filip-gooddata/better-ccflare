@@ -451,7 +451,7 @@ Force-clear persisted rate-limit lock state for an account and trigger immediate
 - Triggers immediate usage poll for the account (if polling is configured in-process, else a direct usage fetch for Anthropic OAuth accounts)
 
 **What it keeps:** a manual reset never lifts known exhausted capacity, because the next request could then be served from extra usage.
-- An active `overage_in_use` bench (the account answered with `overage-in-use: true`) stays until its `rate_limited_until`, or until a newer usage reading shows both the five-hour and the weekly window below 100 %. A bench whose time has passed is cleared.
+- An active `overage_in_use` bench (the account answered with `overage-in-use: true`) stays until its `rate_limited_until`, or until a newer usage poll (the in-process poller, not the one-off direct fetch fallback) shows both the five-hour and the weekly window below 100 %. A bench whose time has passed is cleared.
 - Unexpired model-family blocks (for example a Fable weekly limit) stay in this server's memory until their reset, also when the usage refresh fails or returns no family telemetry. Expired blocks are dropped.
 
 `kept` lists what is still in force after the refresh; both parts are empty when nothing was kept. `until` is epoch milliseconds.
@@ -460,7 +460,7 @@ Force-clear persisted rate-limit lock state for an account and trigger immediate
 ```json
 {
   "success": true,
-  "message": "Rate limit state cleared for account 'myaccount'. Kept the overage_in_use bench until 2026-11-18T15:00:00.000Z: it lifts then, or earlier when a newer usage reading shows five-hour and weekly below 100%. Kept family blocks until their reset: fable until 2026-11-20T09:00:00.000Z.",
+  "message": "Rate limit state cleared for account 'myaccount'. Kept the overage_in_use bench until 2026-11-18T15:00:00.000Z: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%. Kept family blocks until their reset: fable until 2026-11-20T09:00:00.000Z.",
   "usagePollTriggered": true,
   "kept": {
     "overageBench": { "until": 1795014000000, "untilIso": "2026-11-18T15:00:00.000Z" },
@@ -473,7 +473,7 @@ Force-clear persisted rate-limit lock state for an account and trigger immediate
 
 With nothing kept, `message` is `Rate limit state cleared for account 'myaccount'.` and `kept` is `{ "overageBench": null, "familyBlocks": [] }`.
 
-The CLI `--force-reset-rate-limit <name>` clears the database the same way (keeping an active bench), then calls this endpoint on local servers (configured port, 8080, 8081). It prints the kept bench, the family blocks a server reported, or, when no server answered, that family blocks in a server's memory were not checked or cleared.
+The CLI `--force-reset-rate-limit <name>` clears the database the same way (keeping an active bench), then calls this endpoint on local servers (configured port, 8080, 8081). It stops at the first server that accepts the usage poll. It prints the kept bench, the family blocks the answering servers reported, the ports it did not check, or, when no server answered, that family blocks in a server's memory were not checked or cleared.
 
 **Example:**
 ```bash

@@ -2563,7 +2563,7 @@ export async function forceResetRateLimit(
 	];
 	if (kept.overageBench) {
 		lines.push(
-			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage reading shows five-hour and weekly below 100%.`,
+			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%.`,
 		);
 	}
 	if (kept.familyBlocks.length > 0) {
@@ -2571,6 +2571,11 @@ export async function forceResetRateLimit(
 			`Kept family blocks on the running server: ${kept.familyBlocks
 				.map((block) => `${block.family} until ${block.untilIso}`)
 				.join(", ")}. They lift at their reset.`,
+		);
+	}
+	if (notified.answered && notified.uncheckedPorts.length > 0) {
+		lines.push(
+			`Family blocks were checked on the server at port ${notified.answeredPorts.join(", ")}; port ${notified.uncheckedPorts.join(", ")} was not checked.`,
 		);
 	}
 	if (!notified.answered) {
@@ -2588,6 +2593,8 @@ async function notifyServersToForceResetRateLimit(
 ): Promise<{
 	usagePollTriggered: boolean;
 	answered: boolean;
+	answeredPorts: number[];
+	uncheckedPorts: number[];
 	familyBlocks: CliKeptLimitHolds["familyBlocks"];
 }> {
 	const configuredPort = config.getRuntime().port || 8080;
@@ -2595,7 +2602,8 @@ async function notifyServersToForceResetRateLimit(
 	const testPort = 8081;
 	const ports = [...new Set([configuredPort, defaultPort, testPort])];
 	let usagePollTriggered = false;
-	let answered = false;
+	const answeredPorts: number[] = [];
+	let uncheckedPorts: number[] = [];
 	const familyBlocks = new Map<string, CliKeptLimitHolds["familyBlocks"][0]>();
 
 	// The local-control-secret (issue #216) lets this notification through
@@ -2604,7 +2612,7 @@ async function notifyServersToForceResetRateLimit(
 	// this never involves handling a real API key.
 	const localControlSecret = config.getLocalControlSecret();
 
-	for (const port of ports) {
+	for (const [index, port] of ports.entries()) {
 		try {
 			const response = await fetch(
 				`http://localhost:${port}/api/accounts/${accountId}/force-reset-rate-limit`,
@@ -2618,7 +2626,7 @@ async function notifyServersToForceResetRateLimit(
 			);
 
 			if (response.ok) {
-				answered = true;
+				answeredPorts.push(port);
 				const data = (await response.json()) as {
 					usagePollTriggered?: boolean;
 					kept?: { familyBlocks?: CliKeptLimitHolds["familyBlocks"] };
@@ -2631,6 +2639,7 @@ async function notifyServersToForceResetRateLimit(
 				}
 				if (data.usagePollTriggered) {
 					usagePollTriggered = true;
+					uncheckedPorts = ports.slice(index + 1);
 					break;
 				}
 			}
@@ -2641,7 +2650,9 @@ async function notifyServersToForceResetRateLimit(
 
 	return {
 		usagePollTriggered,
-		answered,
+		answered: answeredPorts.length > 0,
+		answeredPorts,
+		uncheckedPorts,
 		familyBlocks: [...familyBlocks.values()].sort((a, b) =>
 			a.family.localeCompare(b.family),
 		),
