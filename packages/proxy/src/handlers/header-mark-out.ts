@@ -1,4 +1,5 @@
 import { getModelFamily } from "@better-ccflare/core";
+import type { DatabaseOperations } from "@better-ccflare/database";
 import { Logger } from "@better-ccflare/logger";
 import {
 	extractFiveHourWindow,
@@ -425,6 +426,32 @@ function releaseBenchOnRecovery(
 
 // Optional call: test doubles of the providers module may lack it.
 usageCache.onPolledReading?.(releaseBenchOnRecovery);
+
+/**
+ * The legacy capacity-restored rule: a usage poll after a usage-endpoint 429
+ * shows the account below 100 %, so a cooldown still ahead is cleared. That
+ * poll may lack a window, so it never clears an active `overage_in_use`
+ * bench; {@link releaseBenchOnRecovery} or the bench's reset ends that. The
+ * write re-checks the row, so a bench applied after the read is kept too.
+ */
+export async function clearCooldownOnCapacityRestored(
+	dbOps: Pick<DatabaseOperations, "getAccount" | "getAdapter">,
+	accountId: string,
+	now: number = Date.now(),
+): Promise<"cleared" | "kept-bench" | "none"> {
+	const account = await dbOps.getAccount(accountId);
+	if (!account?.rate_limited_until || account.rate_limited_until <= now) {
+		return "none";
+	}
+	if (holdsOverageBench(account, now)) return "kept-bench";
+	const changes = await dbOps
+		.getAdapter()
+		.runWithChanges(
+			`UPDATE accounts SET rate_limited_until = NULL, rate_limited_reason = NULL, rate_limited_at = NULL, rate_limit_reset = NULL, rate_limit_reset_at = NULL, rate_limit_status = NULL, rate_limit_remaining = NULL WHERE id = ? AND ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL}`,
+			[accountId, now],
+		);
+	return changes > 0 ? "cleared" : "kept-bench";
+}
 
 /** Test-only: forgets the re-read throttle between cases. */
 export function resetHeaderMarkOutForTests(): void {
