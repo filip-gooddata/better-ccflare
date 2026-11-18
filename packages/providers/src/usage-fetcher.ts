@@ -1103,11 +1103,29 @@ export function normalizeUsageSnapshotForHistory(
  */
 export type AccessTokenProvider = () => Promise<string>;
 
+export type PolledReadingListener = (
+	accountId: string,
+	data: AnyUsageData,
+	requestedAt: number,
+) => void;
+
+function isHeld(entry: { holdUntil?: number }, now: number): boolean {
+	return entry.holdUntil !== undefined && entry.holdUntil > now;
+}
+
 /**
  * In-memory cache for usage data per account
  */
 class UsageCache {
-	private cache = new Map<string, { data: AnyUsageData; timestamp: number }>();
+	private cache = new Map<
+		string,
+		{ data: AnyUsageData; timestamp: number; holdUntil?: number }
+	>();
+	/**
+	 * Listeners told about every Anthropic poll reading that reached the cache,
+	 * with the time its request went out. Kept across {@link clear}.
+	 */
+	private polledReadingListeners = new Set<PolledReadingListener>();
 	/**
 	 * Per-account write counter, bumped by {@link install} and by every teardown
 	 * ({@link invalidateInFlight}). A poll captures it before its request goes on
@@ -1682,6 +1700,7 @@ class UsageCache {
 				// may already be on the wire; that poll's older reading must not
 				// put the account back in rotation.
 				const generationBefore = this.generations.get(accountId) ?? 0;
+				const requestedAt = Date.now();
 				const result = await fetchUsageData(token);
 				if (
 					result.data &&
@@ -1708,6 +1727,7 @@ class UsageCache {
 						data: result.data,
 						timestamp: Date.now(),
 					});
+					this.notifyPolledReading(accountId, result.data, requestedAt);
 					const snapshotCb = this.snapshotCallbacks.get(accountId);
 					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
 					const utilization = getRepresentativeUtilization(
@@ -1787,7 +1807,7 @@ class UsageCache {
 		let cleanedCount = 0;
 
 		for (const [accountId, cached] of this.cache.entries()) {
-			if (now - cached.timestamp > maxAgeMs) {
+			if (now - cached.timestamp > maxAgeMs && !isHeld(cached, now)) {
 				this.cache.delete(accountId);
 				cleanedCount++;
 			}
@@ -1807,7 +1827,7 @@ class UsageCache {
 
 		// Clean up stale entries while accessing
 		const age = Date.now() - cached.timestamp;
-		if (age > 10 * 60 * 1000) {
+		if (age > 10 * 60 * 1000 && !isHeld(cached, Date.now())) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			log.debug(
@@ -1824,9 +1844,44 @@ class UsageCache {
 	 * write must go through here so an in-flight poll can tell that it lost a
 	 * race — see {@link generations}.
 	 */
-	private install(accountId: string, data: AnyUsageData): void {
-		this.cache.set(accountId, { data, timestamp: Date.now() });
+	private install(
+		accountId: string,
+		data: AnyUsageData,
+		holdUntil?: number,
+	): void {
+		this.cache.set(accountId, {
+			data,
+			timestamp: Date.now(),
+			...(holdUntil !== undefined ? { holdUntil } : {}),
+		});
 		this.invalidateInFlight(accountId);
+	}
+
+	/**
+	 * Subscribe to Anthropic poll readings as they reach the cache. The
+	 * listener gets the reading and the time its request went out, so it can
+	 * tell a reading taken after some event from one already on the wire.
+	 * Returns an unsubscribe function.
+	 */
+	onPolledReading(listener: PolledReadingListener): () => void {
+		this.polledReadingListeners.add(listener);
+		return () => this.polledReadingListeners.delete(listener);
+	}
+
+	private notifyPolledReading(
+		accountId: string,
+		data: AnyUsageData,
+		requestedAt: number,
+	): void {
+		for (const listener of this.polledReadingListeners) {
+			try {
+				listener(accountId, data, requestedAt);
+			} catch (error) {
+				log.warn(
+					`Polled-reading listener failed for account ${accountId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 	}
 
 	/**
@@ -1842,10 +1897,15 @@ class UsageCache {
 	}
 
 	/**
-	 * Set cached usage data for an account
+	 * Set cached usage data for an account. With `holdUntil`, the entry does
+	 * not expire by age before that time; the next write replaces it as usual.
 	 */
-	set(accountId: string, data: AnyUsageData): void {
-		this.install(accountId, data);
+	set(
+		accountId: string,
+		data: AnyUsageData,
+		options: { holdUntil?: number } = {},
+	): void {
+		this.install(accountId, data, options.holdUntil);
 
 		// Periodic cleanup of stale entries to prevent memory bloat
 		// Run cleanup every 100 sets to balance performance and memory
@@ -1910,7 +1970,7 @@ class UsageCache {
 
 		const age = Date.now() - cached.timestamp;
 		// Clean up if too old
-		if (age > 10 * 60 * 1000) {
+		if (age > 10 * 60 * 1000 && !isHeld(cached, Date.now())) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			return null;

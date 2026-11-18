@@ -6,7 +6,7 @@ import {
 	usageCache,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
-import { markFamilyExhausted } from "./model-capacity";
+import { blockFamily } from "./model-capacity";
 import type { ProxyContext } from "./proxy-types";
 import { applyRateLimitCooldown } from "./rate-limit-cooldown";
 
@@ -20,6 +20,12 @@ const PREFIX = "anthropic-ratelimit-unified-";
  * usage fetch, not one per response.
  */
 export const HEADER_REFRESH_MIN_INTERVAL_MS = 30_000;
+
+/**
+ * How long a mark holds when no header gave its reset: a full week, the
+ * longest window. A newer usage reading showing recovery releases it sooner.
+ */
+const UNKNOWN_RESET_HOLD_MS = 7 * 24 * 3_600_000;
 
 const lastRefreshAt = new Map<string, number>();
 /** The latest usage entry each account got from headers, not from a read. */
@@ -204,8 +210,31 @@ function writeUsageFromHeaders(
 	);
 	if (five) next.five_hour = five;
 	if (seven) next.seven_day = seven;
-	usageCache.set(accountId, next);
+	usageCache.set(accountId, next, { holdUntil: markHoldUntil(next) });
 	headerWritten.set(accountId, next);
+}
+
+/**
+ * When a header mark may expire by age: the latest reset of the windows it
+ * marks full. Until then only a newer write (a poll that started after the
+ * mark, or another header mark) replaces it, so the account stays out until
+ * its reset or a reading that shows it recovered, not just for the cache's
+ * ten minutes.
+ */
+function markHoldUntil(usage: UsageData): number {
+	const now = Date.now();
+	let until = now;
+	for (const window of [usage.five_hour, usage.seven_day]) {
+		if (!window || window.utilization < 100) continue;
+		const resetMs = window.resets_at
+			? Date.parse(window.resets_at)
+			: Number.NaN;
+		until = Math.max(
+			until,
+			Number.isFinite(resetMs) ? resetMs : now + UNKNOWN_RESET_HOLD_MS,
+		);
+	}
+	return until;
 }
 
 function logRefreshFailure(accountId: string, error: unknown): void {
@@ -270,8 +299,17 @@ export function observeLimitHeaders(
 	const family = parsed.overageInUse ? familyOfClaim(parsed) : null;
 	if (family !== null && !windowOut) {
 		// Served on credits for one family: block that family until the reset,
-		// keep the account for the others.
-		markFamilyExhausted(account.id, family, parsed.resetMs);
+		// keep the account for the others. The claim names the family upstream
+		// charged, which is the family this account sends (after its model
+		// mapping), and a standing block excludes it in every routing mode.
+		// Without a reset header the account's weekly reset bounds it, else a
+		// full week.
+		const now = Date.now();
+		const until =
+			[parsed.resetMs, parsed.sevenDay.resetMs].find(
+				(reset): reset is number => reset !== null && reset > now,
+			) ?? now + UNKNOWN_RESET_HOLD_MS;
+		blockFamily(account.id, family, until, "header", now);
 	} else {
 		writeUsageFromHeaders(account.id, parsed, windowOut);
 	}
@@ -298,7 +336,8 @@ export function applyOverageCooldown(
 	if (!parsed.overageInUse) return;
 	// A family claim is blocked per family (observeLimitHeaders), not benched.
 	if (familyOfClaim(parsed) !== null && !headerWindowOut(parsed)) return;
-	if (parsed.resetMs === null || parsed.resetMs <= Date.now()) return;
+	const benchedAt = Date.now();
+	if (parsed.resetMs === null || parsed.resetMs <= benchedAt) return;
 	applyRateLimitCooldown(
 		account,
 		{
@@ -308,11 +347,101 @@ export function applyOverageCooldown(
 		},
 		ctx,
 	);
+	if (holdsOverageBench(account, benchedAt)) {
+		pendingBenches.set(account.id, {
+			ctx,
+			benchedAt,
+			until: account.rate_limited_until as number,
+		});
+	}
 }
+
+/**
+ * Whether `account` sits on an `overage_in_use` bench that has not reached
+ * its reset. Such a bench is a hard admission block: no bypass admits the
+ * account, and no later success clears it. It ends at its reset or when a
+ * usage reading taken after it shows the account below its limits.
+ */
+export function holdsOverageBench(
+	account: Pick<Account, "rate_limited_until" | "rate_limited_reason">,
+	now: number = Date.now(),
+): boolean {
+	return (
+		account.rate_limited_reason === "overage_in_use" &&
+		account.rate_limited_until != null &&
+		account.rate_limited_until > now
+	);
+}
+
+/**
+ * SQL condition, true for an accounts row whose cooldown a success may clear:
+ * anything but an `overage_in_use` bench still ahead of its reset. Takes one
+ * parameter, the current time in epoch ms.
+ */
+export const SUCCESS_MAY_CLEAR_COOLDOWN_SQL =
+	"(COALESCE(rate_limited_reason, '') <> 'overage_in_use' OR rate_limited_until IS NULL OR rate_limited_until <= ?)";
+
+interface PendingBench {
+	ctx: ProxyContext;
+	benchedAt: number;
+	until: number;
+}
+
+/** Overage benches this process applied, waiting for a recovering reading. */
+const pendingBenches = new Map<string, PendingBench>();
+
+function windowBelowLimit(window: UsageWindow | undefined): boolean {
+	return (
+		window !== undefined &&
+		window !== null &&
+		typeof window.utilization === "number" &&
+		window.utilization < 100
+	);
+}
+
+/**
+ * Releases an overage bench when a usage poll whose request went out after
+ * the bench shows both the five-hour and the weekly window below 100 %. A
+ * reading already on the wire when the account was benched proves nothing,
+ * and neither does one that lacks a window. The database write only clears
+ * the bench it was told about, never a newer one.
+ */
+function releaseBenchOnRecovery(
+	accountId: string,
+	data: unknown,
+	requestedAt: number,
+): void {
+	const bench = pendingBenches.get(accountId);
+	if (!bench) return;
+	const now = Date.now();
+	if (bench.until <= now) {
+		pendingBenches.delete(accountId);
+		return;
+	}
+	if (requestedAt < bench.benchedAt) return;
+	const { five_hour: five, seven_day: seven } = data as UsageData;
+	if (!windowBelowLimit(five) || !windowBelowLimit(seven)) return;
+	pendingBenches.delete(accountId);
+	log.info(
+		`Releasing overage_in_use bench of ${accountId}: a usage reading taken after it shows five-hour ${five?.utilization}% and weekly ${seven?.utilization}%`,
+	);
+	bench.ctx.asyncWriter.enqueue(async () => {
+		await bench.ctx.dbOps
+			.getAdapter()
+			.run(
+				"UPDATE accounts SET rate_limited_until = NULL, rate_limited_reason = NULL WHERE id = ? AND rate_limited_reason = 'overage_in_use' AND rate_limited_until <= ?",
+				[accountId, bench.until],
+			);
+	});
+}
+
+// Optional call: test doubles of the providers module may lack it.
+usageCache.onPolledReading?.(releaseBenchOnRecovery);
 
 /** Test-only: forgets the re-read throttle between cases. */
 export function resetHeaderMarkOutForTests(): void {
 	lastRefreshAt.clear();
 	headerWritten.clear();
 	readingsBeforeMark.clear();
+	pendingBenches.clear();
 }

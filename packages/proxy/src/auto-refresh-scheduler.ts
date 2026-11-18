@@ -34,6 +34,7 @@ import {
 	INTERNAL_PROBE_SECRET_HEADER,
 	LOCAL_REFUSAL_ERROR_TYPES,
 } from "./handlers";
+import { SUCCESS_MAY_CLEAR_COOLDOWN_SQL } from "./handlers/header-mark-out";
 import { limitRefusalResetMs } from "./handlers/limit-response";
 import {
 	flushPendingRotation,
@@ -716,10 +717,14 @@ export class AutoRefreshScheduler {
 				const rateLimitInfo = provider.parseRateLimit(response);
 
 				// Update rate limit fields from unified headers
+				// A probe's success never clears an overage_in_use bench still ahead
+				// of its reset: that bench says the account's limits are spent
+				// (header-mark-out.ts). Every other cooldown clears as before.
+				const clearedAt = Date.now();
 				if (rateLimitInfo.resetTime) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limited_until = NULL WHERE id = ?",
-						[rateLimitInfo.resetTime, Date.now(), accountRow.id],
+						`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limited_until = CASE WHEN ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL} THEN NULL ELSE rate_limited_until END WHERE id = ?`,
+						[rateLimitInfo.resetTime, clearedAt, clearedAt, accountRow.id],
 					);
 
 					// Update our tracking with the NEW rate_limit_reset from the API
@@ -735,8 +740,8 @@ export class AutoRefreshScheduler {
 					// Even if no reset time is provided, clear rate_limited_until as the refresh was successful
 					// Also make sure to clear any existing rate_limited_until value to ensure the account is not stuck
 					await this.db.run(
-						"UPDATE accounts SET rate_limited_until = NULL WHERE id = ?",
-						[accountRow.id],
+						`UPDATE accounts SET rate_limited_until = NULL WHERE id = ? AND ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL}`,
+						[accountRow.id, clearedAt],
 					);
 					log.info(
 						`Cleared rate_limited_until for ${accountRow.name} as account has been refreshed (no new reset time)`,

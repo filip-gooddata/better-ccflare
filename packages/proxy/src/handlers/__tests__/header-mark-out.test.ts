@@ -27,8 +27,9 @@ import {
 } from "../header-mark-out";
 import { collectLimitBlockedAccounts } from "../limit-blocked";
 import {
+	clearFamilyBlocks,
 	clearFamilyExhaustionCache,
-	isFamilyExhausted,
+	getFamilyBlock,
 } from "../model-capacity";
 import { proxyWithAccount } from "../proxy-operations";
 import {
@@ -266,6 +267,7 @@ beforeEach(() => {
 afterEach(() => {
 	resetUsageCollectorForTests();
 	clearFamilyExhaustionCache();
+	clearFamilyBlocks();
 	refreshSpy.mockRestore();
 	globalThis.fetch = originalFetch;
 	setSystemTime();
@@ -404,13 +406,13 @@ describe("observeLimitHeaders", () => {
 		await processProxyResponse(familyOverage(), account, ctx);
 		await flush();
 
-		expect(isFamilyExhausted("a", "opus")).toBe(true);
-		expect(isFamilyExhausted("a", "sonnet")).toBe(false);
-		expect(limitKinds(ctx, "a")).toEqual([]);
+		expect(getFamilyBlock("a", "opus")?.source).toBe("header");
+		expect(getFamilyBlock("a", "sonnet")).toBeNull();
+		expect(limitKinds(ctx, "a")).toEqual(["family"]);
 		expect(account.rate_limited_until).toBeNull();
 		expect(marks).toEqual([]);
 		setSystemTime(new Date(SEVEN_DAY_RESET + 1000));
-		expect(isFamilyExhausted("a", "opus")).toBe(false);
+		expect(getFamilyBlock("a", "opus")).toBeNull();
 	});
 
 	it("an overall rejection naming a family leaves the cache to the family classifier", () => {
