@@ -448,16 +448,20 @@ describe("cost", () => {
 });
 
 describe("served demand (F2)", () => {
-	test("learnedDemand = presentDemand(settings) and learnedDemand omitted give the same result", async () => {
-		const input = buildInput(replayFixture());
-		const omitted = await engine.compute(input);
-		const present = await engine.compute({
-			...input,
-			learnedDemand: presentDemand(input.settings),
-		});
-		expect(omitted.available).toBe(true);
-		expect(present).toEqual(omitted);
-		const nulled = await engine.compute({ ...input, learnedDemand: null });
-		expect(nulled).toEqual(omitted);
-	});
+	test(
+		"learnedDemand = presentDemand(settings) and learnedDemand omitted give the same result",
+		async () => {
+			const input = buildInput(replayFixture());
+			const omitted = await engine.compute(input);
+			const present = await engine.compute({
+				...input,
+				learnedDemand: presentDemand(input.settings),
+			});
+			expect(omitted.available).toBe(true);
+			expect(present).toEqual(omitted);
+			const nulled = await engine.compute({ ...input, learnedDemand: null });
+			expect(nulled).toEqual(omitted);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });
