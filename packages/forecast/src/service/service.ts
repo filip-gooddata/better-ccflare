@@ -27,6 +27,7 @@ import {
 } from "../history/proxy-usage-detail";
 import { loadReadings } from "../history/readings";
 import { runUsageDetailBackfill } from "../history/usage-detail-backfill";
+import { maybeExportPaceSeries } from "../pace-export/export";
 import {
 	type PrewarmForecastView,
 	type PrewarmScheduler,
@@ -484,6 +485,25 @@ export function createForecastService(
 				accounts: countedIds(limits),
 				timeZone: deps.pace().timeZone,
 			});
+			// Opt-in offline copy of the series (FORECAST_PACE_SERIES_EXPORT); off, one env read.
+			void maybeExportPaceSeries(
+				process.env,
+				() => {
+					const stored = storedDaytypes(demand);
+					return {
+						series,
+						now,
+						historyFrom,
+						accountCount: countedIds(limits).length,
+						settings: demand,
+						rowOne: stored && {
+							served: stored.choice.served,
+							pending: stored.pending,
+						},
+					};
+				},
+				logger,
+			);
 		} catch {
 			if (!stopped)
 				logger.info(
