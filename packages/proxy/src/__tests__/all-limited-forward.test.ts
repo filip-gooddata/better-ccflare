@@ -534,10 +534,11 @@ describe("session-pace with every account out on limits", () => {
 	});
 
 	it("answers a bypass-session request without a forced account with the local 429", async () => {
-		const a = makeAccount("a");
-		const b = makeAccount("b");
-		usageCache.set("a", usage({ fiveHour: win(100, NOW + 3 * HOUR) }));
-		usageCache.set("b", usage({ fiveHour: win(100, NOW + HOUR) }));
+		// Cooldowns, not full windows: on this branch the usage-cap prefilter
+		// still readmits a capped account for the bypass header (the gate
+		// stream closes that).
+		const a = makeAccount("a", { rate_limited_until: NOW + 3 * HOUR });
+		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
 		const calls = installUpstream((account) => ok200(account));
 		const { ctx } = makeCtx([a, b], paceStrategy());
 

@@ -465,7 +465,9 @@ describe("combo slot whose account is full", () => {
 	});
 });
 
-describe("sticky session account at 100 % with bypass-session and no forced id", () => {
+// Without the bypass-session header: the prefilter's readmission of a capped
+// account for that header is closed by the gate stream, not on this branch.
+describe("sticky session account at 100 %", () => {
 	/** Maps `session` to an account and returns that account's id. */
 	async function mapSession(ctx: ProxyContext, session: string) {
 		const calls = installUpstream(ok200);
@@ -483,10 +485,7 @@ describe("sticky session account at 100 % with bypass-session and no forced id",
 
 		const response = (await send(
 			ctx,
-			makeRequest({
-				session: "s-1",
-				headers: { "x-better-ccflare-bypass-session": "true" },
-			}),
+			makeRequest({ session: "s-1" }),
 		)) as Response;
 
 		expect(calls).toEqual([other]);
@@ -501,13 +500,7 @@ describe("sticky session account at 100 % with bypass-session and no forced id",
 		setFull(other, "weekly", NOW + 30 * HOUR);
 		const calls = installUpstream(ok200);
 
-		const response = await send(
-			ctx,
-			makeRequest({
-				session: "s-2",
-				headers: { "x-better-ccflare-bypass-session": "true" },
-			}),
-		);
+		const response = await send(ctx, makeRequest({ session: "s-2" }));
 
 		expect(calls).toEqual([]);
 		await expectLocal429(response, NOW + 2 * HOUR);

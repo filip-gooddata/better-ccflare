@@ -24,6 +24,7 @@ import {
 	clearFamilyExhaustionCache,
 	getFamilyBlock,
 } from "../handlers/model-capacity";
+import { clearLimitRefusalCache } from "../handlers/limit-response";
 import { resetRateLimitProbeGatesForTests } from "../handlers/rate-limit-cooldown";
 import { clearVisionCapability } from "../handlers/vision-capability";
 import { handleProxy } from "../proxy";
@@ -450,6 +451,9 @@ const logged = (pattern: string | RegExp) =>
 
 beforeEach(() => {
 	logs = [];
+	// The cache of real limit refusals is process-wide; an earlier scenario's
+	// refusal must not answer a later one.
+	clearLimitRefusalCache();
 	setSystemTime(new Date(NOW));
 	setUseExtraUsage(false);
 	clearVisionCapability();
@@ -584,7 +588,10 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		expect(
 			logged(`account=${GD} family_block family=fable`).length,
 		).toBeGreaterThan(0);
-		await expectUpstreamRefusal(first, aiRefusal);
+		// gooddata-ai is usable first; it is not asked (failover path C never
+		// re-asks), and its limit answers locally.
+		expect(calls.filter((c) => c.account === AI)).toEqual([]);
+		await expectBuiltLimit429(first, FIVE_HOUR_RESET_AI);
 
 		const opus = (await send(ctx, makeRequest(OPUS))) as Response;
 		expect(opus.status).toBe(200);
