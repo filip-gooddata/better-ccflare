@@ -35,7 +35,10 @@ import {
 	LOCAL_REFUSAL_ERROR_TYPES,
 } from "./handlers";
 import { SUCCESS_MAY_CLEAR_COOLDOWN_SQL } from "./handlers/header-mark-out";
-import { limitRefusalResetMs } from "./handlers/limit-response";
+import {
+	LOCAL_429_HEADER,
+	limitRefusalResetMs,
+} from "./handlers/limit-response";
 import {
 	flushPendingRotation,
 	getPendingRotation,
@@ -55,16 +58,34 @@ const log = new Logger("AutoRefreshScheduler");
 const UNKNOWN_USAGE_RESET = 0;
 
 /**
- * Whether a failed probe was refused because the account is at a full limit:
- * a 429 with unified status `rejected`. The proxy's own local 429 for a full
- * account carries it, and so does upstream's real one. Either way the account
- * is full, not broken. A 429 without it is not a limit refusal.
+ * Whether a failed probe was refused because the account is at a full limit
+ * or on a cooldown: a 429 with unified status `rejected` (the proxy's local
+ * limit 429 and upstream's real one both carry it), or any 429 the proxy
+ * built itself ({@link LOCAL_429_HEADER}, which also marks the cooldown-only
+ * answer that claims no limit). Either way the account is held, not broken.
+ * Any other 429 is not a limit refusal.
  */
 function isLimitRefusal(response: Response): boolean {
+	if (response.status !== 429) return false;
 	return (
-		response.status === 429 &&
-		response.headers.get("anthropic-ratelimit-unified-status") === "rejected"
+		response.headers.get("anthropic-ratelimit-unified-status") === "rejected" ||
+		response.headers.has(LOCAL_429_HEADER)
 	);
+}
+
+/**
+ * When a limit refusal lets the account be probed again: its unified reset,
+ * or for the proxy's own cooldown answer (no unified reset) its retry-after,
+ * which counts to the cooldown end.
+ */
+function limitRefusalHoldUntil(response: Response, now: number): number | null {
+	const resetMs = limitRefusalResetMs(response.headers);
+	if (resetMs !== null) return resetMs;
+	if (!response.headers.has(LOCAL_429_HEADER)) return null;
+	const retryAfterS = Number(response.headers.get("retry-after"));
+	return Number.isFinite(retryAfterS) && retryAfterS > 0
+		? now + retryAfterS * 1000
+		: null;
 }
 
 /**
@@ -876,8 +897,8 @@ export class AutoRefreshScheduler {
 			// toward the pause. Hold probes off until the refusal's reset; with
 			// no reset to go by, the uncounted-failure ladder spaces them.
 			if (isLimitRefusal(response)) {
-				const resetMs = limitRefusalResetMs(response.headers);
 				const now = Date.now();
+				const resetMs = limitRefusalHoldUntil(response, now);
 				log.warn(
 					`Auto-refresh probe for ${accountRow.name} was refused for a full limit${resetMs !== null ? ` until ${new Date(resetMs).toISOString()}` : ""} — not counting toward the ${this.FAILURE_THRESHOLD}-failure pause threshold`,
 				);
