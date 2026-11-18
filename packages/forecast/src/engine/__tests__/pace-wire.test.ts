@@ -18,9 +18,9 @@ import {
 	plainPace,
 } from "../pace";
 import {
-	FIXED_N_ENGINE,
 	buildInput,
 	defaultSettings,
+	FIXED_N_ENGINE,
 	replayFixture,
 } from "./fixtures-engine";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";

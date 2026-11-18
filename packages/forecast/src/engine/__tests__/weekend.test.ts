@@ -8,10 +8,10 @@ import type { EpochMs, ForecastBlock } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { Scenarios } from "../model";
 import {
-	FIXED_N_ENGINE,
 	buildInput,
 	defaultSettings,
 	type EngineFixture,
+	FIXED_N_ENGINE,
 	prague,
 	replayFixture,
 } from "./fixtures-engine";

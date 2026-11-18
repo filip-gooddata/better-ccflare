@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ForecastInput, ForecastResult } from "../../types";
 import { createForecastEngine } from "../engine";
-import { FIXED_N_ENGINE, buildInput, replayFixture } from "./fixtures-engine";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 
 const engine = createForecastEngine(FIXED_N_ENGINE);
 

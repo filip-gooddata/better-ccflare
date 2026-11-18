@@ -7,9 +7,9 @@ import type { ForecastBlock, ForecastInput } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import type { NoiseMode } from "../model";
 import {
-	FIXED_N_ENGINE,
 	buildInput,
 	defaultSettings,
+	FIXED_N_ENGINE,
 	profileFixture,
 	replayFixture,
 } from "./fixtures-engine";

@@ -4,6 +4,12 @@ import { createForecastWorkerRunner } from "../forecast-worker-runner";
 import { paceRefitLine } from "../pace-refit-log";
 import { createPaceRefitRunner } from "../pace-refit-runner";
 
+/** One scenario-count rung at the days the context holds (400 here): N as before the rule. */
+const atBuiltDays = (ctx: { scenarios: { units: unknown[] } }) => ({
+	start: ctx.scenarios.units.length,
+	top: ctx.scenarios.units.length,
+});
+
 const T0 = Date.UTC(2026, 10, 16, 9, 0);
 const BUCKET = 300_000;
 
@@ -134,7 +140,11 @@ describe("forecast worker: the plan job", () => {
 		const ctx = await replayContext();
 		const outcome = await sourceRunner().run(
 			"plan",
-			{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
+			{
+				ctx: planJobContext(ctx),
+				budgetMs: PLAN_BUDGET_MS,
+				ladder: atBuiltDays(ctx),
+			},
 			{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
 		);
 		if (outcome.status !== "ok") throw new Error(JSON.stringify(outcome));
@@ -166,7 +176,11 @@ describe("forecast worker: the plan job", () => {
 		try {
 			const outcome = await sourceRunner().run(
 				"plan",
-				{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
+				{
+					ctx: planJobContext(ctx),
+					budgetMs: PLAN_BUDGET_MS,
+					ladder: atBuiltDays(ctx),
+				},
 				{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
 			);
 			expect(outcome.status).toBe("ok");
@@ -184,7 +198,7 @@ describe("forecast worker: the plan job", () => {
 		const ctx = await replayContext();
 		const outcome = await sourceRunner().run(
 			"plan",
-			{ ctx, budgetMs: 1 },
+			{ ctx, budgetMs: 1, ladder: atBuiltDays(ctx) },
 			{ timeoutMs: 1 },
 		);
 		expect(outcome.status).toBe("timeout");
@@ -193,7 +207,7 @@ describe("forecast worker: the plan job", () => {
 	it("reports a job error, not a worker failure, when the planner throws", async () => {
 		const outcome = await sourceRunner().run(
 			"plan",
-			// A context without scenarios: the planner throws inside the worker.
+			// A context without scenarios: the job throws inside the worker.
 			{ ctx: {} as never, budgetMs: 1_000 },
 			{ timeoutMs: 60_000 },
 		);
@@ -205,7 +219,7 @@ describe("forecast worker: the plan job", () => {
 		const controller = new AbortController();
 		const pending = sourceRunner().run(
 			"plan",
-			{ ctx, budgetMs: 15_000 },
+			{ ctx, budgetMs: 15_000, ladder: atBuiltDays(ctx) },
 			{ timeoutMs: 60_000, signal: controller.signal },
 		);
 		setTimeout(() => controller.abort(), 5);

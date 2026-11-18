@@ -8,7 +8,7 @@ import { calibrateWithEvidence } from "../calibration";
 import { buildDayTable, poolFor } from "../days";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import { plainPace } from "../pace";
-import { FIXED_N_ENGINE, buildInput, replayFixture } from "./fixtures-engine";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 
 /** Smallest daily total whose share of the summed weight, counting it and every smaller total, reaches q. */
 function lowerWeightedQuantile(

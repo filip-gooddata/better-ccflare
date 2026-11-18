@@ -8,7 +8,7 @@ import type {
 } from "../../types";
 import * as calibration from "../calibration";
 import { createForecastEngine } from "../engine";
-import { FIXED_N_ENGINE, buildInput, replayFixture } from "./fixtures-engine";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 import { settings } from "./fixtures-sim";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 

@@ -15,8 +15,8 @@ import { createForecastEngine, prepareEngineContext } from "../engine";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
 import {
-	FIXED_N_ENGINE,
 	buildInput,
+	FIXED_N_ENGINE,
 	prague,
 	replay1113Fixture,
 } from "./fixtures-engine";

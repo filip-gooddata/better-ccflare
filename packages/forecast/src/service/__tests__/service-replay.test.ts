@@ -18,8 +18,8 @@ import { join } from "node:path";
 import { DatabaseOperations } from "@better-ccflare/database";
 import { validateForecastResponse } from "../../contract/validate";
 import {
-	REPLAY_ENGINE,
 	buildInput,
+	REPLAY_ENGINE,
 	replayFixture,
 } from "../../engine/__tests__/fixtures-engine";
 import { prague } from "../../engine/__tests__/fixtures-sim";

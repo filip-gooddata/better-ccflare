@@ -14,9 +14,9 @@ import { validateForecastResponse } from "../../contract";
 import type { ForecastBlock } from "../../types";
 import { createForecastEngine } from "../engine";
 import {
-	REPLAY_ENGINE,
 	buildInput,
 	prague,
+	REPLAY_ENGINE,
 	replay1113Fixture,
 } from "./fixtures-engine";
 import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
