@@ -84,6 +84,7 @@ export {
 	unregisterPollingRestarter,
 	unregisterRefreshClearer,
 } from "./handlers";
+export { clearCooldownOnCapacityRestored } from "./handlers/header-mark-out";
 export {
 	getModelCooldownsForAccount,
 	markModelCooling,

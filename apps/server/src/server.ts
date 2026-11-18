@@ -67,6 +67,7 @@ import {
 	AutoRefreshScheduler,
 	CacheKeepaliveScheduler,
 	drainUsageCollector,
+	clearCooldownOnCapacityRestored,
 	earliestCodexResetMs,
 	forceCloseCircuit,
 	getCodexModels,
@@ -1064,21 +1065,17 @@ function startUsagePollingWithRefresh(
 					// Usage API shows available capacity (<100%). If rate_limited_until is
 					// set in the future (seat-reassignment case), clear it now rather than
 					// waiting for the natural expiry timer — the polling loop has confirmed
-					// the seat is available again.
-					proxyContext.dbOps
-						.getAccount(accountId)
-						.then((acc) => {
-							if (
-								acc?.rate_limited_until &&
-								Number(acc.rate_limited_until) > Date.now()
-							) {
-								return proxyContext.dbOps
-									.forceResetAccountRateLimit(accountId)
-									.then(() => {
-										logger.info(
-											`Cleared stale rate_limited_until for account ${acc.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
-										);
-									});
+					// the seat is available again. An active overage_in_use bench is kept.
+					clearCooldownOnCapacityRestored(proxyContext.dbOps, accountId)
+						.then((outcome) => {
+							if (outcome === "cleared") {
+								logger.info(
+									`Cleared stale rate_limited_until for account ${accountId}: usage polling shows available capacity (seat reassignment or early reset)`,
+								);
+							} else if (outcome === "kept-bench") {
+								logger.info(
+									`Kept overage_in_use bench for account ${accountId}: it ends at its reset or on a reading showing both five-hour and weekly below 100%`,
+								);
 							}
 						})
 						.catch((err) =>

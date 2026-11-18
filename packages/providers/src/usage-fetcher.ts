@@ -331,13 +331,28 @@ export function extractModelFamilyWindows(
 	return rows;
 }
 
+/** Flat account windows a full reading is held for (admission's set). */
+const HELD_FLAT_WINDOWS = [
+	"five_hour",
+	"seven_day",
+	"seven_day_oauth_apps",
+] as const;
+
+/** `limits[]` kinds a full reading is held for. */
+const HELD_LIMIT_KINDS = new Set<unknown>([
+	"session",
+	"weekly_all",
+	"weekly_scoped",
+]);
+
 /** How long a full window holds when its reading gives no reset: a week. */
 const UNKNOWN_FULL_RESET_HOLD_MS = 7 * 24 * 3_600_000;
 
 /**
  * Until when a reading that shows a window full must stay in the cache: the
- * latest reset among its full windows (five-hour, weekly, and model-scoped
- * weekly rows, flat or `limits[]` shape), now plus a week when a full window
+ * latest reset among its full windows (five-hour, weekly, the flat
+ * `seven_day_oauth_apps` window, and model-scoped weekly rows, flat or
+ * `limits[]` shape), now plus a week when a full window
  * has no reset. Undefined when nothing in the reading is full; a full window
  * whose reset already passed holds nothing.
  */
@@ -347,13 +362,16 @@ export function fullReadingHoldUntil(
 ): number | undefined {
 	const d = data as UsageData;
 	const windows: StrategyUsageWindow[] = [];
-	const five = extractFiveHourWindow(d, "anthropic");
-	const seven = extractWeeklyWindow(d, "anthropic");
-	if (five) windows.push(five);
-	if (seven) windows.push(seven);
+	// Every shape admission reads as a limit: the flat account windows
+	// (including `seven_day_oauth_apps`) and every `limits[]` session,
+	// weekly_all and weekly_scoped row.
+	for (const key of HELD_FLAT_WINDOWS) {
+		const window = windowFrom(d[key], undefined);
+		if (window) windows.push(window);
+	}
 	if (Array.isArray(d.limits)) {
 		for (const limit of d.limits) {
-			if (limit?.kind !== "weekly_scoped") continue;
+			if (!limit || !HELD_LIMIT_KINDS.has(limit.kind)) continue;
 			if (typeof limit.percent !== "number") continue;
 			windows.push({
 				utilization: limit.percent,
@@ -1422,8 +1440,15 @@ class UsageCache {
 			this.capacityRestoredCallbacks.delete(accountId);
 			this.staleWeeklyResetCallbacks.delete(accountId);
 			this.snapshotCallbacks.delete(accountId);
-			// Clean up cache entry when polling stops to prevent memory leaks
-			this.cache.delete(accountId);
+			// Clean up cache entry when polling stops to prevent memory leaks,
+			// except a reading held until a full window's reset: a restart
+			// ("Refresh usage") must not drop it before a newer reading
+			// replaces it. Account removal drops it with delete(); otherwise
+			// the age sweep removes it once the hold ends.
+			const cached = this.cache.get(accountId);
+			if (!cached || !isHeld(cached, Date.now())) {
+				this.cache.delete(accountId);
+			}
 			this.invalidateInFlight(accountId);
 			this.usageRateLimitedUntil.delete(accountId);
 			// Clear any in-flight fetch so it doesn't linger after polling stops.

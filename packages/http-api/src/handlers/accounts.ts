@@ -1251,7 +1251,10 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// account to prevent memory leaks. `delete()` only clears the cache
 			// entry — `stopPolling()` also clears the timer and tracking maps,
 			// otherwise the poll loop keeps rescheduling itself forever.
+			// stopPolling() keeps a reading held until a full window's reset,
+			// so drop it explicitly.
 			usageCache.stopPolling(accountId);
+			usageCache.delete(accountId);
 
 			// Also clear token-manager state (in-flight refresh, failure/backoff
 			// counters) for the removed account — otherwise it lingers until the
