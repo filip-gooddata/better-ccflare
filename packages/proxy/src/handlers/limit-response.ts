@@ -303,11 +303,12 @@ function familyReading(
 }
 
 /**
- * Readings for one account from the usage cache. Binding: the family when
- * `family` is given and its window or block is full; else the full window of
- * five-hour and weekly (both full: the later reset, when the account is
- * usable again); if none is full, the window with the latest reset among
- * those at ≥ 100 %, else five_hour. Null when no usage is cached.
+ * Readings for one account from the usage cache. Binding: among the full
+ * limits (the family when `family` is given and its window or block is full,
+ * five-hour, weekly) the one with the latest reset, when the account is
+ * usable again; ties go to the family. If none is full, the window with the
+ * latest reset among those at ≥ 100 %, else five_hour. Null when no usage
+ * is cached.
  */
 export function localLimitInputForAccount(
 	accountId: string,
@@ -355,36 +356,42 @@ export function localLimitInputForAccount(
 				now,
 			)
 		: null;
+	const windows: Array<{
+		binding: LimitBinding;
+		reading: { utilization: number; resetMs: number | null } | null;
+	}> = [
+		{ binding: { kind: "five_hour" }, reading: fiveHour },
+		{ binding: { kind: "seven_day" }, reading: sevenDay },
+	];
+	const anyFull = windows.some((w) => isFull(w.reading, now));
+	const candidates: Array<{ binding: LimitBinding; resetMs: number | null }> =
+		[];
+	for (const w of windows) {
+		const qualifies = anyFull
+			? isFull(w.reading, now)
+			: (w.reading?.utilization ?? 0) >= 100;
+		if (qualifies && w.reading)
+			candidates.push({ binding: w.binding, resetMs: w.reading.resetMs });
+	}
+	// A full family competes with the full account-wide windows: the account
+	// is usable again only when every full limit has reset, so the latest
+	// reset binds. A window at >= 100 % whose reset has passed (not full)
+	// never outranks a full family.
 	if (opts.family && familyReset !== null) {
-		binding = { kind: "family", family: opts.family };
-		resetMs = familyReset;
-	} else {
-		const windows: Array<{
-			binding: LimitBinding;
-			reading: { utilization: number; resetMs: number | null } | null;
-		}> = [
-			{ binding: { kind: "five_hour" }, reading: fiveHour },
-			{ binding: { kind: "seven_day" }, reading: sevenDay },
-		];
-		const anyFull = windows.some((w) => isFull(w.reading, now));
-		const candidates: Array<{ binding: LimitBinding; resetMs: number | null }> =
-			[];
-		for (const w of windows) {
-			const qualifies = anyFull
-				? isFull(w.reading, now)
-				: (w.reading?.utilization ?? 0) >= 100;
-			if (qualifies && w.reading)
-				candidates.push({ binding: w.binding, resetMs: w.reading.resetMs });
-		}
-		let best: (typeof candidates)[number] | null = null;
-		for (const c of candidates) {
-			if (!best || (c.resetMs ?? -Infinity) > (best.resetMs ?? -Infinity))
-				best = c;
-		}
-		if (best) {
-			binding = best.binding;
-			resetMs = best.resetMs;
-		}
+		if (!anyFull) candidates.length = 0;
+		candidates.unshift({
+			binding: { kind: "family", family: opts.family },
+			resetMs: familyReset,
+		});
+	}
+	let best: (typeof candidates)[number] | null = null;
+	for (const c of candidates) {
+		if (!best || (c.resetMs ?? -Infinity) > (best.resetMs ?? -Infinity))
+			best = c;
+	}
+	if (best) {
+		binding = best.binding;
+		resetMs = best.resetMs;
 	}
 
 	return { binding, resetMs, fiveHour, sevenDay, overage };

@@ -483,6 +483,40 @@ describe("localLimitInputForAccount", () => {
 		expect(input?.resetMs).toBe(R7 * 1000 + HOUR);
 	});
 
+	it("binds a full account-wide window that resets after a full family", () => {
+		usageCache.set("acc-a", anthropicUsage({ five: 100, seven: 100 }) as never);
+		const familyReset = NOW + 1000;
+		const input = localLimitInputForAccount("acc-a", {
+			family: "fable",
+			familyResetMs: familyReset,
+			now: NOW,
+		});
+		expect(input?.binding).toEqual({ kind: "seven_day" });
+		expect(input?.resetMs).toBe(R7 * 1000);
+		const res = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ family: "fable", familyResetMs: familyReset, now: NOW },
+		);
+		expect(res.headers.get("retry-after")).toBe(
+			String(Math.floor(R7 - NOW / 1000)),
+		);
+		expect(
+			res.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBe("seven_day");
+	});
+
+	it("keeps the family binding when it resets after every full window", () => {
+		usageCache.set("acc-a", anthropicUsage({ five: 100, seven: 89 }) as never);
+		const familyReset = R7 * 1000 + HOUR;
+		const input = localLimitInputForAccount("acc-a", {
+			family: "fable",
+			familyResetMs: familyReset,
+			now: NOW,
+		});
+		expect(input?.binding).toEqual({ kind: "family", family: "fable" });
+		expect(input?.resetMs).toBe(familyReset);
+	});
+
 	it("leaves five_hour as the binding when nothing is full", () => {
 		usageCache.set("acc-a", anthropicUsage({ five: 50, seven: 60 }) as never);
 		const input = localLimitInputForAccount("acc-a", { now: NOW });
