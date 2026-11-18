@@ -241,10 +241,7 @@ describe("outer-fold exclusion (R3-2: held-out days never train)", () => {
 	const planted = () => {
 		const r = rng(7);
 		const level = Array.from({ length: 28 }, () => (r() < 0.5 ? 5 : 20));
-		return makeSeries(
-			28,
-			(i) => level[Math.floor(i / DAY_BUCKETS)] as number,
-		);
+		return makeSeries(28, (i) => level[Math.floor(i / DAY_BUCKETS)] as number);
 	};
 	const NOW = at(28, 0);
 	const comparable = (s: PaceFitState) => ({
@@ -270,7 +267,9 @@ describe("outer-fold exclusion (R3-2: held-out days never train)", () => {
 				lean: true,
 				excludeDays,
 			});
-			expect(base.selected.find((b) => b.band === "8-16h")?.feature).not.toBeNull();
+			expect(
+				base.selected.find((b) => b.band === "8-16h")?.feature,
+			).not.toBeNull();
 			expect(
 				comparable(
 					fitPaceModel(changed, NOW, undefined, { lean: true, excludeDays }),
