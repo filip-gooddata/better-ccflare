@@ -1,3 +1,5 @@
+import { PRESENT_PARTITION } from "../../engine/learn";
+import type { Partition, RowChoice } from "../../engine/learn/types";
 import { buildPaceSeries } from "../../engine/pace";
 import type { PaceSeries } from "../../engine/pace/types";
 import type { RefitDemandSettings } from "../../service/pace-refit-runner";
@@ -42,7 +44,50 @@ export function synthetic(days: number): {
 	return { series, historyFrom };
 }
 
-export function exportInput(days = 21): PaceExportInput {
+export const MON_FRI: Partition = [0, 0, 0, 0, 0, 1, 1];
+
+/** A stored row-1 choice that switched on, as forecast-jobs.test.ts stores one. */
+export const ON_CHOICE: RowChoice<Partition> = {
+	row: "daytypes",
+	m: 3,
+	floor: 4,
+	units: 6,
+	present: PRESENT_PARTITION,
+	chosen: MON_FRI,
+	runnerUp: PRESENT_PARTITION,
+	served: MON_FRI,
+	presentLoss: 2,
+	chosenLoss: 1,
+	gain: 1,
+	se: 0.25,
+	p: 0.01,
+	on: true,
+	reason: "on",
+};
+
+/** A stored row-1 choice with nothing scored: NaN losses, as selectRow returns it. */
+export const NO_UNITS_CHOICE: RowChoice<Partition> = {
+	row: "daytypes",
+	m: 3,
+	floor: 4,
+	units: 0,
+	present: PRESENT_PARTITION,
+	chosen: PRESENT_PARTITION,
+	runnerUp: null,
+	served: PRESENT_PARTITION,
+	presentLoss: Number.NaN,
+	chosenLoss: Number.NaN,
+	gain: 0,
+	se: 0,
+	p: 1,
+	on: false,
+	reason: "no-units",
+};
+
+export function exportInput(
+	days = 21,
+	rowOne: PaceExportInput["rowOne"] = { choice: ON_CHOICE, pending: null },
+): PaceExportInput {
 	const { series, historyFrom } = synthetic(days);
 	return {
 		series,
@@ -50,7 +95,7 @@ export function exportInput(days = 21): PaceExportInput {
 		historyFrom,
 		accountCount: 2,
 		settings: { ...SETTINGS },
-		rowOne: { served: [0, 0, 0, 0, 0, 1, 1], pending: null },
+		rowOne,
 	};
 }
 

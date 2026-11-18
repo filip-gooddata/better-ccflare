@@ -16,7 +16,12 @@ import {
 	paceExportIo,
 } from "../export";
 import { buildPaceExport, canonicalJson, paceExportHash } from "../format";
-import { captureLogger, exportInput } from "./fixture";
+import {
+	captureLogger,
+	exportInput,
+	NO_UNITS_CHOICE,
+	ON_CHOICE,
+} from "./fixture";
 
 let dir: string;
 beforeEach(() => {
@@ -104,7 +109,22 @@ describe("pace export: content", () => {
 			timeShiftMin: 30,
 		});
 		expect(file.rowOne).toEqual({
-			served: [0, 0, 0, 0, 0, 1, 1],
+			choice: {
+				m: 3,
+				floor: 4,
+				units: 6,
+				present: Array.from(ON_CHOICE.present),
+				chosen: [0, 0, 0, 0, 0, 1, 1],
+				runnerUp: Array.from(ON_CHOICE.present),
+				served: [0, 0, 0, 0, 0, 1, 1],
+				presentLoss: 2,
+				chosenLoss: 1,
+				gain: 1,
+				se: 0.25,
+				p: 0.01,
+				on: 1,
+				reason: 0,
+			},
 			pending: null,
 		});
 		expect(file.buckets.start).toBe(input.series.start);
@@ -158,6 +178,26 @@ describe("pace export: content", () => {
 		(moved.series.units as Float64Array)[5] += 0.5;
 		expect(buildPaceExport(moved, "1.2.3").hash).not.toBe(hash);
 		expect(buildPaceExport(input, "1.2.4").hash).not.toBe(hash);
+	});
+
+	it("a row-1 choice with NaN losses is stored with null, its reason as an index", () => {
+		const f = buildPaceExport(
+			exportInput(2, {
+				choice: NO_UNITS_CHOICE,
+				pending: [0, 0, 0, 0, 0, 1, 2],
+			}),
+			"1",
+		);
+		expect(f.rowOne?.choice.presentLoss).toBeNull();
+		expect(f.rowOne?.choice.chosenLoss).toBeNull();
+		expect(f.rowOne?.choice.reason).toBe(5);
+		expect(f.rowOne?.choice.on).toBe(0);
+		expect(f.rowOne?.pending).toEqual([0, 0, 0, 0, 0, 1, 2]);
+		expect(buildPaceExport(exportInput(2, null), "1").rowOne).toBeNull();
+		const otherRow = { ...ON_CHOICE, row: "pool" };
+		expect(() =>
+			buildPaceExport(exportInput(2, { choice: otherRow, pending: null }), "1"),
+		).toThrow("rowone");
 	});
 
 	it("canonical form: sorted keys, no whitespace", () => {
@@ -263,6 +303,26 @@ describe("pace export: write", () => {
 			"forecast pace export failed code=build",
 		]);
 		expect(readdirSync(dir)).toEqual([]);
+	});
+
+	it("concurrent exports to one target leave one complete 0600 file and no temp file", async () => {
+		const target = join(dir, "series.json");
+		const log = captureLogger();
+		const a = exportInput(3);
+		const b = exportInput(4);
+		await Promise.all([
+			exportPaceSeries(target, a, log.logger, "1"),
+			exportPaceSeries(target, b, log.logger, "1"),
+		]);
+		expect(readdirSync(dir)).toEqual(["series.json"]);
+		expect(statSync(target).mode & 0o777).toBe(0o600);
+		const hash = JSON.parse(readFileSync(target, "utf8")).hash;
+		expect([
+			buildPaceExport(a, "1").hash,
+			buildPaceExport(b, "1").hash,
+		]).toContain(hash);
+		expect(log.warns).toEqual([]);
+		expect(log.infos).toHaveLength(2);
 	});
 
 	it("snapshots the series before returning, so a later buffer transfer cannot change the file", async () => {

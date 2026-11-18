@@ -496,7 +496,7 @@ export function createForecastService(
 						accountCount: countedIds(limits).length,
 						settings: demand,
 						rowOne: stored && {
-							served: stored.choice.served,
+							choice: stored.choice,
 							pending: stored.pending,
 						},
 					};
