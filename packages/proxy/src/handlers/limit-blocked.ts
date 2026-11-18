@@ -26,8 +26,7 @@ import {
 	requestExcludedProviders,
 } from "./account-selector";
 import {
-	buildLocalLimitResponse,
-	getCachedLimitRefusal,
+	buildLocalCooldownResponse,
 	localLimitInputForAccount,
 	localLimitResponseForAccount,
 } from "./limit-response";
@@ -374,26 +373,24 @@ export function getLocalLimitAnswer(
 
 /**
  * The local 429 for `answer`: the account's cached real 429 replayed with
- * retry-after and date rebased while its reset is ahead, else one built from
- * its usage readings. An account out only on a cooldown, with no cached
- * refusal, gets the built 429 with the cooldown end as its reset, since that
- * is when it can serve again.
+ * retry-after and date rebased while its reset is ahead and its claim names
+ * the binding limit, else one built from its usage readings. An account out
+ * only on a cooldown has no full limit to claim: it gets the cooldown 429
+ * (no unified status, claim or reset; `retry-after` counted to the cooldown
+ * end; window headers from its readings), never a replayed refusal.
  */
 export function localLimitAnswerResponse(
 	answer: LocalLimitAnswer,
 	requestId: string,
 	now: number = Date.now(),
 ): Response {
-	if (
-		answer.cooldownResetMs !== null &&
-		!getCachedLimitRefusal(answer.account.id, now)
-	) {
-		const input = localLimitInputForAccount(answer.account.id, {
-			now,
-			provider: answer.account.provider ?? "anthropic",
-		}) ?? { binding: { kind: "five_hour" as const }, resetMs: null };
-		const response = buildLocalLimitResponse(
-			{ ...input, resetMs: answer.cooldownResetMs },
+	if (answer.cooldownResetMs !== null) {
+		const response = buildLocalCooldownResponse(
+			localLimitInputForAccount(answer.account.id, {
+				now,
+				provider: answer.account.provider ?? "anthropic",
+			}),
+			answer.cooldownResetMs,
 			now,
 		);
 		response.headers.set("x-better-ccflare-request-id", requestId);

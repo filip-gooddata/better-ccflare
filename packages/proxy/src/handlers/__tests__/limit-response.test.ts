@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { usageCache } from "@better-ccflare/providers";
 import {
+	buildLocalCooldownResponse,
 	buildLocalLimitResponse,
 	clearLimitRefusalCache,
 	getCachedLimitRefusal,
@@ -544,5 +545,225 @@ describe("localLimitInputForAccount", () => {
 		expect(input?.fiveHour).toEqual({ utilization: 100, resetMs: R5 * 1000 });
 		expect(input?.sevenDay).toEqual({ utilization: 30, resetMs: R7 * 1000 });
 		expect(input?.overage).toBeNull();
+	});
+});
+
+// ── fix1 part C: cooldown answers, unknown resets, family replay ───────────
+
+const CLAIM = "anthropic-ratelimit-unified-representative-claim";
+
+function refusalWith(claim: string, resetS: number): Headers {
+	const h = realHeaders();
+	h.set(CLAIM, claim);
+	h.set("anthropic-ratelimit-unified-reset", String(resetS));
+	return h;
+}
+
+describe("buildLocalCooldownResponse", () => {
+	it("stays a 429 but claims no limit and invents no reset", async () => {
+		const cooldownEnd = NOW + 7 * 60_000;
+		const res = buildLocalCooldownResponse(
+			{
+				fiveHour: { utilization: 42, resetMs: R5 * 1000 },
+				sevenDay: { utilization: 77, resetMs: R7 * 1000 },
+				overage: null,
+			},
+			cooldownEnd,
+			NOW,
+		);
+		expect(res.status).toBe(429);
+		const h = res.headers;
+		expect(h.get("content-type")).toBe("application/json");
+		expect(h.get("x-should-retry")).toBe("true");
+		expect(h.get("retry-after")).toBe(String(7 * 60));
+		expect(h.get("anthropic-ratelimit-unified-status")).toBeNull();
+		expect(h.get(CLAIM)).toBeNull();
+		expect(h.get("anthropic-ratelimit-unified-reset")).toBeNull();
+		// Window statuses come from the readings only.
+		expect(h.get("anthropic-ratelimit-unified-5h-status")).toBe("allowed");
+		expect(h.get("anthropic-ratelimit-unified-5h-reset")).toBe(String(R5));
+		expect(h.get("anthropic-ratelimit-unified-7d-status")).toBe(
+			"allowed_warning",
+		);
+		expectGrammar(h);
+		const body = (await res.json()) as { error: { type: string } };
+		expect(body.error.type).toBe("rate_limit_error");
+	});
+
+	it("sends the default retry-after and no window headers without readings", () => {
+		const res = buildLocalCooldownResponse(null, null, NOW);
+		const h = res.headers;
+		expect(h.get("retry-after")).toBe("60");
+		expect(h.get("anthropic-ratelimit-unified-status")).toBeNull();
+		expect(h.get(CLAIM)).toBeNull();
+		expect(h.get("anthropic-ratelimit-unified-5h-status")).toBeNull();
+		expect(h.get("anthropic-ratelimit-unified-7d-status")).toBeNull();
+	});
+});
+
+describe("exhausted limits with an unknown reset", () => {
+	it("binds an exhausted family whose usage row has no reset", () => {
+		usageCache.set("acc-a", {
+			five_hour: {
+				utilization: 40,
+				resets_at: new Date(R5 * 1000).toISOString(),
+			},
+			seven_day: {
+				utilization: 50,
+				resets_at: new Date(R7 * 1000).toISOString(),
+			},
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: null,
+					scope: { model: { display_name: "Fable" } },
+				},
+			],
+		} as never);
+		const res = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ family: "fable", familyResetMs: null, now: NOW },
+		);
+		const h = res.headers;
+		expect(h.get(CLAIM)).toBe("seven_day_fable");
+		expect(h.get("anthropic-ratelimit-unified-status")).toBe("rejected");
+		expect(h.get("anthropic-ratelimit-unified-reset")).toBeNull();
+		expect(h.get("retry-after")).toBe("60");
+	});
+
+	it("binds a family that admission holds out with no reset and no usage row", () => {
+		usageCache.set(
+			"acc-a",
+			anthropicUsage({ five: 40, seven: 50, fable: null }) as never,
+		);
+		const res = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ family: "fable", familyResetMs: null, now: NOW },
+		);
+		expect(res.headers.get(CLAIM)).toBe("seven_day_fable");
+		expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBeNull();
+	});
+
+	it("counts a five-hour window at 100 % with no reset as full, as admission does", () => {
+		usageCache.set(
+			"acc-a",
+			anthropicUsage({ five: 100, fiveReset: null, seven: 50 }) as never,
+		);
+		const input = localLimitInputForAccount("acc-a", { now: NOW });
+		expect(input?.binding).toEqual({ kind: "five_hour" });
+		expect(input?.resetMs).toBeNull();
+		if (!input) throw new Error("no readings");
+		const res = buildLocalLimitResponse(input, NOW);
+		expect(res.headers.get("anthropic-ratelimit-unified-5h-status")).toBe(
+			"rejected",
+		);
+	});
+
+	it("keeps a full window's known reset over a full window with no reset", () => {
+		usageCache.set(
+			"acc-a",
+			anthropicUsage({ five: 100, fiveReset: null, seven: 100 }) as never,
+		);
+		const input = localLimitInputForAccount("acc-a", { now: NOW });
+		expect(input?.binding).toEqual({ kind: "seven_day" });
+		expect(input?.resetMs).toBe(R7 * 1000);
+		if (!input) throw new Error("no readings");
+		const res = buildLocalLimitResponse(input, NOW);
+		expect(res.headers.get("anthropic-ratelimit-unified-5h-status")).toBe(
+			"rejected",
+		);
+		expect(res.headers.get("anthropic-ratelimit-unified-7d-status")).toBe(
+			"rejected",
+		);
+	});
+});
+
+describe("replay against the current binding", () => {
+	it("does not replay one family's refusal for another family", async () => {
+		rememberLimitRefusal(
+			"acc-a",
+			{
+				status: 429,
+				statusText: "Too Many Requests",
+				headers: refusalWith("seven_day_opus", R7),
+				body: REAL_BODY,
+			},
+			NOW,
+		);
+		expect(getCachedLimitRefusal("acc-a", NOW)?.claim).toBe("seven_day_opus");
+		const res = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ family: "fable", familyResetMs: R7 * 1000, now: NOW },
+		);
+		expect(res.headers.get(CLAIM)).toBe("seven_day_fable");
+		expect(res.headers.get("request-id")).toBeNull();
+		expect(new Uint8Array(await res.arrayBuffer())).not.toEqual(REAL_BODY);
+	});
+
+	it("replays a family refusal for the same family", async () => {
+		rememberLimitRefusal(
+			"acc-a",
+			{
+				status: 429,
+				statusText: "Too Many Requests",
+				headers: refusalWith("seven_day_fable", R7),
+				body: REAL_BODY,
+			},
+			NOW,
+		);
+		const res = localLimitResponseForAccount(
+			{ id: "acc-a" },
+			{ family: "Fable", familyResetMs: R7 * 1000, now: NOW },
+		);
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(REAL_BODY);
+		expect(res.headers.get(CLAIM)).toBe("seven_day_fable");
+	});
+
+	it("does not replay a family refusal for a request with no family", () => {
+		rememberLimitRefusal(
+			"acc-a",
+			{
+				status: 429,
+				statusText: "",
+				headers: refusalWith("seven_day_opus", R7),
+				body: REAL_BODY,
+			},
+			NOW,
+		);
+		usageCache.set("acc-a", anthropicUsage({ five: 100, seven: 50 }) as never);
+		const res = localLimitResponseForAccount({ id: "acc-a" }, { now: NOW });
+		expect(res.headers.get(CLAIM)).toBe("five_hour");
+		expect(res.headers.get("request-id")).toBeNull();
+	});
+
+	it("does not replay a five-hour refusal once the weekly limit binds", () => {
+		rememberLimitRefusal(
+			"acc-a",
+			{ status: 429, statusText: "", headers: realHeaders(), body: REAL_BODY },
+			NOW,
+		);
+		usageCache.set("acc-a", anthropicUsage({ five: 100, seven: 100 }) as never);
+		const res = localLimitResponseForAccount({ id: "acc-a" }, { now: NOW });
+		expect(res.headers.get(CLAIM)).toBe("seven_day");
+		expect(res.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+			String(R7),
+		);
+	});
+
+	it("replays a seven_day_overage_included refusal when the weekly limit binds", async () => {
+		rememberLimitRefusal(
+			"acc-a",
+			{
+				status: 429,
+				statusText: "",
+				headers: refusalWith("seven_day_overage_included", R7),
+				body: REAL_BODY,
+			},
+			NOW,
+		);
+		usageCache.set("acc-a", anthropicUsage({ five: 30, seven: 100 }) as never);
+		const res = localLimitResponseForAccount({ id: "acc-a" }, { now: NOW });
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(REAL_BODY);
 	});
 });
