@@ -461,6 +461,8 @@ The [interruption forecast](routing-architecture.md#interruption-forecast) sees 
 
 The setting is still accepted so old config files and API clients keep working: a config file that sets it starts unchanged, `GET`/`POST /api/config/use-extra-usage` still read and store it (see [api-http.md](api-http.md#get-apiconfiguse-extra-usage)), and `CCFLARE_USE_EXTRA_USAGE` still seeds the stored value once. When it is `true`, the server logs one warning at start saying it is ignored; `false` or unset logs nothing. The dashboard no longer shows a switch for it. It will be removed in a later release.
 
+The forced-account header `x-better-ccflare-account-id` no longer bypasses a full limit either. An account at 100% of its five-hour, weekly or model-family limit is not served through the header. Ordinary traffic forced to it falls back to normal selection, and gets the local 429 when no account is left. An auto-refresh probe forced to it gets that account's local 429 at once. An account benched because a response carried `overage-in-use: true` is treated the same way. See [Forced account and probes at a full limit](routing-architecture.md#session-pace-sessionpacestrategy).
+
 ## Night Window
 
 Some providers sell a cheaper completion tier for work that can wait. Sail Research, for example, prices `balanced` well below its default `asap` tier: the same request costs less per token, at the price of a queue of roughly 5–30 seconds before the first token. The night window lets you take that trade automatically for the hours when nobody is watching, without changing what your client sends.
