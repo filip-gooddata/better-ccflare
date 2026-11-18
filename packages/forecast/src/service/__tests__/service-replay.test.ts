@@ -4,13 +4,12 @@
  * clock, the timers, the demand store, the usage readings, the limits, the session tracker and the
  * pre-warm runner. No network and no `claude` CLI.
  *
- * At 07:00 the plan holds acct-b closed until 08:00 (amendment 5, E3: S +59.9 against +13.8 when it
- * opens at once); until then new sessions follow the base order. The record has acct-a's window at
- * 0 % at 06:12 and 60 % at 10:58; the fixture puts it on the straight line between them. At 08:00
- * (23 %) the planner, searching again from 08:00, holds acct-b once more, to 08:30 (S +77.7 against
- * +60.1 opening at once; 08:30 was not on the 07:00 grid of 0, 30, 60, 120 … minutes ahead). At
- * 08:30 (29 %) holding no longer gains the gate, so new sessions go to the idle acct-b with rule
- * `forecast-open`. The runner is never called.
+ * At 07:00 the plan holds acct-b closed until 08:30 (amendment 5, E3: S +76.9 against +13.7 when it
+ * opens at once; the quarter-hour grid reaches 08:30 from 07:00); until then new sessions follow the
+ * base order. The record has acct-a's window at 0 % at 06:12 and 60 % at 10:58; the fixture puts it
+ * on the straight line between them. At 08:00 (23 %) the planner, searching again, keeps the hold to
+ * 08:30 (S +76.9 against +59.8 opening at once). At 08:30 (29 %) holding no longer gains the gate,
+ * so new sessions go to the idle acct-b with rule `forecast-open`. The runner is never called.
  */
 import { afterAll, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -36,9 +35,9 @@ import type {
 import { createForecastService, type ForecastService } from "../service";
 
 const POLL_MS = 90_000;
-// amendment 5 (E1 to E3): the plan computed at 07:00 holds acct-b until 08:00 (10:00 before)
+// the second computation, during the hold (until F1 the 07:00 plan held acct-b to here, 10:00 before amendment 5)
 const OPEN_AT = prague(12, 8);
-// the plan computed at 08:00 holds it until 08:30
+// amendment 5 (E1 to E3) and the F1 quarter-hour grid: the plans computed at 07:00 and 08:00 hold acct-b until 08:30
 const REHOLD_AT = prague(12, 8, 30);
 
 const dirs: string[] = [];
@@ -160,7 +159,7 @@ function world() {
 }
 
 describe("forecast service with the real engine on the 2026-11-12 replay, pre-warm off", () => {
-	it("holds acct-b until 08:00, then until 08:30, then routes new sessions to it, and never pre-warms", async () => {
+	it("holds acct-b until 08:30 at 07:00 and again at 08:00, then routes new sessions to it, and never pre-warms", async () => {
 		const w = world();
 		expect(w.current.input.settings.prewarm).toBe(false);
 		expect(w.current.input.settings.routing).toBe(true);
@@ -168,22 +167,22 @@ describe("forecast service with the real engine on the 2026-11-12 replay, pre-wa
 		// 07:00, while the plan holds acct-b closed.
 		await w.computeAt(prague(12, 7));
 		const early = w.service.forecastView();
-		expect(early?.plan?.openAt).toEqual({ "acct-b": OPEN_AT });
+		expect(early?.plan?.openAt).toEqual({ "acct-b": REHOLD_AT });
 		const before = w.service.advisor.placeNewSession(w.clock.at);
 		expect(before?.rule).toBe("forecast-lookahead");
-		// "reset-soon" before amendment 5: the hold gains S 46.1 over opening acct-b at once
-		expect(before?.reason).toBe("low-point+46.1");
+		// "reset-soon" before amendment 5: the hold gains S 63.2 over opening acct-b at once
+		expect(before?.reason).toBe("low-point+63.2");
 		expect(before?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 		const morning = w.service.provider();
 		expect(morning.available).toBe(true);
 		expect(morning.prewarm).toEqual({
 			enabled: false,
-			planned: [{ accountId: "acct-b", openAt: OPEN_AT }],
+			planned: [{ accountId: "acct-b", openAt: REHOLD_AT }],
 			last: [],
 		});
 		expect(validateForecastResponse(morning)).toEqual([]);
 
-		// 08:00, the first hold ends; the plan computed now holds acct-b until 08:30.
+		// 08:00, during the hold; the plan computed now still holds acct-b until 08:30.
 		await w.computeAt(OPEN_AT, { usedPct: 23, resetsAt: prague(12, 11) });
 		expect(w.service.forecastView()?.plan?.openAt).toEqual({
 			"acct-b": REHOLD_AT,

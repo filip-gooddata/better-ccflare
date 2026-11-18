@@ -18,6 +18,7 @@ import {
 	plainPace,
 } from "../pace";
 import { buildInput, defaultSettings, replayFixture } from "./fixtures-engine";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const STATE: PaceFitState = {
 	fittedAt: 1_000,
@@ -144,14 +145,18 @@ describe("the pace in the engine", () => {
 		});
 	});
 
-	test("off gives exactly the unfitted forecast", async () => {
-		const engine = createForecastEngine({ noise: false });
-		const a = await engine.compute(input());
-		const b = await engine.compute(
-			input({ settings: off(), demandModel: STATE }),
-		);
-		if (!a.available || !b.available) throw new Error("no forecast");
-		expect(b.response).toEqual(a.response);
-		expect(b.plan).toEqual(a.plan);
-	});
+	test(
+		"off gives exactly the unfitted forecast",
+		async () => {
+			const engine = createForecastEngine({ noise: false });
+			const a = await engine.compute(input());
+			const b = await engine.compute(
+				input({ settings: off(), demandModel: STATE }),
+			);
+			if (!a.available || !b.available) throw new Error("no forecast");
+			expect(b.response).toEqual(a.response);
+			expect(b.plan).toEqual(a.plan);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });

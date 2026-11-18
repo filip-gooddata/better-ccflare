@@ -4,10 +4,10 @@
  * unserved demand counted below zero; the first step of the best plan is applied and the search runs
  * again at the next usage poll.
  */
-import { addLocalDays, atLocalMinute, localDayStart } from "../time";
 import type { EpochMs, MoveAdvice, PlacementAdvice, Plan } from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { moveCostUnits } from "./move-cost";
+import { localPeaks, quarterHourGrid, refineMarks } from "./opening-grid";
 import { levelOf } from "./percentile";
 import {
 	isOpenNow,
@@ -18,27 +18,58 @@ import {
 } from "./simulate";
 import { yieldToEventLoop } from "./yield";
 
-const MINUTE_MS = 60_000;
 /** The planner plans against the heavy day: 90th percentile of demand (settled decision 3). */
 const HEAVY_LEVEL = 90;
 /** Typical day: 50th percentile of demand (tie-break 2). */
 const TYPICAL_LEVEL = 50;
 /** Scores closer than this (points) are equal: float noise, not a difference. */
 const SCORE_EPS = 1e-9;
-/** Openings tried, minutes after now: now and the next few hours, enough to place a 5-hour window across a work day. */
-const OPEN_AHEAD_MIN = [0, 30, 60, 120, 180, 240] as const;
-/** With pre-warm on, openings also tried this many minutes before the learned work start: reaches across the night. */
-const OPEN_BEFORE_WORK_START_MIN = [300, 240, 180, 120, 60] as const;
-/** Best single openings per closed account carried into the combination search. */
-const OPENING_BEAM = 3;
-/** Most opening combinations simulated: (beam + 1)^closed accounts stays within it for up to 3 accounts. */
-const MAX_OPENING_COMBOS = 64;
-/** Most live sessions tried as move candidates (largest recent use first): keeps the search bounded. */
-const MAX_MOVE_SESSIONS = 3;
 /** Scores whose low points differ by at most this many points are tied (amendment 5, E2); also the placement tiers. */
 export const TIER_TOLERANCE_POINTS = 0.5;
-/** Gains below this many points are not named in a placement reason. */
-const REASON_MIN_GAIN_POINTS = 0.05;
+/** Decimals of every reported gain and cost: reason tokens and the numeric move fields. */
+const REPORT_DECIMALS = 1;
+/** The reported step, 0.1 points. */
+export const REPORT_STEP_POINTS = 10 ** -REPORT_DECIMALS;
+/** Gains below half the reported step print as 0.0, so they are not named in a placement reason (row 53). */
+export const REASON_MIN_GAIN_POINTS = REPORT_STEP_POINTS / 2;
+
+/** Options of one planner search. */
+export interface PlanSearchOptions {
+	/** Monotonic clock in ms; default performance.now. */
+	now?: () => number;
+	/**
+	 * On the `now` clock; none: unbounded. Checked before each simulation it may cut: combinations of
+	 * two or more openings, coordinate refinement and moves. A simulation admitted just before it
+	 * passes still runs (the search yields to the event loop first), and the work planForecast always
+	 * completes runs after it.
+	 */
+	deadline?: number;
+	/** The simulation; default simulate. A seam for tests that watch what the search keeps. */
+	simulate?: typeof simulate;
+}
+
+/** What one planner search covered. */
+export interface PlannerSearch {
+	/** Stage-1 opening times: now and every local quarter hour to the fine horizon (shared by every closed account). */
+	stage1: number;
+	/** Stage-2 opening times added around the peaks, summed over closed accounts. */
+	stage2: number;
+	/** Local peaks of the single-opening score curve, per closed account. */
+	peaks: Record<string, number>;
+	/** Opening combinations (rows with at least one opening) simulated or looked up, of those available. */
+	combos: { evaluated: number; available: number };
+	/**
+	 * Coordinate refinement after the combinations: passes started, plans looked up (cache hits
+	 * included) and times the best plan changed. Goes beyond the ruled peak beam (open decision).
+	 */
+	refine: { passes: number; evaluated: number; improved: number };
+	/** Move candidates (session, destination) simulated, of those available. */
+	moves: { evaluated: number; available: number };
+	/** True when the deadline stopped combinations or moves before all were tried. */
+	cutByDeadline: boolean;
+	/** Search time on the options' clock. */
+	elapsedMs: number;
+}
 
 /**
  * Score of one plan (design amendment 5, E2), in points of the pool (100 × counted accounts). Higher
@@ -308,10 +339,10 @@ export function decidingReason(
 	next: PlanScore,
 	stage: ScoreStage | null = pairStage(top, next),
 ): string | null {
-	// One decimal, or one significant digit for a gain that would show as 0.0.
+	// The reported step, or one significant digit for a gain that would show as 0.0.
 	const points = (value: number) =>
 		Math.abs(value) >= REASON_MIN_GAIN_POINTS
-			? value.toFixed(1)
+			? value.toFixed(REPORT_DECIMALS)
 			: String(Number(value.toPrecision(1)));
 	const other = () =>
 		top.weekLowPoints >= top.dayLowPoints ? "weekly-low" : "five-hour-low";
@@ -327,27 +358,18 @@ export function decidingReason(
 	return null;
 }
 
-/** Opening times tried for a closed window, ascending, inside [now, fineEnd). */
+/**
+ * Stage-1 opening times for a closed window, ascending: now and every local quarter hour in
+ * (now, fineEnd). The same with pre-warm on or off: with it off, the simulation opens a window only
+ * when demand is routed to it at or after the planned time.
+ */
 export function openingGrid(ctx: EngineContext): EpochMs[] {
-	const { now } = ctx;
-	const end = ctx.horizon.fineEnd;
-	const times = new Set<EpochMs>();
-	for (const minutes of OPEN_AHEAD_MIN) times.add(now + minutes * MINUTE_MS);
-	if (ctx.input.settings.prewarm && ctx.workStartMinute !== null) {
-		const minute = Math.round(ctx.workStartMinute);
-		const today = localDayStart(now, ctx.timeZone);
-		for (const day of [today, addLocalDays(today, 1, ctx.timeZone)]) {
-			const start = atLocalMinute(day, minute, ctx.timeZone);
-			for (const lead of OPEN_BEFORE_WORK_START_MIN)
-				times.add(start - lead * MINUTE_MS);
-		}
-	}
-	return [...times].filter((t) => t >= now && t < end).sort((a, b) => a - b);
+	return quarterHourGrid(ctx.now, ctx.horizon.fineEnd, ctx.timeZone);
 }
 
+/** A simulated plan and its score. The simulation itself (about 9 MB for 400 days) is not kept. */
 interface Evaluated {
 	plan: SimPlan;
-	result: SimulationResult;
 	score: PlanScore;
 }
 
@@ -364,7 +386,17 @@ function bestOf(candidates: Evaluated[]): Evaluated | null {
 	);
 }
 
-export async function planForecast(ctx: EngineContext): Promise<{
+/**
+ * The best plan for the coming hours. Always searched in full, so the plan is valid whatever the
+ * deadline: the baseline, every stage-1 and stage-2 single opening (and so every combination with one
+ * opening), the preference order, the pruning of openings and the placement. The deadline in
+ * `options` stops only the combinations of two or more openings, taken in order of their openings'
+ * single scores, and the move candidates, taken largest recent use first.
+ */
+export async function planForecast(
+	ctx: EngineContext,
+	options: PlanSearchOptions = {},
+): Promise<{
 	plan: Plan;
 	result: SimulationResult;
 	score: PlanScore;
@@ -373,15 +405,30 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	candidates: number;
 	/** Every candidate plan simulated with its score, in the order simulated (the baseline first). */
 	scored: { plan: SimPlan; score: PlanScore }[];
+	search: PlannerSearch;
 }> {
+	const clock = options.now ?? (() => performance.now());
+	const run = options.simulate ?? simulate;
+	const startedAt = clock();
+	const deadline = options.deadline ?? Number.POSITIVE_INFINITY;
+	let cutByDeadline = false;
+	const timeLeft = () => {
+		if (clock() < deadline) return true;
+		cutByDeadline = true;
+		return false;
+	};
+	// Scores only: the search simulates hundreds of plans, and keeping every simulation would hold
+	// gigabytes. The baseline's simulation is kept; the chosen plan's is simulated again at the end.
 	const cache = new Map<string, Evaluated>();
+	let baselineResult: SimulationResult | null = null;
 	const evaluate = async (plan: SimPlan): Promise<Evaluated> => {
 		const key = planKey(plan);
 		const known = cache.get(key);
 		if (known) return known;
 		if (cache.size > 0) await yieldToEventLoop();
-		const result = await simulate(ctx, plan);
-		const evaluated = { plan, result, score: scorePlan(ctx, result, plan) };
+		const result = await run(ctx, plan);
+		baselineResult ??= result;
+		const evaluated = { plan, score: scorePlan(ctx, result, plan) };
 		cache.set(key, evaluated);
 		return evaluated;
 	};
@@ -399,37 +446,98 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	const openMin = ctx.input.settings.openMinGainPoints;
 	const moveMin = ctx.input.settings.moveMinGainPoints;
 
-	// 1. Openings: each closed account's grid alone, then every combination of each account's best
-	// few openings (two openings may gain only together).
+	// 1. Openings: each closed account's stage-1 grid alone, then stage 2 around each local peak of
+	// that curve; the beam is every peak of the refined curve. Then the combinations of the beams (two
+	// openings may gain only together), in order of their openings' single scores.
 	const grid = openingGrid(ctx);
-	const beams: (EpochMs | null)[][] = [];
+	const end = ctx.horizon.fineEnd;
+	let stage2 = 0;
+	const peaks: Record<string, number> = {};
+	const beams: EpochMs[][] = [];
+	const singleTimes: EpochMs[][] = [];
 	for (const j of closed) {
-		const singles: { at: EpochMs; evaluated: Evaluated }[] = [];
-		for (const at of grid)
-			singles.push({
+		const singles = new Map<EpochMs, PlanScore>();
+		const single = async (at: EpochMs) => {
+			if (singles.has(at)) return;
+			singles.set(
 				at,
-				evaluated: await evaluate(withOpening(baseline.plan, j, at)),
-			});
-		beams.push([
-			null,
-			...openingBeam(
-				singles.map((x) => ({ at: x.at, score: x.evaluated.score })),
+				(await evaluate(withOpening(baseline.plan, j, at))).score,
+			);
+		};
+		for (const at of grid) await single(at);
+		for (const peak of singlePeaks(singles))
+			for (const at of refineMarks(peak, ctx.now, end, ctx.timeZone)) {
+				if (singles.has(at)) continue;
+				stage2++;
+				await single(at);
+			}
+		peaks[ctx.accounts[j].accountId] = singlePeaks(singles).length;
+		singleTimes.push([...singles.keys()].sort((a, b) => a - b));
+		beams.push(
+			openingBeam(
+				[...singles].map(([at, score]) => ({ at, score })),
 				baseline.score,
 				openMin,
 			),
-		]);
+		);
 	}
+	let combosEvaluated = 0;
 	const earners: Evaluated[] = [];
-	for (const combo of combinations(beams, MAX_OPENING_COMBOS)) {
+	for (const row of openingCombinations(beams)) {
+		const opened = row.filter((x) => x >= 0).length;
+		if (opened >= 2 && !timeLeft()) break;
 		const openAt = [...baseline.plan.openAt];
 		closed.forEach((j, x) => {
-			openAt[j] = combo[x];
+			openAt[j] = row[x] >= 0 ? beams[x][row[x]] : null;
 		});
 		const candidate = await evaluate({ ...baseline.plan, openAt });
+		combosEvaluated++;
 		if (openingEarns(candidate.score, baseline.score, openMin))
 			earners.push(candidate);
 	}
 	best = bestOf(earners) ?? best;
+
+	// Coordinate refinement (beyond the peak beam: staggered openings sit on slopes, not peaks): each
+	// closed account's full single grid with the others held at the best so far, under the same opening
+	// gate; repeated until nothing changes, never returning to a plan already chosen, until the deadline.
+	const refine = { passes: 0, evaluated: 0, improved: 0 };
+	const chosen = new Set([planKey(best.plan)]);
+	// The other accounts' openings at each account's last scan: a scan against the same ones is not repeated.
+	const scannedAgainst: (string | null)[] = closed.map(() => null);
+	refining: for (let changed = closed.length > 0; changed; ) {
+		changed = false;
+		refine.passes++;
+		for (const [x, j] of closed.entries()) {
+			const others = JSON.stringify(withOpening(best.plan, j, null).openAt);
+			if (scannedAgainst[x] === others) continue;
+			scannedAgainst[x] = others;
+			const tried: Evaluated[] = [best];
+			let cut = false;
+			for (const at of [null, ...singleTimes[x]]) {
+				if (!timeLeft()) {
+					cut = true;
+					break;
+				}
+				const candidate = await evaluate(withOpening(best.plan, j, at));
+				refine.evaluated++;
+				if (
+					candidate !== best &&
+					!chosen.has(planKey(candidate.plan)) &&
+					openingEarns(candidate.score, baseline.score, openMin)
+				)
+					tried.push(candidate);
+			}
+			const next = bestOf(tried);
+			if (next && next !== best && compareScores(next.score, best.score) < 0) {
+				best = next;
+				chosen.add(planKey(best.plan));
+				refine.improved++;
+				changed = true;
+			}
+			// Cut by the deadline: the best of the part scanned is kept, then the search moves on.
+			if (cut) break refining;
+		}
+	}
 
 	// 2. Order for unattached demand now: each account preferred in turn, ranked with the plan so far.
 	const preferences: Evaluated[] = [best];
@@ -451,26 +559,31 @@ export async function planForecast(ctx: EngineContext): Promise<{
 		}
 	}
 
-	// 3. At most one move of one warm live session; it pays its move cost inside the simulation.
+	// 3. At most one move of one warm live session; it pays its move cost inside the simulation. Every
+	// warm session with recent use, largest first, until the deadline.
 	let move: MoveAdvice | null = null;
 	const indexOf = new Map(ctx.accounts.map((a, j) => [a.accountId, j]));
 	const movable = warmSessions(ctx)
 		.filter((s) => s.recentUnits > 0)
-		.sort((a, b) => b.recentUnits - a.recentUnits)
-		.slice(0, MAX_MOVE_SESSIONS);
+		.sort((a, b) => b.recentUnits - a.recentUnits);
+	const moveCandidates = movable.flatMap((session) =>
+		ctx.accounts
+			.map((_, to) => to)
+			.filter(
+				(to) =>
+					to !== indexOf.get(session.accountId) && canTakeWorkNow(ctx, to),
+			)
+			.map((to) => ({ sessionId: session.sessionId, to })),
+	);
+	let movesEvaluated = 0;
 	const moves: Evaluated[] = [];
 	const noMove = best;
-	for (const session of movable) {
-		for (let to = 0; to < n; to++) {
-			if (to === indexOf.get(session.accountId) || !canTakeWorkNow(ctx, to))
-				continue;
-			const candidate = await evaluate({
-				...noMove.plan,
-				move: { sessionId: session.sessionId, to },
-			});
-			if (lowPointGain(candidate.score, noMove.score) >= moveMin)
-				moves.push(candidate);
-		}
+	for (const candidateMove of moveCandidates) {
+		if (!timeLeft()) break;
+		const candidate = await evaluate({ ...noMove.plan, move: candidateMove });
+		movesEvaluated++;
+		if (lowPointGain(candidate.score, noMove.score) >= moveMin)
+			moves.push(candidate);
 	}
 	const bestMove = bestOf(moves);
 	const bestMoveSession =
@@ -485,9 +598,9 @@ export async function planForecast(ctx: EngineContext): Promise<{
 			from: bestMoveSession.accountId,
 			to: target,
 			rule: "forecast-move",
-			reason: `low-point+${gain.toFixed(1)}`,
-			gainPoints: round1(gain),
-			costPoints: round1(
+			reason: `low-point+${gain.toFixed(REPORT_DECIMALS)}`,
+			gainPoints: toReportStep(gain),
+			costPoints: toReportStep(
 				moveCostUnits(bestMoveSession) *
 					(ctx.calibration.fiveHour[target] ?? 0),
 			),
@@ -502,6 +615,11 @@ export async function planForecast(ctx: EngineContext): Promise<{
 	const openAt: Record<string, EpochMs | null> = {};
 	for (const j of closed)
 		openAt[ctx.accounts[j].accountId] = best.plan.openAt[j] ?? null;
+	if (baselineResult === null) throw new Error("baseline not simulated");
+	const baselineSim: SimulationResult = baselineResult;
+	// The simulation is deterministic for one context, so the chosen plan's is the one it was scored on.
+	const bestResult =
+		best === baseline ? baselineSim : await run(ctx, best.plan);
 
 	return {
 		plan: {
@@ -511,16 +629,99 @@ export async function planForecast(ctx: EngineContext): Promise<{
 			moves: move ? [move] : [],
 			workStartMinute: ctx.workStartMinute,
 		},
-		result: best.result,
+		result: bestResult,
 		score: best.score,
-		baseline: { result: baseline.result, score: baseline.score },
+		baseline: { result: baselineSim, score: baseline.score },
 		candidates: cache.size,
 		scored: [...cache.values()].map(({ plan, score }) => ({ plan, score })),
+		search: {
+			stage1: grid.length,
+			stage2,
+			peaks,
+			combos: {
+				evaluated: combosEvaluated,
+				available: openingCombinationCount(beams),
+			},
+			refine,
+			moves: { evaluated: movesEvaluated, available: moveCandidates.length },
+			cutByDeadline,
+			elapsedMs: clock() - startedAt,
+		},
 	};
 }
 
-function round1(value: number): number {
-	return Math.round(value * 10) / 10;
+/** A value rounded to the reported step. */
+function toReportStep(value: number): number {
+	const scale = 10 ** REPORT_DECIMALS;
+	return Math.round(value * scale) / scale;
+}
+
+/** Opening times of one account's singles that are local peaks of its score curve, best first. */
+function singlePeaks(singles: Map<EpochMs, PlanScore>): EpochMs[] {
+	const ranked = rankedOpenings(
+		[...singles].map(([at, score]) => ({ at, score })),
+	);
+	const rank = new Map(ranked.map((x, r) => [x.at, r]));
+	const curve = [...singles.keys()].sort((a, b) => a - b);
+	return localPeaks(curve, (at) => rank.get(at) ?? 0).sort(
+		(a, b) => (rank.get(a) ?? 0) - (rank.get(b) ?? 0),
+	);
+}
+
+/** Singles in rankTiers order, the earlier opening breaking exact ties. */
+function rankedOpenings(
+	singles: { at: EpochMs; score: PlanScore }[],
+): { at: EpochMs; score: PlanScore }[] {
+	return rankTiers(
+		singles,
+		(x) => x.score,
+		(x) => x.at,
+	).flatMap((tier) => tier.map(({ item }) => item));
+}
+
+/**
+ * Opening combinations over the beams as rows of beam indices (-1: no opening), every row with at
+ * least one opening, generated lazily: first those with exactly one (each a single already scored),
+ * then the rest in order of the sum of their openings' beam positions (best singles first), then by
+ * the row itself (lexicographic, -1 first). Nothing is built beyond the rows taken.
+ */
+export function* openingCombinations(
+	beams: readonly EpochMs[][],
+): Generator<number[]> {
+	const lens = beams.map((b) => b.length);
+	const longest = Math.max(0, ...lens);
+	for (let sum = 0; sum < longest; sum++)
+		for (let x = lens.length - 1; x >= 0; x--)
+			if (sum < lens[x]) yield lens.map((_, y) => (y === x ? sum : -1));
+	// Largest position sum still reachable from account x onwards.
+	const reach = lens.map((_, x) =>
+		lens.slice(x).reduce((total, len) => total + Math.max(len - 1, 0), 0),
+	);
+	const row: number[] = [];
+	function* withSum(
+		x: number,
+		left: number,
+		opened: number,
+	): Generator<number[]> {
+		if (x === lens.length) {
+			if (left === 0 && opened >= 2) yield [...row];
+			return;
+		}
+		for (let i = -1; i < lens[x]; i++) {
+			const part = Math.max(i, 0);
+			if (part > left) break;
+			if (left - part > (reach[x + 1] ?? 0)) continue;
+			row.push(i);
+			yield* withSum(x + 1, left - part, opened + (i >= 0 ? 1 : 0));
+			row.pop();
+		}
+	}
+	for (let sum = 0; sum <= (reach[0] ?? 0); sum++) yield* withSum(0, sum, 0);
+}
+
+/** How many rows openingCombinations yields: every choice per account, less the row with none. */
+export function openingCombinationCount(beams: readonly EpochMs[][]): number {
+	return beams.reduce((product, beam) => product * (beam.length + 1), 1) - 1;
 }
 
 /**
@@ -645,7 +846,7 @@ export function placementOf(
 	const ahead = plannedAt != null ? openingReason(gain) : null;
 	if (ahead) reason = ahead;
 	else if (gain >= REASON_MIN_GAIN_POINTS)
-		reason = `low-point+${gain.toFixed(1)}`;
+		reason = `low-point+${gain.toFixed(REPORT_DECIMALS)}`;
 	else if (resetsFirst(ctx, first)) reason = "reset-soon";
 	else {
 		// The stage on which the second account dropped from the first account's tier (null inside
@@ -677,51 +878,32 @@ export function placementOf(
  */
 export function openingReason(gainPoints: number): string | null {
 	return gainPoints >= REASON_MIN_GAIN_POINTS
-		? `open-ahead+${gainPoints.toFixed(1)}`
+		? `open-ahead+${gainPoints.toFixed(REPORT_DECIMALS)}`
 		: null;
 }
 
 /**
- * Best single openings of one closed account carried into the combination search: the OPENING_BEAM
- * best by score, except that the last place goes to the best opening that earns its place alone
- * (openingEarns) when none of the others does; a tie that shortens the heavy stop may rank below
- * openings that raise item 1 too little to count.
+ * Single openings of one closed account carried into the combination search, best first: every
+ * local peak of its score curve in time order (rankTiers order, the earlier opening breaking exact
+ * ties, so a plateau peaks once), and the best opening that earns its place alone (openingEarns)
+ * when no peak does; a tie that shortens the heavy stop may rank below openings that raise item 1
+ * too little to count.
  */
 export function openingBeam(
 	singles: { at: EpochMs; score: PlanScore }[],
 	baseline: PlanScore,
 	openMinGainPoints: number,
 ): EpochMs[] {
-	const sorted = rankTiers(
-		singles,
-		(x) => x.score,
-		(x) => x.at,
-	).flatMap((tier) => tier.map(({ item }) => item));
-	const beam = sorted.slice(0, OPENING_BEAM);
+	const ranked = rankedOpenings(singles);
+	const beam = singlePeaks(new Map(singles.map((x) => [x.at, x.score])));
 	const earns = (x: { score: PlanScore }) =>
 		openingEarns(x.score, baseline, openMinGainPoints);
-	if (beam.length === OPENING_BEAM && !beam.some(earns)) {
-		const earner = sorted.slice(OPENING_BEAM).find(earns);
-		if (earner) beam[OPENING_BEAM - 1] = earner;
+	const inBeam = new Set(beam);
+	if (!ranked.some((x) => inBeam.has(x.at) && earns(x))) {
+		const earner = ranked.find((x) => !inBeam.has(x.at) && earns(x));
+		if (earner) beam.push(earner.at);
 	}
-	return beam.map((x) => x.at);
-}
-
-/** Cartesian product of the choices, or only the one-change-at-a-time rows when it exceeds `limit`. */
-function combinations<T>(choices: T[][], limit: number): T[][] {
-	const size = choices.reduce((product, c) => product * c.length, 1);
-	if (size > limit) {
-		const rows: T[][] = [choices.map((c) => c[0])];
-		choices.forEach((c, x) => {
-			for (const value of c.slice(1))
-				rows.push(choices.map((d, y) => (y === x ? value : d[0])));
-		});
-		return rows;
-	}
-	let rows: T[][] = [[]];
-	for (const c of choices)
-		rows = rows.flatMap((row) => c.map((value) => [...row, value]));
-	return rows;
+	return beam;
 }
 
 /** Not paused by a cooldown, weekly not used up, and no full 5-hour window. */
