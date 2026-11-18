@@ -36,7 +36,7 @@ const MAX_OPENING_COMBOS = 64;
 /** Most live sessions tried as move candidates (largest recent use first): keeps the search bounded. */
 const MAX_MOVE_SESSIONS = 3;
 /** Scores whose low points differ by at most this many points are tied (amendment 5, E2); also the placement tiers. */
-const TIER_TOLERANCE_POINTS = 0.5;
+export const TIER_TOLERANCE_POINTS = 0.5;
 /** Gains below this many points are not named in a placement reason. */
 const REASON_MIN_GAIN_POINTS = 0.05;
 
