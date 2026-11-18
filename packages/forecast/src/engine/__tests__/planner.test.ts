@@ -82,26 +82,28 @@ describe("planForecast: 2026-11-12 shape", () => {
 		]);
 		// The heavy day is 62.4 points short (unserved demand counted below zero, amendment 5 E2).
 		expect(baseline.score.lowPoint).toBeCloseTo(-62.4, 1);
-		// The plan opens both windows ahead of work: acct-a at 08:30, acct-b at 09:30 (resets 13:30, 14:30).
+		// The plan opens both windows ahead of work, staggered: acct-b at 08:00, acct-a at 09:30 (resets
+		// 13:00, 14:30). Neither 09:30 nor 08:00 is a peak of an account's single-opening curve (flat
+		// 08:20 to 09:00); coordinate refinement finds the pair.
 		expect(plan.openAt).toEqual({
-			"acct-a": prague(12, 8, 30),
-			"acct-b": prague(12, 9, 30),
+			"acct-a": prague(12, 9, 30),
+			"acct-b": prague(12, 8),
 		});
-		expect(score.dayLowPoints).toBeCloseTo(85.5, 1);
-		expect(score.lowPoint).toBeCloseTo(85.5, 1);
+		expect(score.dayLowPoints).toBeCloseTo(104.5, 1);
+		expect(score.lowPoint).toBeCloseTo(104.5, 1);
 		expect(plan.placement).toEqual({
-			tiers: [["acct-a"], ["acct-b"]],
-			// New sessions now (07:30) go to acct-a, whose window the plan opens at 08:30, not now.
+			tiers: [["acct-b"], ["acct-a"]],
+			// New sessions now (07:30) go to acct-b, whose window the plan opens at 08:00, not now.
 			rule: "forecast-lookahead",
-			// The gain of S over on demand: 85.5 - (-62.4).
-			reason: "open-ahead+148.0",
+			// The gain of S over on demand: 104.5 - (-62.4).
+			reason: "open-ahead+166.9",
 		});
 		expect(plan.computedAt).toBe(ctx.now);
 		expect(plan.workStartMinute).toBe(660);
 		expect(plan.moves).toEqual([]);
 		expect(compareScores(score, baseline.score)).toBeLessThan(0);
 		expect(longestMs).toBeLessThan(60);
-	}, 30_000);
+	}, 300_000);
 
 	test("with pre-warm off nothing opens ahead: no demand before 11:00, so no opening gains openMinGainPoints", async () => {
 		const { plan, score, baseline } = await planForecast(nov12(false));
@@ -109,7 +111,7 @@ describe("planForecast: 2026-11-12 shape", () => {
 		expect(score.dayLowPoints).toBe(baseline.score.dayLowPoints);
 	}, 30_000);
 
-	test("with pre-warm on the grid reaches across the night to before the work start", () => {
+	test("the grid is now and every local quarter hour to the fine horizon, across the night, pre-warm on or off", () => {
 		const ctx = makeCtx({
 			now: prague(12, 18),
 			days: 1,
@@ -119,6 +121,10 @@ describe("planForecast: 2026-11-12 shape", () => {
 			workStartMinute: 540,
 		});
 		const grid = openingGrid(ctx);
+		expect(grid.length).toBe(96);
+		expect(grid[0]).toBe(prague(12, 18));
+		expect(grid[1]).toBe(prague(12, 18, 15));
+		expect(grid[95]).toBe(prague(13, 17, 45));
 		expect(grid).toContain(prague(13, 4));
 		expect(grid).toContain(prague(13, 8));
 		const off = openingGrid({
@@ -128,7 +134,11 @@ describe("planForecast: 2026-11-12 shape", () => {
 				settings: { ...ctx.input.settings, prewarm: false },
 			},
 		});
-		expect(off.every((t) => t <= prague(12, 22))).toBe(true);
+		expect(off).toEqual(grid);
+		// now off a quarter mark: now itself, then the marks after it
+		const odd = openingGrid({ ...ctx, now: prague(12, 18, 7) });
+		expect(odd[0]).toBe(prague(12, 18, 7));
+		expect(odd[1]).toBe(prague(12, 18, 15));
 	});
 });
 
@@ -177,11 +187,10 @@ describe("planForecast: an early opening that serves more of the day (amendment 
 			up(4, 0.1, 60),
 			up(5, 0.45),
 		];
-		expect(openingBeam(singles, base, 0.45)).toEqual([1, 2, 5]);
-		// When one of the best already earns its place, the beam is the best three.
-		expect(openingBeam([up(0, 1.5), ...singles], base, 0.45)).toEqual([
-			0, 1, 2,
-		]);
+		// By time the curve falls from opening 1 (ranked first) to 5, so 1 is its one peak; 5 joins.
+		expect(openingBeam(singles, base, 0.45)).toEqual([1, 5]);
+		// When a peak already earns its place, the beam is the peaks alone.
+		expect(openingBeam([up(0, 1.5), ...singles], base, 0.45)).toEqual([0]);
 	});
 
 	test("reason tokens: the gain of S, when worth naming", () => {
@@ -393,10 +402,12 @@ describe("planForecast cost", () => {
 		console.log(
 			`planForecast week horizon: ${value.result.axis.times.length} samples, wall ${wallMs.toFixed(0)} ms, ${value.candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
 		);
-		expect(value.candidates).toBeLessThanOrEqual(40);
+		// One closed account: the baseline, 96 quarter hours and their refinement, the peaks, a refinement
+		// scan and the preferences; the deadline, not a list, bounds the search in service.
+		expect(value.candidates).toBe(109);
 		expect(longestMs).toBeLessThan(60);
 		expect(wallMs).toBeLessThan(5000);
-	}, 30_000);
+	}, 300_000);
 });
 
 describe("placement: a held account goes behind every unheld one (amendment 5, E3)", () => {

@@ -101,7 +101,8 @@ describe("opening beam", () => {
 			{ at: 12, score: up(10.2, 31) },
 			{ at: 14, score: up(9.4, 40) },
 		];
-		const want = [11, 12, 13];
+		// Ranked 11, 12, 13, 14 and in that time order too: 11 is the curve's one peak.
+		const want = [11];
 		const perms = (xs: typeof singles): (typeof singles)[] =>
 			xs.length <= 1
 				? [xs]
