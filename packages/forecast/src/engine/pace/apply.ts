@@ -30,17 +30,20 @@ export function applyPace(
 		Math.min(series.units.length, Math.floor((now - series.start) / BUCKET_MS)),
 	);
 	const last = PACE_BANDS[PACE_BANDS.length - 1] as { toMin: number };
+	const names: readonly string[] = state.dayTypes?.names ?? DAY_TYPES;
+	const group: ArrayLike<number> = state.dayTypes?.group ?? PRESENT_GROUP;
 	const cal = buildCalendar(
 		series.start,
 		o + last.toMin / 5 + 1,
 		series.timeZone,
+		group,
 	);
 	const ctx = new GrammarContext(cal);
-	const profile = DAY_TYPES.map((t) => state.baseline[t]);
+	const profile = names.map((t) => state.baseline[t] as number[]);
 	const P: SpanSums = {
 		PU: prefix(series.units, o),
 		PC: prefix(series.censored, o),
-		PB: baselinePrefix(cal, profile, PRESENT_GROUP, o),
+		PB: baselinePrefix(cal, profile, group, o),
 	};
 	const hour = Math.round((cal.minute[o] as number) / 60) % 24;
 	state.bands.forEach((fit, k) => {
@@ -49,7 +52,7 @@ export function applyPace(
 		if (!band || !c) return;
 		const a = o + band.fromMin / 5;
 		const b = o + band.toMin / 5;
-		const dayType = DAY_TYPES[cal.dtype[a] as number];
+		const dayType = names[cal.dtype[a] as number];
 		const cell = fit.cells.find(
 			(x) => x.dayType === dayType && x.hour === hour,
 		);

@@ -16,6 +16,7 @@ import type {
 import { BUCKET_MS } from "../../types";
 import { buildDayTable, poolFor } from "../days";
 import { computeHorizon } from "../horizon";
+import { type LearnedDemand, presentDemand } from "../learn";
 import type { DayTable, RecordedDay } from "../model";
 import { type PaceNow, paceMultiplierAt, plainPace } from "../pace";
 import {
@@ -51,7 +52,6 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		openMinGainPoints: 1,
 		historyHalfLifeDays: 14,
 		historyLookbackDays: 28,
-		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,
@@ -230,7 +230,6 @@ describe("buildScenarios", () => {
 	test("noise off: every later-date simulated day is one recorded day of its pool, bucket for bucket", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 60,
-			recentTauMin: 0.001,
 		});
 		const sc = await buildScenarios(
 			input,
@@ -277,7 +276,6 @@ describe("buildScenarios", () => {
 		// τ = 60: a last-hour blend, were one left, would move today's first hours
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 40,
-			recentTauMin: 60,
 		});
 		const off = await buildScenarios(
 			input,
@@ -320,7 +318,6 @@ describe("buildScenarios", () => {
 	test("a burst in the last hour of history leaves the plain lines unchanged: no fixed 60-minute recent window", async () => {
 		const { input, horizon } = setup(NOW, {
 			simulatedDays: 20,
-			recentTauMin: 60,
 		});
 		const burst: ForecastInput = {
 			...input,
@@ -441,7 +438,6 @@ describe("buildScenarios", () => {
 	test("noise on draws the same days as noise off (same random stream), scaled", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 30,
-			recentTauMin: 0.001,
 			timeShiftMin: 0,
 		});
 		const off = await buildScenarios(
@@ -478,7 +474,6 @@ describe("buildScenarios", () => {
 	test("deterministic for one local day; another local day draws differently", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 40,
-			recentTauMin: 0.001,
 		});
 		const a = await buildScenarios(
 			input,
@@ -499,7 +494,6 @@ describe("buildScenarios", () => {
 		// same day, an hour later: the same draws for later dates
 		const later = setup(NOW + 3_600_000, {
 			simulatedDays: 40,
-			recentTauMin: 0.001,
 		});
 		const c = await buildScenarios(
 			later.input,
@@ -532,7 +526,7 @@ describe("buildScenarios", () => {
 	});
 
 	test("a longer horizon leaves the draws of the shared dates unchanged", async () => {
-		const input = makeInput(NOW, { simulatedDays: 30, recentTauMin: 0.001 });
+		const input = makeInput(NOW, { simulatedDays: 30 });
 		const table = buildDayTable(input);
 		const short = computeHorizon(NOW, [account(NOW + 2 * DAY)], TZ);
 		const long = computeHorizon(NOW, [account(NOW + 7 * DAY)], TZ);
@@ -548,7 +542,6 @@ describe("buildScenarios", () => {
 	test("a date whose pool is empty draws from all recorded days", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 20,
-			recentTauMin: 0.001,
 		});
 		const noWeekends: DayTable = {
 			...table,
@@ -580,7 +573,7 @@ describe("buildScenarios", () => {
 	});
 
 	test("weekends without buckets are recorded zero days: the fallback does not fire", async () => {
-		const input = makeInput(NOW, { simulatedDays: 20, recentTauMin: 0.001 });
+		const input = makeInput(NOW, { simulatedDays: 20 });
 		const weekdaysOnly: ForecastInput = {
 			...input,
 			history: input.history.filter(
@@ -611,7 +604,6 @@ describe("buildScenarios", () => {
 	test("time noise shifts the recorded day by whole buckets within ±timeShiftMin", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 60,
-			recentTauMin: 0.001,
 			timeShiftMin: 30,
 		});
 		// equal totals: zero scale bandwidth, so only the time shift acts
@@ -665,7 +657,6 @@ describe("buildScenarios", () => {
 		const now = Date.UTC(2026, 2, 27, 9, 0);
 		const { input, table, horizon } = setup(now, {
 			simulatedDays: 20,
-			recentTauMin: 0.001,
 		});
 		const sc = await buildScenarios(
 			input,
@@ -794,7 +785,7 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 	async function futureDateLogTotals(
 		noiseMode: "shrunk" | "unshrunk" | "off",
 	): Promise<{ logs: number[]; pool: RecordedDay[] }> {
-		const input = makeInput(NOW, { recentTauMin: 0.001 });
+		const input = makeInput(NOW);
 		const table = buildDayTable(input);
 		const horizon = computeHorizon(NOW, input.accounts, TZ);
 		const todayStart = localDayStart(NOW, TZ);
@@ -888,5 +879,199 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 				4,
 			);
 		}
+	});
+});
+
+describe("buildScenarios served demand (F2)", () => {
+	function setup(over: Partial<ForecastSettings> = {}) {
+		const input = makeInput(NOW, { simulatedDays: 30, ...over });
+		const table = buildDayTable(input);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		return { input, table, horizon };
+	}
+	const present = (s: ForecastSettings): LearnedDemand => presentDemand(s);
+
+	test("learnedDemand = presentDemand(settings) is the same output as no learnedDemand", async () => {
+		const { input, table, horizon } = setup();
+		const a = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const b = await buildScenarios(
+			{ ...input, learnedDemand: present(input.settings) },
+			table,
+			horizon,
+			{},
+			PLAIN,
+		);
+		expect(b).toEqual(a);
+	});
+
+	test("row 20: the served jitter bound replaces timeShiftMin", async () => {
+		const { input, table, horizon } = setup({ timeShiftMin: 0 });
+		const zero = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const shifted = setup({ timeShiftMin: 30 });
+		const served = await buildScenarios(
+			{
+				...shifted.input,
+				learnedDemand: {
+					...present(shifted.input.settings),
+					jitterMin: 0,
+				},
+			},
+			shifted.table,
+			shifted.horizon,
+			{},
+			PLAIN,
+		);
+		expect(served).toEqual(zero);
+	});
+
+	test("row 18: bandwidth multiplied by 2^(k/2)", async () => {
+		const { input, table, horizon } = setup();
+		const a = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const b = await buildScenarios(
+			{
+				...input,
+				learnedDemand: { ...present(input.settings), bandwidthK: 2 },
+			},
+			table,
+			horizon,
+			{},
+			PLAIN,
+		);
+		const keys = Object.keys(a.diagnostics.bandwidths);
+		expect(keys.length).toBeGreaterThan(0);
+		for (const k of keys)
+			expect(b.diagnostics.bandwidths[k]).toBeCloseTo(
+				2 * (a.diagnostics.bandwidths[k] as number),
+				12,
+			);
+	});
+
+	test("row 2: numeric tau draws w·own + (1-w)·all; tau 0 keeps own, Infinity pools all", async () => {
+		const { input, horizon } = setup();
+		const weekdaysOnly = {
+			...input,
+			history: input.history.filter(
+				(b) => localParts(b.start, TZ).isoWeekday <= 5,
+			),
+		};
+		const t = buildDayTable(weekdaysOnly);
+		const satStart = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
+		expect(localDayKey(satStart, TZ)).toBe("2026-11-14");
+		const satSum = async (poolTau: LearnedDemand["poolTau"]) => {
+			const sc = await buildScenarios(
+				{
+					...weekdaysOnly,
+					learnedDemand: { ...present(input.settings), poolTau },
+				},
+				t,
+				horizon,
+				{},
+				PLAIN,
+			);
+			const from = (satStart - sc.start) / BUCKET_MS;
+			const to = (addLocalDays(satStart, 1, TZ) - sc.start) / BUCKET_MS;
+			let sum = 0;
+			for (const u of sc.units)
+				for (let j = from; j < to; j++) sum += u[j] as number;
+			return sum;
+		};
+		expect(await satSum("hard3")).toBe(0);
+		expect(await satSum(0)).toBe(0);
+		expect(await satSum(Number.POSITIVE_INFINITY)).toBeGreaterThan(0);
+		expect(await satSum(4)).toBeGreaterThan(0);
+	});
+});
+
+describe("scenario pools follow the served E4 partition (R3-4)", () => {
+	const ONE: number[] = [0, 0, 0, 0, 0, 0, 0];
+	function setup(over: Partial<ForecastSettings> = {}) {
+		const input = makeInput(NOW, {
+			simulatedDays: 30,
+			paceConditioning: true,
+			...over,
+		});
+		const table = buildDayTable(input);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		return { input, table, horizon };
+	}
+	/** A served E4 state fitted under `group` (only its partition is read here). */
+	const fitUnder = (group: number[] | null) =>
+		(group
+			? { dayTypes: { names: ["all"], group } }
+			: {}) as unknown as ForecastInput["demandModel"];
+	const run = (input: ForecastInput, s: ReturnType<typeof setup>) =>
+		buildScenarios(input, s.table, s.horizon, {}, PLAIN);
+
+	test("a learned partition with no E4 state served draws the present pools", async () => {
+		const s = setup();
+		const plain = await run(s.input, s);
+		const learned = await run(
+			{
+				...s.input,
+				demandModel: null,
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(learned).toEqual(plain);
+	});
+
+	test("a learned partition differing from the served E4 state's draws the state's pools", async () => {
+		const s = setup();
+		const plain = await run({ ...s.input, demandModel: fitUnder(null) }, s);
+		const learned = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(null),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(learned).toEqual(plain);
+	});
+
+	test("settings change: present learned demand with an E4 fit of another partition draws that fit's pools", async () => {
+		const s = setup();
+		const paired = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		const present = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(null),
+				learnedDemand: presentDemand(s.input.settings),
+			},
+			s,
+		);
+		expect(paired).not.toEqual(present);
+		// the service serves presentDemand(new settings) while the last fit (under ONE) stays served
+		const transition = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: presentDemand(s.input.settings),
+			},
+			s,
+		);
+		expect(transition).toEqual(paired);
+	});
+
+	test("pace off serves no E4 state: present pools whatever state is stored", async () => {
+		const s = setup({ paceConditioning: false });
+		const plain = await run(s.input, s);
+		const off = await run(
+			{
+				...s.input,
+				demandModel: fitUnder(ONE),
+				learnedDemand: { ...presentDemand(s.input.settings), partition: ONE },
+			},
+			s,
+		);
+		expect(off).toEqual(plain);
 	});
 });

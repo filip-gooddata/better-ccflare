@@ -44,7 +44,6 @@ const DEFAULTS = {
 	openMinGainPoints: 1,
 	historyHalfLifeDays: 14,
 	historyLookbackDays: 84,
-	recentTauMin: 45,
 	sessionTurnoverMin: 60,
 	workStartSharePct: 5,
 	paceConditioning: true,
@@ -78,6 +77,16 @@ describe("resolveForecastSettings", () => {
 		expect(settings.fanLevels).toEqual([12, 24, 38, 62, 76, 88]);
 	});
 
+	it("has no recentTauMin and ignores its old environment variable and config key", () => {
+		const legacy: Record<string, unknown> = { forecast_recent_tau_min: 30 };
+		const { settings, warnings } = resolve(
+			{ FORECAST_RECENT_TAU_MIN: "20" },
+			legacy as ForecastConfigData,
+		);
+		expect(Object.keys(settings)).not.toContain("recentTauMin");
+		expect(warnings).toEqual([]);
+	});
+
 	it("reads every setting from the config file", () => {
 		const { settings, warnings } = resolve(
 			{},
@@ -101,7 +110,6 @@ describe("resolveForecastSettings", () => {
 				forecast_open_min_gain_points: 1.5,
 				forecast_history_half_life_days: 7,
 				forecast_history_lookback_days: 28,
-				forecast_recent_tau_min: 30,
 				forecast_session_turnover_min: 90,
 				forecast_work_start_share_pct: 12.5,
 				forecast_pace_conditioning: false,
@@ -128,7 +136,6 @@ describe("resolveForecastSettings", () => {
 			openMinGainPoints: 1.5,
 			historyHalfLifeDays: 7,
 			historyLookbackDays: 28,
-			recentTauMin: 30,
 			sessionTurnoverMin: 90,
 			workStartSharePct: 12.5,
 			paceConditioning: false,
@@ -146,7 +153,6 @@ describe("resolveForecastSettings", () => {
 				FORECAST_PREWARM_TEST: '{"account":"work","at":1794560000000}',
 				FORECAST_CLAUDE_PATH: "/opt/claude",
 				FORECAST_PREWARM_MODEL: "sonnet",
-				FORECAST_RECENT_TAU_MIN: "20",
 				FORECAST_WORK_START_SHARE_PCT: "10",
 			},
 			{
@@ -158,7 +164,6 @@ describe("resolveForecastSettings", () => {
 				forecast_prewarm_test: null,
 				forecast_claude_path: "/usr/bin/claude",
 				forecast_prewarm_model: "haiku",
-				forecast_recent_tau_min: 60,
 				forecast_work_start_share_pct: 20,
 			},
 		);
@@ -174,7 +179,6 @@ describe("resolveForecastSettings", () => {
 		});
 		expect(settings.claudePath).toBe("/opt/claude");
 		expect(settings.prewarmModel).toBe("sonnet");
-		expect(settings.recentTauMin).toBe(20);
 		expect(settings.workStartSharePct).toBe(10);
 	});
 
@@ -210,7 +214,6 @@ describe("resolveForecastSettings", () => {
 			"999",
 			365,
 		],
-		["FORECAST_RECENT_TAU_MIN", "recentTauMin", "0", 1, "9999", 720],
 		[
 			"FORECAST_SESSION_TURNOVER_MIN",
 			"sessionTurnoverMin",
@@ -484,6 +487,23 @@ describe("Config.getForecastSettings", () => {
 		expect(settings.simulatedDays).toBe(500);
 		expect(settings.enabled).toBe(false);
 		expect(settings.transcriptsDir).toBe(join(homedir(), ".claude/projects"));
+	});
+
+	it("starts from a config file that still holds forecast_recent_tau_min and an unknown key", () => {
+		const warn = spyOn(Logger.prototype, "warn");
+		try {
+			const c = config({
+				forecast_recent_tau_min: 30,
+				forecast_no_such_setting: "x",
+				forecast_simulated_days: 800,
+			});
+			const settings = c.getForecastSettings();
+			expect(settings.simulatedDays).toBe(800);
+			expect(Object.keys(settings)).not.toContain("recentTauMin");
+			expect(warn).not.toHaveBeenCalled();
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("warns once per distinct invalid value however often it is read", () => {

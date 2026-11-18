@@ -1,5 +1,5 @@
-import { fitPaceModel } from "../engine/pace";
-import { planReplyTransfer, runPlanJob } from "../engine/plan-job";
+import { planReplyTransfer } from "../engine/plan-job";
+import { daytypesJob, planJob, refitJob } from "./forecast-jobs";
 import type {
 	ForecastJobName,
 	ForecastWorkerJobs,
@@ -25,20 +25,9 @@ const handlers: {
 		transfer?: (result: ForecastWorkerJobs[J]["result"]) => Transferable[];
 	};
 } = {
-	refit: {
-		run: ({ start, units, censored, timeZone, now }) =>
-			fitPaceModel({ start, units, censored, timeZone }, now),
-	},
-	plan: {
-		// The deadline is on this worker's clock: performance.now has a per-thread origin.
-		run: ({ ctx, budgetMs, ladder }) =>
-			runPlanJob(ctx, {
-				deadline: performance.now() + budgetMs,
-				now: () => performance.now(),
-				ladder,
-			}),
-		transfer: planReplyTransfer,
-	},
+	refit: { run: (payload) => refitJob(payload) },
+	daytypes: { run: (payload) => daytypesJob(payload) },
+	plan: { run: (payload) => planJob(payload), transfer: planReplyTransfer },
 };
 
 self.onmessage = async (event: MessageEvent<ForecastWorkerRequest>) => {
@@ -46,6 +35,7 @@ self.onmessage = async (event: MessageEvent<ForecastWorkerRequest>) => {
 	let reply: ForecastWorkerReply;
 	let transfer: Transferable[] = [];
 	try {
+		// The request union pairs each job with its payload; TypeScript cannot correlate the two through the index.
 		const handler = handlers[job] as
 			| {
 					run: (payload: unknown) => unknown;

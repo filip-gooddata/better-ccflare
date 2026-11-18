@@ -40,7 +40,6 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		// effectively no recency decay, so ratios are exact
 		historyHalfLifeDays: 1e12,
 		historyLookbackDays: 28,
-		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,

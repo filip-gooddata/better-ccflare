@@ -1,7 +1,14 @@
+import type {
+	DemandSettings,
+	LearnedDemand,
+	Partition,
+	RowChoice,
+} from "../engine/learn/types";
 import type { PaceFitState, PaceSeries } from "../engine/pace/types";
 import type { EpochMs } from "../types";
 import {
 	createForecastWorkerRunner,
+	type ForecastJobFailure,
 	type ForecastWorkerRunner,
 } from "./forecast-worker-runner";
 
@@ -20,37 +27,137 @@ export type PaceRefitFailure =
 	| "busy"
 	| "input-error";
 
+/** The settings the refit job's demand learners (F2) start from: their present values and the work days. */
+export interface RefitDemandSettings extends DemandSettings {
+	/** As PaceContext.workDays. */
+	workDays: number;
+}
+
 export type PaceRefitOutcome =
-	| { status: "ok"; state: PaceFitState; ms: number }
+	/** `state` (E4) and `learned` (F2) come from the same job. */
+	| { status: "ok"; state: PaceFitState; learned: LearnedDemand; ms: number }
+	| { status: "timeout"; ms: number }
+	| { status: "error"; reason: PaceRefitFailure; ms: number };
+
+export type DaytypesOutcome =
+	| {
+			status: "ok";
+			choice: RowChoice<Partition>;
+			/** The switch waiting for the next job's nested confirmation (R3-2). */
+			pending: Partition | null;
+			/** True when this job ran the nested confirmation. */
+			nested: boolean;
+			ms: number;
+	  }
 	| { status: "timeout"; ms: number }
 	| { status: "error"; reason: PaceRefitFailure; ms: number };
 
 export interface PaceRefitRunner {
-	/** Fits `series` in the worker. The series' buffers are transferred: do not use it afterwards. */
+	/**
+	 * Fits E4 on `series` with the partition of `options.daytypes` (the stored
+	 * row-1 choice; null or absent fits the present partition) and learns rows
+	 * 2-8, in the worker. The series' buffers are transferred: do not use it afterwards.
+	 */
 	run(
 		series: PaceSeries,
 		now: EpochMs,
-		options: { timeoutMs: number; signal?: AbortSignal },
+		demand: RefitDemandSettings,
+		options: {
+			timeoutMs: number;
+			signal?: AbortSignal;
+			daytypes?: RowChoice<Partition> | null;
+		},
 	): Promise<PaceRefitOutcome>;
+	/**
+	 * Runs the F2 row-1 job in its own worker: family scoring, or with
+	 * `options.pending` the nested confirmation (R3-2). `options.daytypes` is
+	 * the stored choice (null or absent: present served). Transfers the
+	 * series' buffers like `run`.
+	 */
+	runDaytypes(
+		series: PaceSeries,
+		now: EpochMs,
+		demand: RefitDemandSettings,
+		options: {
+			timeoutMs: number;
+			signal?: AbortSignal;
+			daytypes?: RowChoice<Partition> | null;
+			pending?: Partition | null;
+		},
+	): Promise<DaytypesOutcome>;
 }
+
+const payloadOf = (
+	{ start, units, censored, timeZone }: PaceSeries,
+	now: EpochMs,
+	{
+		workDays,
+		historyLookbackDays,
+		historyHalfLifeDays,
+		workStartSharePct,
+		timeShiftMin,
+	}: RefitDemandSettings,
+) => ({
+	start,
+	units,
+	censored,
+	timeZone,
+	now,
+	workDays,
+	historyLookbackDays,
+	historyHalfLifeDays,
+	workStartSharePct,
+	timeShiftMin,
+});
+
+const failureOf = (reason: ForecastJobFailure): PaceRefitFailure =>
+	reason === "job-error" ? "fit-error" : reason;
 
 export function createPaceRefitRunner(
 	worker: ForecastWorkerRunner = createForecastWorkerRunner(),
 ): PaceRefitRunner {
 	return {
-		async run(series, now, { timeoutMs, signal }) {
-			const { start, units, censored, timeZone } = series;
+		async run(series, now, demand, { timeoutMs, signal, daytypes = null }) {
+			const { units, censored } = series;
 			const outcome = await worker.run(
 				"refit",
-				{ start, units, censored, timeZone, now },
+				{ ...payloadOf(series, now, demand), daytypes },
 				{ timeoutMs, signal, transfer: [units.buffer, censored.buffer] },
 			);
 			if (outcome.status === "ok")
-				return { status: "ok", state: outcome.result, ms: outcome.ms };
+				return {
+					status: "ok",
+					state: outcome.result.pace,
+					learned: outcome.result.learned,
+					ms: outcome.ms,
+				};
 			if (outcome.status === "timeout") return outcome;
-			const reason =
-				outcome.reason === "job-error" ? "fit-error" : outcome.reason;
-			return { status: "error", reason, ms: outcome.ms };
+			return {
+				status: "error",
+				reason: failureOf(outcome.reason),
+				ms: outcome.ms,
+			};
+		},
+		async runDaytypes(
+			series,
+			now,
+			demand,
+			{ timeoutMs, signal, daytypes = null, pending = null },
+		) {
+			const { units, censored } = series;
+			const outcome = await worker.run(
+				"daytypes",
+				{ ...payloadOf(series, now, demand), daytypes, pending },
+				{ timeoutMs, signal, transfer: [units.buffer, censored.buffer] },
+			);
+			if (outcome.status === "ok")
+				return { status: "ok", ...outcome.result, ms: outcome.ms };
+			if (outcome.status === "timeout") return outcome;
+			return {
+				status: "error",
+				reason: failureOf(outcome.reason),
+				ms: outcome.ms,
+			};
 		},
 	};
 }

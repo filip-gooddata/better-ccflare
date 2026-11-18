@@ -6,6 +6,7 @@
  * through the orchestrator.
  */
 
+import type { LearnedDemand } from "./engine/learn/types";
 import type { PaceFitState } from "./engine/pace/types";
 
 export type AccountId = string;
@@ -13,6 +14,9 @@ export type EpochMs = number;
 
 /** Width of one demand bucket. */
 export const BUCKET_MS = 5 * 60_000;
+
+/** Largest `timeShiftMin` setting (minutes); the settings range and the F2 jitter grid both end here. */
+export const TIME_SHIFT_MIN_MAX = 120;
 export const FIVE_HOUR_MS = 5 * 3_600_000;
 export const WEEK_MS = 7 * 86_400_000;
 /** Version of the HTTP contract in docs/forecast-endpoint.md. */
@@ -141,6 +145,8 @@ export interface LiveSession {
 	contextTokens: number;
 	/** Demand units it used in the trailing 60 minutes. */
 	recentUnits: number;
+	/** Demand units it used over its own cache lifetime (cacheTtlMs; the trailing 60 minutes while unknown). */
+	warmUnits: number;
 }
 
 export interface SessionTrackerLike {
@@ -185,8 +191,6 @@ export interface ForecastSettings {
 	/** Recency weighting of recorded days. */
 	historyHalfLifeDays: number;
 	historyLookbackDays: number;
-	/** Time constant of the blend from the last hour's rate into the recorded day. */
-	recentTauMin: number;
 	/** Time constant with which demand detaches from the sessions that carry it now. */
 	sessionTurnoverMin: number;
 	/** Work start: the local minute by which this percent of a work day's demand has been used (median over recent work days). */
@@ -219,6 +223,8 @@ export interface ForecastInput {
 	readings: LimitReading[];
 	sessions: LiveSession[];
 	demandModel?: PaceFitState | null;
+	/** F2 served demand values; absent or null = presentDemand(settings). */
+	learnedDemand?: LearnedDemand | null;
 }
 
 export interface PlacementAdvice {

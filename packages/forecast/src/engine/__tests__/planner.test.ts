@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { createSessionTracker } from "../../sessions/session-tracker";
+import type { TokenUsage } from "../../types";
 import type { SimulationResult } from "../model";
 import {
 	compareScores,
 	decidingReason,
 	dueRoutingOpening,
+	moveCandidates,
 	openingBeam,
 	openingEarns,
 	openingGrid,
@@ -516,5 +519,46 @@ describe("reason within one tier follows the exact order", () => {
 		expect(
 			decidingReason(s({ lowPoint: 80 + 5e-10 }), s({ typicalLow: 100.3 })),
 		).toBe("low-point+5e-10");
+	});
+});
+
+describe("moveCandidates: warm sessions ranked by units over their own cache lifetime", () => {
+	const write = (w5m: number, w1h: number): Partial<TokenUsage> => ({
+		cacheWriteTokens: w5m + w1h,
+		cacheWrite5mTokens: w5m,
+		cacheWrite1hTokens: w1h,
+	});
+	const use = (inputTokens: number, w: Partial<TokenUsage>): TokenUsage => ({
+		model: "claude-opus-5-5",
+		inputTokens,
+		outputTokens: 0,
+		cacheReadTokens: 0,
+		cacheWriteTokens: 0,
+		cacheWrite5mTokens: null,
+		cacheWrite1hTokens: null,
+		...w,
+	});
+	const T0 = Date.parse("2026-11-12T08:00:00Z");
+
+	test("a burst-y 5-minute session ranks below a 1-hour session with fewer units in the hour", () => {
+		const now = T0 + 42 * MIN;
+		const tracker = createSessionTracker({ now: () => now });
+		const feed = (id: string, at: number, u: TokenUsage) =>
+			tracker.observe({ sessionId: id, accountId: "acct-a", at, usage: u });
+		for (const m of [0, 10, 20])
+			feed("burst", T0 + m * MIN, use(50_000, write(1000, 0)));
+		feed("burst", T0 + 40 * MIN, use(100, write(100, 0)));
+		for (const m of [10, 30])
+			feed("hour", T0 + m * MIN, use(5_000, write(0, 1000)));
+		feed("stale5m", T0 + 30 * MIN, use(200_000, write(1000, 0)));
+		const live = tracker.live(now, HOUR);
+		const byId = new Map(live.map((s) => [s.sessionId, s]));
+		const burst = byId.get("burst");
+		const hour = byId.get("hour");
+		expect(burst && hour && burst.recentUnits > hour.recentUnits).toBe(true);
+		expect(moveCandidates(live).map((s) => s.sessionId)).toEqual([
+			"hour",
+			"burst",
+		]);
 	});
 });

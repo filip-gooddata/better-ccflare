@@ -38,7 +38,6 @@ export function settings(
 		openMinGainPoints: 2,
 		historyHalfLifeDays: 14,
 		historyLookbackDays: 56,
-		recentTauMin: 60,
 		sessionTurnoverMin: 90,
 		workStartSharePct: 5,
 		paceConditioning: true,

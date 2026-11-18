@@ -9,6 +9,7 @@ import {
 	createForecastWorkerRunner,
 	type ForecastWorkerRunner,
 } from "../service/forecast-worker-runner";
+import { localDayStart } from "../time";
 import type {
 	AccountId,
 	AccountLimits,
@@ -32,14 +33,18 @@ import {
 	MIN_CALIBRATION_POINTS,
 } from "./calibration";
 import {
+	activeDays,
 	buildDayTable,
+	demandLookbackDays,
 	historyAvailable,
+	MIN_ACTIVE_DAYS,
 	MIN_POOL_DAYS,
-	MIN_RECORDED_DAYS,
 	poolFor,
+	WORK_START_RECENT_DAYS,
 	workStartMinute,
 } from "./days";
 import { computeHorizon } from "./horizon";
+import type { LearnedDemand } from "./learn/types";
 import type {
 	DayTable,
 	EngineContext,
@@ -60,7 +65,12 @@ import {
 } from "./plan-job";
 import { buildResponseSliced, unavailableResponse } from "./response";
 import { SCENARIO_LADDER_TOP } from "./scenario-count";
-import { buildScenarios, resolveNoiseMode } from "./scenarios";
+import {
+	buildScenarios,
+	datePool,
+	resolveNoiseMode,
+	servedPartition,
+} from "./scenarios";
 import { yieldToEventLoop } from "./yield";
 
 const HOUR_MS = 3_600_000;
@@ -140,6 +150,29 @@ export function currentPace(
 	return fit.applyPace(state, series, input.now, true);
 }
 
+/**
+ * The scenario day table under F2 rows 4 and 5: the served lookback (never
+ * above the setting nor DEMAND_LOOKBACK_MAX_DAYS, also without learned demand)
+ * and half-life. At the settings' values it is the gate's own table;
+ * availability, work start and calibration keep the settings.
+ */
+function scenarioDayTable(
+	input: ForecastInput,
+	table: DayTable,
+	learned: LearnedDemand | null,
+): DayTable {
+	const { historyLookbackDays, historyHalfLifeDays } = input.settings;
+	const cap = demandLookbackDays(historyLookbackDays);
+	const lookbackDays = Math.min(learned?.lookbackDays ?? cap, cap);
+	const halfLifeDays = learned?.halfLifeDays ?? historyHalfLifeDays;
+	if (
+		lookbackDays === historyLookbackDays &&
+		halfLifeDays === historyHalfLifeDays
+	)
+		return table;
+	return buildDayTable(input, { lookbackDays, halfLifeDays });
+}
+
 /** The demand model's summary for the log line; null without one. */
 function paceModelDetail(
 	input: ForecastInput,
@@ -181,8 +214,10 @@ async function prepare(
 	const counted = input.accounts.filter((a) => a.counted);
 	if (counted.length === 0) return { rule: "no_counted_account" };
 
+	const learned = input.learnedDemand ?? null;
 	const table = buildDayTable(input);
-	if (!historyAvailable(table)) return historyDetail(table);
+	if (!historyAvailable(table, learned ? learned.poolTau : "hard3"))
+		return historyDetail(table);
 	await yieldToEventLoop();
 
 	const { calibration, evidence } = calibrateWithEvidence(input, counted);
@@ -193,9 +228,10 @@ async function prepare(
 	await yieldToEventLoop();
 
 	const pace = currentPace(input);
+	const scenarioTable = scenarioDayTable(input, table, learned);
 	const scenarios = await buildScenarios(
 		input,
-		table,
+		scenarioTable,
 		horizon,
 		options,
 		pace,
@@ -205,9 +241,16 @@ async function prepare(
 	const workStart = workStartMinute(
 		table,
 		timeZone,
-		input.settings.workStartSharePct,
+		learned ? learned.workStartSharePct : input.settings.workStartSharePct,
+		learned ? learned.workStartSample : WORK_START_RECENT_DAYS,
 	);
-	const pool = poolFor(table, table.today.type);
+	// today's served draw pool, as the scenarios draw it (R3-8)
+	const pool = datePool(
+		scenarioTable,
+		localDayStart(input.now, timeZone),
+		input.pace,
+		{ poolTau: learned?.poolTau, partition: servedPartition(input) },
+	);
 	return {
 		input,
 		now: input.now,
@@ -222,7 +265,7 @@ async function prepare(
 			pace: scenarios.diagnostics.pace,
 			paceModel: paceModelDetail(input),
 			pool: {
-				name: poolName(table),
+				name: poolName(scenarioTable),
 				days: pool.length,
 				medianUnits: weightedQuantile(pool, 0.5),
 				p90Units: weightedQuantile(pool, 0.9),
@@ -371,8 +414,9 @@ function historyDetail(table: DayTable): UnavailableDetail {
 	const type = table.today.type;
 	return {
 		rule: "history",
-		recordedDays: table.days.length,
-		minRecordedDays: MIN_RECORDED_DAYS,
+		// F2 row 3: active days (days with demand) against their floor
+		recordedDays: activeDays(table),
+		minRecordedDays: MIN_ACTIVE_DAYS,
 		pool: poolName(table),
 		poolDays: poolFor(table, type).length,
 		minPoolDays: MIN_POOL_DAYS,

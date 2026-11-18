@@ -1,4 +1,4 @@
-import { DAY_BUCKETS, type PaceCalendar } from "./calendar";
+import { DAY_BUCKETS, type PaceCalendar, PRESENT_GROUP } from "./calendar";
 import type { PaceCandidate } from "./types";
 
 /** Pseudo-count (units) inside every log ratio (sandbox lib.ts C_UNITS). */
@@ -71,16 +71,24 @@ export function prefix(a: ArrayLike<number>, n = a.length): Float64Array {
 	return p;
 }
 
-/** Prefix sums of the usage, censoring and one baseline over the observed buckets. */
+/**
+ * Prefix sums of the usage, censoring and one baseline over the observed
+ * buckets; `PX`, when set, of the buckets on days excluded from training.
+ */
 export interface SpanSums {
 	PU: Float64Array;
 	PC: Float64Array;
 	PB: Float64Array;
+	PX?: Float64Array;
 }
 
-/** log((U + c) / (B + c)) of the span [s, e), or NaN when out of range or censored (sandbox lib.ts lr). */
+/**
+ * log((U + c) / (B + c)) of the span [s, e), or NaN when out of range,
+ * censored (sandbox lib.ts lr) or touching an excluded bucket at all.
+ */
 export function lr(P: SpanSums, s: number, e: number): number {
 	if (s < 0 || e <= s || e > P.PU.length - 1) return Number.NaN;
+	if (P.PX && (P.PX[e] as number) - (P.PX[s] as number) > 0) return Number.NaN;
 	if (((P.PC[e] as number) - (P.PC[s] as number)) / (e - s) > CENSOR_SHARE)
 		return Number.NaN;
 	return Math.log(
@@ -111,7 +119,10 @@ export class GrammarContext {
 			if (ds.length < 7) return null;
 			const sel = workdays
 				? ds.filter(
-						(d) => cal.dtype[(days[d] as { first: number }).first] === 0,
+						(d) =>
+							PRESENT_GROUP[
+								cal.wd[(days[d] as { first: number }).first] as number
+							] === 0,
 					)
 				: ds;
 			if (!sel.length) return null;

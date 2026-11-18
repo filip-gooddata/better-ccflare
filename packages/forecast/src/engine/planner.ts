@@ -4,7 +4,14 @@
  * unserved demand counted below zero; the first step of the best plan is applied and the search runs
  * again at the next usage poll.
  */
-import type { EpochMs, MoveAdvice, PlacementAdvice, Plan } from "../types";
+import { addLocalDays, atLocalMinute, localDayStart } from "../time";
+import type {
+	EpochMs,
+	LiveSession,
+	MoveAdvice,
+	PlacementAdvice,
+	Plan,
+} from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { moveCostUnits } from "./move-cost";
 import { localPeaks, quarterHourGrid, refineMarks } from "./opening-grid";
@@ -387,11 +394,22 @@ function bestOf(candidates: Evaluated[]): Evaluated | null {
 }
 
 /**
+ * Warm sessions worth trying a move for: those with units over their own cache lifetime
+ * (DESIGN-F2 "P warm window"), most first. All of them are candidates; the plan deadline cuts
+ * the tail (DESIGN row 48).
+ */
+export function moveCandidates(warm: LiveSession[]): LiveSession[] {
+	return warm
+		.filter((s) => s.warmUnits > 0)
+		.sort((a, b) => b.warmUnits - a.warmUnits);
+}
+
+/**
  * The best plan for the coming hours. Always searched in full, so the plan is valid whatever the
  * deadline: the baseline, every stage-1 and stage-2 single opening (and so every combination with one
  * opening), the preference order, the pruning of openings and the placement. The deadline in
  * `options` stops only the combinations of two or more openings, taken in order of their openings'
- * single scores, and the move candidates, taken largest recent use first.
+ * single scores, and the move candidates, taken in moveCandidates order.
  */
 export async function planForecast(
 	ctx: EngineContext,
@@ -560,13 +578,11 @@ export async function planForecast(
 	}
 
 	// 3. At most one move of one warm live session; it pays its move cost inside the simulation. Every
-	// warm session with recent use, largest first, until the deadline.
+	// warm session with units over its own cache lifetime, most first, until the deadline.
 	let move: MoveAdvice | null = null;
 	const indexOf = new Map(ctx.accounts.map((a, j) => [a.accountId, j]));
-	const movable = warmSessions(ctx)
-		.filter((s) => s.recentUnits > 0)
-		.sort((a, b) => b.recentUnits - a.recentUnits);
-	const moveCandidates = movable.flatMap((session) =>
+	const movable = moveCandidates(warmSessions(ctx));
+	const moveTries = movable.flatMap((session) =>
 		ctx.accounts
 			.map((_, to) => to)
 			.filter(
@@ -578,7 +594,7 @@ export async function planForecast(
 	let movesEvaluated = 0;
 	const moves: Evaluated[] = [];
 	const noMove = best;
-	for (const candidateMove of moveCandidates) {
+	for (const candidateMove of moveTries) {
 		if (!timeLeft()) break;
 		const candidate = await evaluate({ ...noMove.plan, move: candidateMove });
 		movesEvaluated++;
@@ -643,7 +659,7 @@ export async function planForecast(
 				available: openingCombinationCount(beams),
 			},
 			refine,
-			moves: { evaluated: movesEvaluated, available: moveCandidates.length },
+			moves: { evaluated: movesEvaluated, available: moveTries.length },
 			cutByDeadline,
 			elapsedMs: clock() - startedAt,
 		},

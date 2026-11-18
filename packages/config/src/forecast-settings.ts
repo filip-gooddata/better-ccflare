@@ -5,6 +5,7 @@ import {
 	type ForecastSettings,
 	fanLevelsForCount,
 	MAX_FAN_LEVEL_COUNT,
+	TIME_SHIFT_MIN_MAX,
 } from "@better-ccflare/forecast";
 
 /** Config-file keys of the forecast settings (snake_case, like `session_pace_*`). */
@@ -25,7 +26,6 @@ export interface ForecastConfigData {
 	forecast_open_min_gain_points?: unknown;
 	forecast_history_half_life_days?: unknown;
 	forecast_history_lookback_days?: unknown;
-	forecast_recent_tau_min?: unknown;
 	forecast_session_turnover_min?: unknown;
 	forecast_work_start_share_pct?: unknown;
 	forecast_pace_conditioning?: unknown;
@@ -50,13 +50,12 @@ interface NumberSpec {
 export const FORECAST_NUMBER_SETTINGS: readonly NumberSpec[] = [
 	n("prewarmMaxPerDay", "PREWARM_MAX_PER_DAY", 4, 0, 24, true),
 	n("simulatedDays", "SIMULATED_DAYS", 400, 50, 2000, true),
-	n("timeShiftMin", "TIME_SHIFT_MIN", 30, 0, 120, false),
+	n("timeShiftMin", "TIME_SHIFT_MIN", 30, 0, TIME_SHIFT_MIN_MAX, false),
 	n("minStopPoints", "MIN_STOP_POINTS", 1, 0, 100, false),
 	n("moveMinGainPoints", "MOVE_MIN_GAIN_POINTS", 2, 0, 100, false),
 	n("openMinGainPoints", "OPEN_MIN_GAIN_POINTS", 1, 0, 100, false),
 	n("historyHalfLifeDays", "HISTORY_HALF_LIFE_DAYS", 14, 1, 365, false),
 	n("historyLookbackDays", "HISTORY_LOOKBACK_DAYS", 84, 7, 365, true),
-	n("recentTauMin", "RECENT_TAU_MIN", 45, 1, 720, false),
 	n("sessionTurnoverMin", "SESSION_TURNOVER_MIN", 60, 1, 1440, false),
 	n("workStartSharePct", "WORK_START_SHARE_PCT", 5, 1, 50, false),
 ];
@@ -349,7 +348,6 @@ export function resolveForecastSettings(
 		openMinGainPoints: numbers.openMinGainPoints,
 		historyHalfLifeDays: numbers.historyHalfLifeDays,
 		historyLookbackDays: numbers.historyLookbackDays,
-		recentTauMin: numbers.recentTauMin,
 		sessionTurnoverMin: numbers.sessionTurnoverMin,
 		workStartSharePct: numbers.workStartSharePct,
 		paceConditioning: resolveBoolean(

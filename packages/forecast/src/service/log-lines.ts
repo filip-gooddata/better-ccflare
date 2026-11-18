@@ -117,7 +117,10 @@ const LIMITS = new Set(["five_hour", "seven_day", "seven_day_fable"]);
 const SOURCES = new Set(["own", "borrowed", "none"]);
 const PACE_STATUSES = new Set(["fitted", "unfitted", "off"]);
 const BAND_IDS = new Set(PACE_BANDS.map((b) => b.id));
-const DAY_TYPE_IDS = new Set(["workday", "monday", "weekend"]);
+const DAY_TYPE_IDS = new Set(["workday", "monday", "weekend", "all"]);
+/** A day-type group of a learned partition (pace calendar groupNames): weekday blocks such as mon-fri or tue+thu-sun. */
+const WD = "(mon|tue|wed|thu|fri|sat|sun)";
+const DAY_TYPE_GROUP = new RegExp(`^${WD}(-${WD})?([+]${WD}(-${WD})?)*$`);
 const FEATURE_ID = /^[A-Za-z0-9:_.+-]{1,64}$/;
 
 function fixed(v: unknown, digits: number): string {
@@ -131,6 +134,9 @@ function num(v: unknown): string {
 function word(v: unknown, allowed: Set<string>): string {
 	return typeof v === "string" && allowed.has(v) ? v : "?";
 }
+
+const dayType = (v: unknown): string =>
+	typeof v === "string" && DAY_TYPE_GROUP.test(v) ? v : word(v, DAY_TYPE_IDS);
 
 function accountId(v: unknown): string {
 	return typeof v === "string" && ACCOUNT_ID.test(v) ? v : "?";
@@ -171,7 +177,7 @@ function paceFields(d: ForecastInputsDetail, now: EpochMs): string[] {
 	const below = model?.belowFloor ?? [];
 	const listed = below.map(
 		(c) =>
-			`${word(c.band, BAND_IDS)}:${word(c.dayType, DAY_TYPE_IDS)}:${num(c.hour)}:${featureId(c.feature)}:${num(c.units)}`,
+			`${word(c.band, BAND_IDS)}:${dayType(c.dayType)}:${num(c.hour)}:${featureId(c.feature)}:${num(c.units)}`,
 	);
 	return [
 		`e4=${word(d.pace.status, PACE_STATUSES)}`,
