@@ -142,6 +142,24 @@ describe("CLI --force-reset-rate-limit keeps an overage bench and family blocks"
 		expect(result.message).toContain("immediate usage polling was triggered");
 	});
 
+	it("names the local ports it did not check after a server accepted the poll", async () => {
+		await insertRow(null, null);
+		serverAnswers({
+			success: true,
+			usagePollTriggered: true,
+			kept: { overageBench: null, familyBlocks: [] },
+		});
+
+		const result = await forceResetRateLimit(dbOps, "work", makeConfig());
+
+		expect(fetchedUrls).toEqual([
+			"http://localhost:8080/api/accounts/acct/force-reset-rate-limit",
+		]);
+		expect(result.message).toContain(
+			"Family blocks were checked on the server at port 8080; port 8081 was not checked.",
+		);
+	});
+
 	it("clears an ordinary cooldown and reports nothing kept", async () => {
 		await insertRow(Date.now() + HOUR, "upstream_429_with_reset");
 		serverAnswers({
