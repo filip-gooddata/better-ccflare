@@ -1010,8 +1010,10 @@ export async function isModelUnavailableError(
  *   3. If retries also return 1305 - converts to a synthetic 429 so isModelUnavailableError
  *      triggers model fallback (e.g. glm-5.2 -> glm-4.7)
  *   4. If no 1305 - returns the original response unchanged
+ *
+ * Exported for tests.
  */
-async function checkZai1305(
+export async function checkZai1305(
 	response: Response,
 	account: Account,
 	requestClone: Request,
@@ -1054,6 +1056,9 @@ async function checkZai1305(
 
 			const retryRaw = await makeProxyRequest(requestClone.clone());
 			const retryHeaders = new Headers(retryRaw.headers);
+			// This retry bypasses forwardUpstream, so drop the proxy-only
+			// headers here: upstream must not pass off its answer as ours.
+			stripProxyOnlyHeaders(retryHeaders);
 			retryHeaders.set(
 				"x-better-ccflare-request-id",
 				response.headers.get("x-better-ccflare-request-id") || "",
@@ -1176,7 +1181,9 @@ export async function proxyUnauthenticated(
 				clientSessionId: requestMeta.clientSessionId ?? null,
 				query: url.search || null,
 				projectAttributionSource: requestMeta.projectAttributionSource ?? null,
-				response,
+				// No forwardUpstream on this path, so drop the proxy-only headers
+				// here: upstream must not pass off its answer as ours.
+				response: withoutProxyOnlyHeaders(response),
 				timestamp: requestMeta.timestamp,
 				retryAttempt: 0,
 				failoverAttempts: 0,

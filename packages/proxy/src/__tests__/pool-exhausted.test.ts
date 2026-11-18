@@ -7,6 +7,7 @@ import {
 	mock,
 	spyOn,
 } from "bun:test";
+import { LOCAL_429_MARKER_HEADER } from "@better-ccflare/http-common";
 import { logBus } from "@better-ccflare/logger";
 import type { Provider } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
@@ -452,6 +453,48 @@ describe("pool exhausted — CCFLARE_PASSTHROUGH_ON_EMPTY_POOL=1 escape hatch", 
 			expect(error.type).toBe("authentication_error");
 			expect(error.type).not.toBe("pool_exhausted");
 			expect(error.message).toBe("marker-from-upstream");
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+
+	// The proxy-only local-429 marker tells a client the 429 is the proxy's own
+	// answer. This path hands upstream's response to the client without the
+	// account path's forwardUpstream, so it must strip the marker itself.
+	it("never passes the proxy-only local-429 marker through from upstream", async () => {
+		process.env.CCFLARE_PASSTHROUGH_ON_EMPTY_POOL = "1";
+
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					type: "error",
+					error: { type: "rate_limit_error", message: "upstream" },
+				}),
+				{
+					status: 429,
+					headers: {
+						"content-type": "application/json",
+						[LOCAL_429_MARKER_HEADER]: "1",
+						"x-upstream-kept": "yes",
+					},
+				},
+			)) as typeof globalThis.fetch;
+
+		try {
+			const ctx = makeContext([], {
+				buildUrl: (path, query) => `https://upstream.test${path}${query}`,
+				prepareHeaders: (headers) => new Headers(headers),
+			});
+			const response = await handleProxy(
+				makeRequest(),
+				new URL("https://proxy.local/v1/messages"),
+				ctx,
+			);
+
+			expect(response.status).toBe(429);
+			expect(response.headers.get(LOCAL_429_MARKER_HEADER)).toBeNull();
+			expect(response.headers.get("x-upstream-kept")).toBe("yes");
 		} finally {
 			globalThis.fetch = realFetch;
 		}

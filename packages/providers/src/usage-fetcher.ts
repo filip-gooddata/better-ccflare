@@ -2055,6 +2055,20 @@ class UsageCache {
 	}
 
 	/**
+	 * Clear cached data for an account whose credentials were reloaded, except
+	 * a reading held until a full window's reset: a reload must not reopen a
+	 * known-full account before a newer reading replaces it. Any in-flight
+	 * poll (made with the old credentials) is invalidated either way.
+	 */
+	deleteUnlessHeld(accountId: string): void {
+		const cached = this.cache.get(accountId);
+		if (!cached || !isHeld(cached, Date.now())) {
+			this.cache.delete(accountId);
+		}
+		this.invalidateInFlight(accountId);
+	}
+
+	/**
 	 * Clear cached data for a specific account
 	 */
 	delete(accountId: string): void {
