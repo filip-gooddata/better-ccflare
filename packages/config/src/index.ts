@@ -21,11 +21,16 @@ import { Logger } from "@better-ccflare/logger";
 import { validatePathOrThrow } from "@better-ccflare/security";
 import {
 	type ForecastConfigData,
+	type ForecastResolveInput,
+	ignoredSimulatedDaysWarning,
 	resolveForecastSettings,
 } from "./forecast-settings";
 import { resolveConfigPath } from "./paths";
 
 const log = new Logger("Config");
+
+/** Module scope, so the ignored-setting warning is logged once per process. */
+let simulatedDaysWarned = false;
 
 function parseEnabledEnvFlag(value: string | undefined): boolean | undefined {
 	if (value === undefined) return undefined;
@@ -725,7 +730,7 @@ export class Config extends EventEmitter {
 	 * with one warning per distinct input. See docs/configuration.md.
 	 */
 	getForecastSettings(): ForecastSettings {
-		return resolveForecastSettings({
+		const input: ForecastResolveInput = {
 			env: process.env,
 			// JSON from disk: the resolver checks every value it reads.
 			file: this.data as ForecastConfigData,
@@ -736,7 +741,16 @@ export class Config extends EventEmitter {
 				this.forecastWarnings.add(warning);
 				log.warn(`Invalid ${warning}: expected ${expected}; using ${using}`);
 			},
-		});
+		};
+		const settings = resolveForecastSettings(input);
+		if (!simulatedDaysWarned) {
+			const warning = ignoredSimulatedDaysWarning(input, settings);
+			if (warning) {
+				simulatedDaysWarned = true;
+				log.warn(warning);
+			}
+		}
+		return settings;
 	}
 
 	setUsagePollIntervalMs(ms: number): void {

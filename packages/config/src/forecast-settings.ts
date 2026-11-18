@@ -293,6 +293,23 @@ function resolvePrewarmTest(
 }
 
 /**
+ * The warning for an operator who set `simulatedDays` (environment or config
+ * file) to other than its default, or `null`. Adaptive compute now chooses the
+ * number of simulated days for each forecast, so the setting has no effect.
+ */
+export function ignoredSimulatedDaysWarning(
+	input: ForecastResolveInput,
+	settings: ForecastSettings,
+): string | null {
+	const spec = FORECAST_NUMBER_SETTINGS.find(
+		(s) => s.field === "simulatedDays",
+	) as NumberSpec;
+	const raw = pick(input, spec.env, spec.key);
+	if (!raw || settings.simulatedDays === spec.fallback) return null;
+	return `${raw.source} is ignored: the number of simulated days is chosen per forecast`;
+}
+
+/**
  * Resolve every forecast setting: environment variable over config file
  * over default; numbers clamped to their range; an invalid value is reported
  * through `warn` and replaced by the default.

@@ -500,7 +500,12 @@ describe("Config.getForecastSettings", () => {
 			const settings = c.getForecastSettings();
 			expect(settings.simulatedDays).toBe(800);
 			expect(Object.keys(settings)).not.toContain("recentTauMin");
-			expect(warn).not.toHaveBeenCalled();
+			// The once-per-process ignored-setting warning is covered in
+			// forecast-simulated-days-notice.test.ts.
+			const others = warn.mock.calls.filter(
+				([m]) => !String(m).includes("is ignored"),
+			);
+			expect(others).toEqual([]);
 		} finally {
 			warn.mockRestore();
 		}
