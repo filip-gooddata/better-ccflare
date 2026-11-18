@@ -8,7 +8,7 @@ import type {
 	SimulationResult,
 } from "../model";
 import { buildResponse } from "../response";
-import { stopNow } from "../stops";
+import { stopNow, zeroPoints } from "../stops";
 import {
 	account,
 	defaultAxis,
@@ -65,8 +65,16 @@ function scattered(options: {
 	stopping: number;
 	minutes?: number;
 	unserved?: number;
+	/** Quota left during a stopping day's out window (0: fully out). */
+	left?: number;
 }) {
-	const { days = 400, stopping, minutes = 60, unserved = 0.5 } = options;
+	const {
+		days = 400,
+		stopping,
+		minutes = 60,
+		unserved = 0.5,
+		left = 0,
+	} = options;
 	const ctx = makeCtx();
 	const axis = defaultAxis(ctx);
 	const traces: SimTrace[] = Array.from({ length: days }, (_, d) => {
@@ -79,7 +87,7 @@ function scattered(options: {
 			{ account: 1, at: from, limit: "five_hour" },
 		];
 		return makeTrace(axis, {
-			day: (t) => (out(t) ? 0 : 100),
+			day: (t) => (out(t) ? left : 100),
 			unserved: (t) => (out(t) ? unserved : 0),
 			outs,
 		});
@@ -199,6 +207,23 @@ describe("stopChance and likelyStop: the engine's stop rule on each simulated da
 		);
 		expect(day.stopChance).toBe(0);
 		expect(day.likelyStop).toBeNull();
+	});
+
+	test("the zero cutoff is derived from the accounts: a residue up to it is 0, any quota above it is not", () => {
+		const cutoff = zeroPoints(makeCtx().accounts.length);
+		const above = block(
+			scattered({ stopping: 300, left: 0.01 }).response,
+			"day",
+		);
+		expect(cutoff).toBeLessThan(0.01);
+		expect(above.stopChance).toBe(0);
+		expect(above.likelyStop).toBeNull();
+		const residue = block(
+			scattered({ stopping: 300, left: cutoff }).response,
+			"day",
+		);
+		expect(residue.stopChance).toBe(0.75);
+		expect(residue.likelyStop).not.toBeNull();
 	});
 
 	test("no stop on any day: 0 and null", () => {
