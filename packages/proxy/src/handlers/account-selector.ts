@@ -473,9 +473,8 @@ function isAccountCapacityExcluded(
 	// of the model this account actually sends (mapModelName: the mapped
 	// primary model, or the client's model when no mapping applies or
 	// "force account model" turns mapping off).
-	const upstreamFamily =
-		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
-		family;
+	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
+	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
 	if (!upstreamFamily) return { excluded: false, resetAt: null, origin: null };
 
 	// A standing family block is an observed upstream refusal of this family
@@ -488,11 +487,15 @@ function isAccountCapacityExcluded(
 		);
 		return { excluded: true, resetAt: block.until, origin: "family_blocked" };
 	}
-	if (!family) return { excluded: false, resetAt: null, origin: null };
 
+	// Telemetry is read for the family the account actually sends, like the
+	// block above: an Opus request mapped to Fable spends the Fable limit. A
+	// mapping lists fallbacks after its primary; only the primary is sent
+	// first, so it is the one gated (a fallback is tried only after the
+	// primary is refused).
 	const usageResult = isAccountExhaustedForModel(
 		usageCache.get(account.id),
-		model,
+		getModelFamily(upstreamModel) ? upstreamModel : model,
 		now,
 	);
 	if (usageResult.exhausted) {
@@ -502,7 +505,7 @@ function isAccountCapacityExcluded(
 			origin: "telemetry_confirmed",
 		};
 	}
-	if (!capacityRoutingEnabled) {
+	if (!capacityRoutingEnabled || !family) {
 		return { excluded: false, resetAt: null, origin: null };
 	}
 	const negativeCacheOrigin = getFamilyExhaustionOrigin(

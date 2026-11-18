@@ -156,17 +156,26 @@ function familyLimitInForce(
 	// Blocks are recorded for the family upstream refused: the family of the
 	// model this account actually sends (mapModelName honors "force account
 	// model", which turns mapping off).
-	const upstreamFamily =
-		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
-		family;
+	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
+	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };
 
+	// Telemetry is read for the family the account actually sends (the
+	// mapping's primary model), the same family the block above uses.
 	const usage = usageCache.get(account.id);
-	const telemetry = isAccountExhaustedForModel(usage, model, now);
+	const telemetry = isAccountExhaustedForModel(
+		usage,
+		getModelFamily(upstreamModel) ? upstreamModel : model,
+		now,
+	);
 	if (telemetry.exhausted) {
-		return { kind: "family", family, resetAt: telemetry.resetAt };
+		return {
+			kind: "family",
+			family: upstreamFamily,
+			resetAt: telemetry.resetAt,
+		};
 	}
 	if (!capacityRoutingEnabled) return null;
 

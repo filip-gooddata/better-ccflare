@@ -567,7 +567,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 	});
 
 	it("blocks Fable without a bench when an Opus request is mapped to two Fable models", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const calls = installUpstream(({ account, model }) => {

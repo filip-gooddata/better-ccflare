@@ -114,6 +114,27 @@ function usage(parts: {
 	return data as never;
 }
 
+/** Anthropic usage with one full Fable weekly_scoped row. */
+function fullFableUsage(resetAt: number) {
+	return {
+		five_hour: win(10, NOW + HOUR),
+		seven_day: win(10, NOW + 48 * HOUR),
+		limits: [
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: iso(resetAt),
+				scope: { model: { id: null, display_name: "Fable" }, surface: null },
+			},
+		],
+	} as never;
+}
+
+/** An account whose mapping sends Opus requests upstream as Fable. */
+const opusToFable = {
+	model_mappings: JSON.stringify({ opus: ["claude-fable-5"] }),
+};
+
 /** A fake strategy that filters like the real ones (isAccountAvailable). */
 function availabilityStrategy(
 	selectWhenAllLimited?: LoadBalancingStrategy["selectWhenAllLimited"],
@@ -396,6 +417,22 @@ describe("collectLimitBlockedAccounts", () => {
 		]);
 	});
 
+	it("lists the full family of the model sent upstream after the account mapping", () => {
+		const a = makeAccount("a", opusToFable);
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			expect(limitsOf(collect([a], { capacityRouting }), "a")).toEqual([
+				{ kind: "family", family: "fable", resetAt: NOW + 10 * HOUR },
+			]);
+		}
+	});
+
+	it("does not list another family's full row when the request is not mapped to it", () => {
+		const a = makeAccount("a");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		expect(collect([a], { capacityRouting: true })).toEqual([]);
+	});
+
 	it("leaves a reactive family mark out while capacity routing is off", () => {
 		const a = makeAccount("a");
 		markFamilyExhausted("a", "opus", NOW);
@@ -522,6 +559,21 @@ describe("selectAccountsForRequest: a full limit is never a candidate", () => {
 		});
 		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
 		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("excludes an account whose mapping sends the request as a full family", async () => {
+		const a = makeAccount("a", opusToFable);
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			const ctx = makeCtx({
+				accounts: [a, b],
+				strategy: availabilityStrategy(),
+				capacityRouting,
+			});
+			const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+			expect(selected.map((x) => x.id)).toEqual(["b"]);
+		}
 	});
 
 	it("keeps an account with only a reactive family mark while capacity routing is off", async () => {
