@@ -580,7 +580,7 @@ Response:
 - While another strategy runs, the values are the ones `session-pace` would start with if selected now, and `timeZone` is the zone the server read at start.
 - The strategy is rebuilt, with the current settings, whenever the strategy setting changes (`POST /api/config/strategy` or the dashboard). The server reads the config file once, at start, so an edit to the file shows here after the next restart.
 
-`forecastSettings` is always present. It holds the 20 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`), plus `fanLevelCount`, the number of levels in `fanLevels` (whether they were set by a count or a list).
+`forecastSettings` is always present. It holds the 19 [forecast settings](#forecast-settings) after resolution and validation, keyed by the names in the Setting column (`enabled`, `routing`, `prewarm`, …, `workStartSharePct`), plus `fanLevelCount`, the number of levels in `fanLevels` (whether they were set by a count or a list).
 
 `forecast` is present only while the forecast setting `enabled` is `true`:
 
