@@ -662,7 +662,7 @@ describe("createModelFamilyExhaustedResponse", () => {
 			statusText: "Too Many Requests",
 			headers: new Headers({
 				"anthropic-ratelimit-unified-reset": String(reset),
-				"anthropic-ratelimit-unified-representative-claim": "five_hour",
+				"anthropic-ratelimit-unified-representative-claim": "seven_day_fable",
 				"retry-after": "1",
 			}),
 			body: new TextEncoder().encode("upstream-body"),
@@ -677,7 +677,7 @@ describe("createModelFamilyExhaustedResponse", () => {
 		expect(await response.text()).toBe("upstream-body");
 		expect(
 			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
-		).toBe("five_hour");
+		).toBe("seven_day_fable");
 	});
 
 	describe("Retry-After", () => {
@@ -713,6 +713,61 @@ describe("createModelFamilyExhaustedResponse", () => {
 			);
 			expect(response.headers.get("Retry-After")).toBe(String(3 * 24 * 3600));
 		});
+	});
+
+	// A cooldown-masked answer is out on cooldowns, not on the family's limit:
+	// it claims no limit and names no unified reset; retry-after counts to the
+	// cooldown end.
+	it("claims no family limit for a cooldown_masked answer", () => {
+		const response = atNow(() =>
+			createModelFamilyExhaustedResponse({
+				family: "fable",
+				resetAt: NOW + 5 * 60_000,
+				origin: "cooldown_masked",
+			}),
+		);
+		const h = response.headers;
+		expect(response.status).toBe(429);
+		expect(h.get("Retry-After")).toBe("300");
+		expect(h.get("anthropic-ratelimit-unified-status")).toBeNull();
+		expect(
+			h.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBeNull();
+		expect(h.get("anthropic-ratelimit-unified-reset")).toBeNull();
+	});
+
+	it("reads the named account's windows for a cooldown_masked answer, and replays nothing", () => {
+		const R5 = NOW + 2 * 60 * 60 * 1000;
+		usageCache.set("acc-m", {
+			five_hour: { utilization: 30, resets_at: new Date(R5).toISOString() },
+		} as never);
+		rememberLimitRefusal(
+			"acc-m",
+			{
+				status: 429,
+				statusText: "",
+				headers: new Headers({
+					"anthropic-ratelimit-unified-reset": String(R5 / 1000),
+					"anthropic-ratelimit-unified-representative-claim": "seven_day_fable",
+				}),
+				body: new TextEncoder().encode("{}"),
+			},
+			NOW,
+		);
+		const response = atNow(() =>
+			createModelFamilyExhaustedResponse({
+				family: "fable",
+				resetAt: NOW + 60_000,
+				origin: "cooldown_masked",
+				accountId: "acc-m",
+			}),
+		);
+		const h = response.headers;
+		expect(h.get("Retry-After")).toBe("60");
+		expect(
+			h.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBeNull();
+		expect(h.get("anthropic-ratelimit-unified-5h-status")).toBe("allowed");
 	});
 
 	// The fixed Anthropic text names no window, so no origin can misattribute

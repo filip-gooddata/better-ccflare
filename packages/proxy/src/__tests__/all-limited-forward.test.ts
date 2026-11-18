@@ -382,19 +382,37 @@ const retryAfterFor = (resetAt: number) =>
  */
 async function expectBuiltLimit429(
 	received: Response | Error,
-	expected: { resetAt: number; claim?: string; head?: boolean },
+	expected: {
+		resetAt: number;
+		claim?: string;
+		head?: boolean;
+		/** Out only on a cooldown: no unified status, claim or reset. */
+		cooldown?: boolean;
+	},
 ) {
 	expect(received).toBeInstanceOf(Response);
 	const response = received as Response;
 	expect(response.status).toBe(429);
 	expect(response.headers.get("content-type")).toContain("application/json");
 	expect(response.headers.get("x-should-retry")).toBe("true");
-	expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
-		"rejected",
-	);
-	expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
-		String(Math.floor(expected.resetAt / 1000)),
-	);
+	if (expected.cooldown) {
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-status"),
+		).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-reset"),
+		).toBeNull();
+	} else {
+		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
+		expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+			String(Math.floor(expected.resetAt / 1000)),
+		);
+	}
 	expect(response.headers.get("retry-after")).toBe(
 		retryAfterFor(expected.resetAt),
 	);
@@ -530,7 +548,10 @@ describe("session-pace with every account out on limits", () => {
 		const response = await send(ctx);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	it("answers a bypass-session request without a forced account with the local 429", async () => {
@@ -548,7 +569,10 @@ describe("session-pace with every account out on limits", () => {
 		);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	for (const session of ["mapped-session", "new-session", null]) {
@@ -843,7 +867,10 @@ describe("refusals on the rule path (point 6)", () => {
 		const { ctx, writes, row } = makeCtx([a, b], paceStrategy());
 
 		for (let i = 0; i < 4; i++) {
-			await expectBuiltLimit429(await send(ctx), { resetAt: NOW + HOUR });
+			await expectBuiltLimit429(await send(ctx), {
+				resetAt: NOW + HOUR,
+				cooldown: true,
+			});
 		}
 
 		expect(perAccount(calls)).toEqual({});
@@ -1198,7 +1225,10 @@ describe("session-pace with every account out on limits and capacity routing on"
 		const response = await send(ctx);
 
 		expect(perAccount(calls)).toEqual({});
-		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	it("answers count_tokens with the local 429", async () => {

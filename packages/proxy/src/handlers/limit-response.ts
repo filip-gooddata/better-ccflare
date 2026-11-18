@@ -1,3 +1,4 @@
+import { isUsageExhausted } from "@better-ccflare/core";
 import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
 import {
 	type AnyUsageData,
@@ -39,6 +40,7 @@ export interface LocalLimitInput {
 
 const H = "anthropic-ratelimit-unified";
 const RESET_HEADER = `${H}-reset`;
+const CLAIM_HEADER = `${H}-representative-claim`;
 const DISABLED_REASON_HEADER = `${H}-overage-disabled-reason`;
 const DEFAULT_RETRY_AFTER_SECONDS = 60;
 /** Upstream's value on every observed 429; the value it sends with extra usage off is unknown. */
@@ -80,13 +82,16 @@ function claimFor(binding: LimitBinding): string {
  * approximate, as DESIGN.md section 2's table):
  * - status 429, `content-type: application/json`: exact.
  * - `retry-after` = max(1, floor(reset_s − now_s)): exact formula; 60 when
- *   the binding reset is unknown.
- * - `x-should-retry: true`, `-unified-status: rejected`: exact.
- * - `-unified-reset`: exact (binding window's reset). Omitted when unknown.
+ *   the binding reset is unknown. A cooldown answer
+ *   ({@link buildLocalCooldownResponse}) counts to the cooldown end instead.
+ * - `x-should-retry: true`, `-unified-status: rejected`: exact. A cooldown
+ *   answer omits `-unified-status`: no limit is full.
+ * - `-unified-reset`: exact (binding window's reset). Omitted when unknown,
+ *   and on a cooldown answer (a cooldown end is not a quota reset).
  * - `-unified-representative-claim`: approximate. `five_hour` / `seven_day`
  *   from the binding; a family binding sends `seven_day_<family>` (lower
  *   case), a name never observed upstream. `_overage_included` variants are
- *   not derivable.
+ *   not derivable. Omitted on a cooldown answer.
  * - `-5h-status`: exact from utilization ≥ 100 (`rejected`, else `allowed`).
  *   `-5h-reset`: exact. `-5h-utilization`: approximate (integer percent up to
  *   one poll old, as a fraction). `-5h-surpassed-threshold: 1.0`: approximate,
@@ -114,12 +119,41 @@ export function buildLocalLimitResponse(
 	input: LocalLimitInput,
 	now: number = Date.now(),
 ): Response {
+	return buildLocal429(input.binding, input.resetMs, input, now);
+}
+
+/** The usage readings a local 429 reports, without a binding limit. */
+export type LocalLimitReadings = Pick<
+	LocalLimitInput,
+	"fiveHour" | "sevenDay" | "overage"
+>;
+
+/**
+ * The local 429 for an account out only on a cooldown (no full limit): still
+ * a 429 with `x-should-retry: true`, but it claims no limit. No
+ * `-unified-status`, no `-unified-representative-claim` and no
+ * `-unified-reset` (a cooldown end is not a quota reset); `retry-after`
+ * counts to the cooldown end (60 when unknown). The window and overage
+ * headers come from the readings alone, as in {@link buildLocalLimitResponse}.
+ */
+export function buildLocalCooldownResponse(
+	readings: LocalLimitReadings | null,
+	cooldownResetMs: number | null,
+	now: number = Date.now(),
+): Response {
+	return buildLocal429(null, cooldownResetMs, readings ?? {}, now);
+}
+
+function buildLocal429(
+	binding: LimitBinding | null,
+	resetMs: number | null,
+	input: LocalLimitReadings,
+	now: number,
+): Response {
 	const headers = new Headers({
 		"content-type": "application/json",
-		"retry-after": String(retryAfterSeconds(input.resetMs, now)),
+		"retry-after": String(retryAfterSeconds(resetMs, now)),
 		"x-should-retry": "true",
-		[`${H}-status`]: "rejected",
-		[`${H}-representative-claim`]: claimFor(input.binding),
 		[`${H}-fallback-percentage`]: "0.5",
 		[`${H}-overage-status`]: "rejected",
 		[DISABLED_REASON_HEADER]:
@@ -129,8 +163,11 @@ export function buildLocalLimitResponse(
 		[`${H}-upgrade-paths`]: "overage",
 		date: new Date(now).toUTCString(),
 	});
-	if (input.resetMs !== null)
-		headers.set(RESET_HEADER, epochSeconds(input.resetMs));
+	if (binding) {
+		headers.set(`${H}-status`, "rejected");
+		headers.set(`${H}-representative-claim`, claimFor(binding));
+		if (resetMs !== null) headers.set(RESET_HEADER, epochSeconds(resetMs));
+	}
 
 	const five = input.fiveHour;
 	if (five) {
@@ -184,6 +221,8 @@ export interface CachedLimitRefusal {
 	body: Uint8Array;
 	/** The refusal's `anthropic-ratelimit-unified-reset`, epoch ms. */
 	resetMs: number;
+	/** Its `-unified-representative-claim`, lower case; null when absent. */
+	claim: string | null;
 	capturedAt: number;
 }
 
@@ -225,6 +264,7 @@ export function rememberLimitRefusal(
 		headers: new Headers(refusal.headers),
 		body: refusal.body.slice(),
 		resetMs,
+		claim: refusal.headers.get(CLAIM_HEADER)?.trim().toLowerCase() || null,
 		capturedAt: now,
 	});
 }
@@ -270,51 +310,64 @@ export function rebaseLimitRefusalHeaders(
 
 // ── Readings ───────────────────────────────────────────────────────────────
 
+/**
+ * Full as admission counts it (isUsageExhausted): at >= 100 % with its reset
+ * ahead or unknown.
+ */
 function isFull(
 	window: { utilization: number; resetMs: number | null } | null | undefined,
 	now: number,
 ): boolean {
-	return (
-		!!window &&
-		window.utilization >= 100 &&
-		window.resetMs !== null &&
-		window.resetMs > now
-	);
+	return !!window && isUsageExhausted(window.utilization, window.resetMs, now);
 }
 
+/**
+ * Whether the family is out on this account and its latest known reset. Out
+ * when the caller says so (`familyOut`), on a block, or on a usage row at
+ * >= 100 % whose reset is ahead or unknown (as admission counts it).
+ */
 function familyReading(
 	accountId: string,
 	data: AnyUsageData,
 	provider: string,
 	family: string,
 	familyResetMs: number | null | undefined,
+	familyOut: boolean,
 	now: number,
-): number | null {
+): { out: boolean; resetMs: number | null } {
+	let out = familyOut;
 	const resets: number[] = [];
 	if (typeof familyResetMs === "number" && familyResetMs > now)
 		resets.push(familyResetMs);
 	const block = getFamilyBlock(accountId, family, now);
 	if (block) resets.push(block.until);
 	for (const w of extractModelFamilyWindows(data, provider, family)) {
-		if (w.utilization >= 100 && w.resetsAt !== null && w.resetsAt > now)
-			resets.push(w.resetsAt);
+		if (!isUsageExhausted(w.utilization, w.resetsAt, now)) continue;
+		out = true;
+		if (w.resetsAt !== null) resets.push(w.resetsAt);
 	}
-	return resets.length > 0 ? Math.max(...resets) : null;
+	if (resets.length > 0) return { out: true, resetMs: Math.max(...resets) };
+	return { out, resetMs: null };
 }
 
 /**
  * Readings for one account from the usage cache. Binding: among the full
- * limits (the family when `family` is given and its window or block is full,
- * five-hour, weekly) the one with the latest reset, when the account is
- * usable again; ties go to the family. If none is full, the window with the
- * latest reset among those at ≥ 100 %, else five_hour. Null when no usage
- * is cached.
+ * limits (the family when `family` is given and it is out: `familyOut`, a
+ * block, or a full family window; five-hour; weekly) the one with the latest
+ * known reset, when the account is usable again; ties go to the family. Full
+ * means what admission counts as exhausted: at >= 100 % with the reset ahead
+ * or unknown. A full limit with an unknown reset binds only when no full
+ * limit has a known one (its reset is then omitted and retry-after is 60).
+ * If none is full, the window with the latest reset among those at ≥ 100 %,
+ * else five_hour. Null when no usage is cached.
  */
 export function localLimitInputForAccount(
 	accountId: string,
 	opts: {
 		family?: string | null;
 		familyResetMs?: number | null;
+		/** The caller's admission holds `family` out on this account. */
+		familyOut?: boolean;
 		now?: number;
 		provider?: string;
 	} = {},
@@ -353,6 +406,7 @@ export function localLimitInputForAccount(
 				provider,
 				opts.family,
 				opts.familyResetMs,
+				opts.familyOut ?? false,
 				now,
 			)
 		: null;
@@ -377,11 +431,11 @@ export function localLimitInputForAccount(
 	// is usable again only when every full limit has reset, so the latest
 	// reset binds. A window at >= 100 % whose reset has passed (not full)
 	// never outranks a full family.
-	if (opts.family && familyReset !== null) {
+	if (opts.family && familyReset?.out) {
 		if (!anyFull) candidates.length = 0;
 		candidates.unshift({
 			binding: { kind: "family", family: opts.family },
-			resetMs: familyReset,
+			resetMs: familyReset.resetMs,
 		});
 	}
 	let best: (typeof candidates)[number] | null = null;
@@ -397,13 +451,35 @@ export function localLimitInputForAccount(
 	return { binding, resetMs, fiveHour, sevenDay, overage };
 }
 
+/** The limit a real refusal's representative claim names, or null. */
+function bindingOfClaim(claim: string | null): LimitBinding | null {
+	if (!claim) return null;
+	if (claim === "five_hour") return { kind: "five_hour" };
+	if (claim === "seven_day" || claim === "seven_day_overage_included")
+		return { kind: "seven_day" };
+	const family = /^seven_day_([a-z0-9]+)$/.exec(claim)?.[1];
+	return family ? { kind: "family", family } : null;
+}
+
+function sameBinding(a: LimitBinding, b: LimitBinding | null): boolean {
+	if (!b || a.kind !== b.kind) return false;
+	return (
+		a.kind !== "family" ||
+		(b.kind === "family" && a.family.toLowerCase() === b.family.toLowerCase())
+	);
+}
+
 /**
- * The local answer for an account the request must not reach: its cached
- * real 429 replayed (headers rebased, body as received, sanitized like a
- * proxied response, plus `x-better-ccflare-request-id`) while that refusal's
- * reset is ahead; else a 429 built from the account's usage readings; else a
- * built 429 with only the binding reset known. Always status 429, plain JSON
- * even for a streaming request.
+ * The local answer for an account the request must not reach, out on
+ * `family` when one is given (the caller's admission holds that family out).
+ * The binding limit comes from {@link localLimitInputForAccount}, or with no
+ * cached usage is the family, else five_hour. The cached real 429 is replayed
+ * (headers rebased, body as received, sanitized like a proxied response, plus
+ * `x-better-ccflare-request-id`) only while its reset is ahead and its claim
+ * names that same binding limit, so one family's refusal never answers for
+ * another family or an account-wide limit. Otherwise a 429 built from the
+ * readings, or with only the binding reset known. Always status 429, plain
+ * JSON even for a streaming request.
  */
 export function localLimitResponseForAccount(
 	account: { id: string; name?: string },
@@ -415,8 +491,19 @@ export function localLimitResponseForAccount(
 	} = {},
 ): Response {
 	const now = opts.now ?? Date.now();
+	const input = localLimitInputForAccount(account.id, {
+		family: opts.family,
+		familyResetMs: opts.familyResetMs,
+		familyOut: !!opts.family,
+		now,
+	}) ?? {
+		binding: opts.family
+			? { kind: "family", family: opts.family }
+			: { kind: "five_hour" },
+		resetMs: opts.familyResetMs ?? null,
+	};
 	const cached = getCachedLimitRefusal(account.id, now);
-	if (cached) {
+	if (cached && sameBinding(input.binding, bindingOfClaim(cached.claim))) {
 		const headers = sanitizeProxyHeaders(
 			rebaseLimitRefusalHeaders(cached.headers, now),
 		);
@@ -428,16 +515,6 @@ export function localLimitResponseForAccount(
 			headers,
 		});
 	}
-	const input = localLimitInputForAccount(account.id, {
-		family: opts.family,
-		familyResetMs: opts.familyResetMs,
-		now,
-	}) ?? {
-		binding: opts.family
-			? { kind: "family", family: opts.family }
-			: { kind: "five_hour" },
-		resetMs: opts.familyResetMs ?? null,
-	};
 	const response = buildLocalLimitResponse(input, now);
 	if (opts.requestId)
 		response.headers.set("x-better-ccflare-request-id", opts.requestId);

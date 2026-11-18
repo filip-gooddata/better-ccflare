@@ -1,7 +1,9 @@
 import { getModelFamily } from "@better-ccflare/core";
 import type { AnyUsageData } from "@better-ccflare/providers";
 import {
+	buildLocalCooldownResponse,
 	buildLocalLimitResponse,
+	localLimitInputForAccount,
 	localLimitResponseForAccount,
 } from "./limit-response";
 
@@ -413,11 +415,19 @@ export interface ModelFamilyExhaustionInfo {
  * `retry-after` counted to `resetAt`. The body carries Anthropic's fixed
  * rate-limit text, which names no window, so no `origin` (a cooldown, a
  * reactive mark) is misattributed to weekly capacity; `origin` no longer
- * changes the response.
+ * changes the response, except `cooldown_masked`: an account with room for
+ * the family exists and is only cooling down, so that answer is the cooldown
+ * 429 (no unified status, claim or reset; `retry-after` counted to `resetAt`).
  */
 export function createModelFamilyExhaustedResponse(
 	info: ModelFamilyExhaustionInfo,
 ): Response {
+	if (info.origin === "cooldown_masked") {
+		return buildLocalCooldownResponse(
+			info.accountId ? localLimitInputForAccount(info.accountId) : null,
+			info.resetAt,
+		);
+	}
 	if (info.accountId) {
 		return localLimitResponseForAccount(
 			{ id: info.accountId },
