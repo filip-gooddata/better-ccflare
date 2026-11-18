@@ -302,3 +302,46 @@ describe("AutoRefreshScheduler — a genuinely failing probe still counts", () =
 		expect(pauseCallFor(db, row.id)).toBeDefined();
 	});
 });
+
+describe("AutoRefreshScheduler — a local 429 with no known reset", () => {
+	type Internals = {
+		limitRefusedUntil: Map<string, number>;
+		uncountedProbeFailures: Map<string, { at: number; streak: number }>;
+	};
+	const internals = (scheduler: TestableScheduler) =>
+		scheduler as unknown as Internals;
+
+	const cases: Array<[string, (now: number) => Response]> = [
+		[
+			"limit answer",
+			(now) =>
+				buildLocalLimitResponse(
+					{ binding: { kind: "five_hour" }, resetMs: null },
+					now,
+				),
+		],
+		["cooldown answer", (now) => buildLocalCooldownResponse(null, null, now)],
+	];
+
+	for (const [name, make] of cases) {
+		it(`${name}: no fixed hold; the uncounted-failure ladder spaces probes, never counted`, async () => {
+			const now = Date.now();
+			respondWith(() => make(now));
+			const db = makeDb();
+			const scheduler = await makeScheduler(db);
+			const row = makeAccountRow();
+
+			for (let i = 0; i < 3; i++) {
+				resetAutoRefreshPromptPoolForTests();
+				expect(await scheduler.sendDummyMessage(row)).toBe(false);
+			}
+
+			expect(internals(scheduler).limitRefusedUntil.has(row.id)).toBe(false);
+			expect(
+				internals(scheduler).uncountedProbeFailures.get(row.id)?.streak,
+			).toBe(3);
+			expect(scheduler.consecutiveFailures.get(row.id)).toBeUndefined();
+			expect(pauseCallFor(db, row.id)).toBeUndefined();
+		});
+	}
+});

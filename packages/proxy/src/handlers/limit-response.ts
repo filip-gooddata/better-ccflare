@@ -1,5 +1,9 @@
 import { isUsageExhausted } from "@better-ccflare/core";
-import { sanitizeProxyHeaders } from "@better-ccflare/http-common";
+import {
+	LOCAL_429_MARKER_HEADER,
+	sanitizeProxyHeaders,
+	stripProxyOnlyHeaders,
+} from "@better-ccflare/http-common";
 import {
 	type AnyUsageData,
 	extractFiveHourWindow,
@@ -46,7 +50,12 @@ const RESET_HEADER = `${H}-reset`;
  * a replayed upstream one, so a caller such as the auto-refresh scheduler can
  * tell the proxy's own refusal from an upstream 429.
  */
-export const LOCAL_429_HEADER = "x-better-ccflare-local-429";
+export const LOCAL_429_HEADER = LOCAL_429_MARKER_HEADER;
+/**
+ * The marker's value on a cooldown answer whose cooldown end is unknown: its
+ * `retry-after` is the 60 s default, not a time anything resets.
+ */
+export const LOCAL_429_COOLDOWN_UNKNOWN_END = "cooldown-unknown-end";
 const CLAIM_HEADER = `${H}-representative-claim`;
 const DISABLED_REASON_HEADER = `${H}-overage-disabled-reason`;
 const DEFAULT_RETRY_AFTER_SECONDS = 60;
@@ -103,8 +112,10 @@ function claimFor(binding: LimitBinding): string {
  *   `seven_day_oauth_apps` window) is approximate in claim and reset: the
  *   reset is the snapshot's, and the `-7d-*` headers still describe the
  *   all-models weekly window, which may read `allowed`.
- * - `x-better-ccflare-local-429` (`limit` / `cooldown`): proxy-only marker,
- *   not an upstream header.
+ * - `x-better-ccflare-local-429` (`limit` / `cooldown`, or
+ *   `cooldown-unknown-end` for a cooldown answer with no known end):
+ *   proxy-only marker, not an upstream header. Stripped from every upstream
+ *   response as it arrives, from the cached real 429 and from its replay.
  * - `-5h-status`: exact from utilization ≥ 100 (`rejected`, else `allowed`).
  *   `-5h-reset`: exact. `-5h-utilization`: approximate (integer percent up to
  *   one poll old, as a fraction). `-5h-surpassed-threshold: 1.0`: approximate,
@@ -167,7 +178,11 @@ function buildLocal429(
 		"content-type": "application/json",
 		"retry-after": String(retryAfterSeconds(resetMs, now)),
 		"x-should-retry": "true",
-		[LOCAL_429_HEADER]: binding ? "limit" : "cooldown",
+		[LOCAL_429_HEADER]: binding
+			? "limit"
+			: resetMs === null
+				? LOCAL_429_COOLDOWN_UNKNOWN_END
+				: "cooldown",
 		[`${H}-fallback-percentage`]: "0.5",
 		[`${H}-overage-status`]: "rejected",
 		[DISABLED_REASON_HEADER]:
@@ -272,10 +287,12 @@ export function rememberLimitRefusal(
 	if (reason) lastDisabledReason.set(accountId, reason);
 	const resetMs = limitRefusalResetMs(refusal.headers);
 	if (resetMs === null || resetMs <= now) return;
+	const headers = new Headers(refusal.headers);
+	stripProxyOnlyHeaders(headers);
 	refusalCache.set(accountId, {
 		status: refusal.status,
 		statusText: refusal.statusText,
-		headers: new Headers(refusal.headers),
+		headers,
 		body: refusal.body.slice(),
 		resetMs,
 		claim: refusal.headers.get(CLAIM_HEADER)?.trim().toLowerCase() || null,
@@ -307,7 +324,8 @@ export function clearLimitRefusalCache(): void {
 
 /**
  * Copy of `headers` with only `retry-after` (max(1, floor(reset_s − now_s))
- * from `anthropic-ratelimit-unified-reset`) and `date` (now) rewritten. A
+ * from `anthropic-ratelimit-unified-reset`) and `date` (now) rewritten, and
+ * no proxy-only marker (a replayed upstream 429 is not the proxy's own). A
  * missing or unparseable reset leaves `retry-after` as it was.
  */
 export function rebaseLimitRefusalHeaders(
@@ -315,6 +333,7 @@ export function rebaseLimitRefusalHeaders(
 	now: number = Date.now(),
 ): Headers {
 	const out = new Headers(headers);
+	stripProxyOnlyHeaders(out);
 	const resetMs = limitRefusalResetMs(headers);
 	if (resetMs !== null)
 		out.set("retry-after", String(retryAfterSeconds(resetMs, now)));
