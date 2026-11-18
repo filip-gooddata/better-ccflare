@@ -1,11 +1,36 @@
 import { describe, expect, test } from "bun:test";
 import { BUCKET_MS } from "../../../types";
 import type { PaceSeries } from "../../pace/types";
+import { observedWorkStartBucket } from "../rows/workstart";
 import { scoreWorkstartSample } from "../rows/workstart-sample";
 import { scoreWorkstartShare } from "../rows/workstart-share";
 import type { LearnInput } from "../types";
 
 const DAY = 288;
+
+describe("row 16 observed work start", () => {
+	const obs = (units: number[]) =>
+		observedWorkStartBucket(Float64Array.from(units));
+	test("spillover, then the night gap, then work: the first bucket after the gap", () => {
+		// total 22, half reached at bucket 8; zero runs 2..6 (before) and 10..13 (after the median)
+		expect(obs([1, 1, 0, 0, 0, 0, 0, 5, 5, 5, 0, 0, 0, 0, 5])).toBe(7);
+	});
+	test("no zero run before the median: the first active bucket", () => {
+		expect(obs([2, 2, 2, 2])).toBe(0);
+		// the only run is the leading one: its end is the first active bucket
+		expect(obs([0, 0, 4, 4, 0, 4])).toBe(2);
+	});
+	test("two equally long runs: the later one", () => {
+		// total 20, half reached at bucket 8; runs 1..3 and 5..7
+		expect(obs([1, 0, 0, 0, 1, 0, 0, 0, 9, 9])).toBe(8);
+	});
+	test("median at the very first bucket: the first active bucket", () => {
+		expect(obs([9, 0, 0, 0, 1])).toBe(0);
+	});
+	test("no demand: -1", () => {
+		expect(obs([0, 0, 0])).toBe(-1);
+	});
+});
 const MON_NOV_2 = Date.UTC(2026, 10, 2);
 
 /**
@@ -122,12 +147,13 @@ describe("row 16 units and loss", () => {
 		const at = (share: number) => [
 			...(s.loss[s.candidates.indexOf(share)] as Float64Array),
 		];
-		// share 5: W1 held out -> median(540 x5, 480 x5) = 510 vs 120;
+		// observed: W1 09:00 (the 02:00 stray precedes the night gap), W2 09:00, W3 08:00
+		// share 5: W1 held out -> median(540 x5, 480 x5) = 510 vs 540;
 		// W2 -> 510 vs 540; W3 -> 540 vs 480
-		expect(at(5)).toEqual([...rep(390, 5), ...rep(30, 5), ...rep(60, 5)]);
+		expect(at(5)).toEqual([...rep(30, 5), ...rep(30, 5), ...rep(60, 5)]);
 		// share 1 catches the W1 stray at 02:00: W2 -> median(120 x5, 480 x5) = 300;
 		// W3 -> median(120 x5, 540 x5) = 330
-		expect(at(1)).toEqual([...rep(390, 5), ...rep(240, 5), ...rep(150, 5)]);
+		expect(at(1)).toEqual([...rep(30, 5), ...rep(240, 5), ...rep(150, 5)]);
 		expect(s.loss).toHaveLength(6);
 		for (const l of s.loss) expect(l).toHaveLength(15);
 	});
@@ -138,7 +164,7 @@ describe("row 16 units and loss", () => {
 		// sample 5: W1 -> nearest are W2 (540); W2 Mon..Wed -> mostly W1 (540),
 		// Thu/Fri -> mostly W3 (480); W3 -> W2 (540)
 		expect([...(s.loss[0] as Float64Array)]).toEqual([
-			...rep(420, 5),
+			...rep(0, 5),
 			0,
 			0,
 			0,
@@ -146,7 +172,7 @@ describe("row 16 units and loss", () => {
 			60,
 			...rep(60, 5),
 		]);
-		const ten = [...rep(390, 5), ...rep(30, 5), ...rep(60, 5)];
+		const ten = [...rep(30, 5), ...rep(30, 5), ...rep(60, 5)];
 		expect([...(s.loss[1] as Float64Array)]).toEqual(ten);
 		// only 10 training work days exist: sample 20 uses what exists
 		expect([...(s.loss[2] as Float64Array)]).toEqual(ten);

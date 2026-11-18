@@ -36,9 +36,38 @@ export function gridWithPresent(
 }
 
 /**
+ * Observed work-start bucket of a day: the first active bucket after the day's
+ * longest run of zero-demand buckets that ends before the day's demand median
+ * (the first bucket at which the cumulative units reach half the total; ties
+ * between equally long runs go to the later one). Without such a run, the
+ * first active bucket; -1 without demand. Overnight spillover before the
+ * night's break therefore does not count as the work start.
+ */
+export function observedWorkStartBucket(curve: Float64Array): number {
+	const first = curve.findIndex((u) => u > 0);
+	if (first < 0) return -1;
+	const mid = shareReachedAt(curve, 50) as number;
+	let best = -1;
+	let bestLen = 0;
+	let run = 0;
+	for (let b = 0; b < mid; b++) {
+		if ((curve[b] as number) > 0) {
+			run = 0;
+			continue;
+		}
+		run++;
+		if ((curve[b + 1] as number) > 0 && run >= bestLen) {
+			bestLen = run;
+			best = b + 1;
+		}
+	}
+	return best >= 0 ? best : first;
+}
+
+/**
  * Out-of-fold work-start loss per (share, sample) pair. Units: held-out work
  * days (by `workDays`) that are uncensored and active, leave-one-ISO-week-out.
- * Observed = the held-out day's first bucket with demand, local minute.
+ * Observed = `observedWorkStartBucket` of the held-out day, local minute.
  * Predicted = days.ts's work start: per training work day the minute its
  * cumulative demand reaches `sharePct` (`shareReachedAt`), median over the
  * `sample` training work days with demand nearest in time (ties to the earlier
@@ -75,7 +104,7 @@ export function workStartLosses(
 			const day = days[h] as LearnDay;
 			if (!day.isWorkday || !day.active) continue;
 			units.push(h);
-			const observed = minuteOf(day, day.firstActiveBucket);
+			const observed = minuteOf(day, observedWorkStartBucket(day.curve));
 			const nearest = [...train].sort(
 				(a, b) =>
 					Math.abs(a.startMs - day.startMs) -
