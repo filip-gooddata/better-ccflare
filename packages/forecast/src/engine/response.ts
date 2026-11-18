@@ -17,7 +17,7 @@ import type {
 import { FORECAST_CONTRACT_VERSION } from "../types";
 import type { EngineContext, SimulationResult } from "./model";
 import { pastSeries, pastStops, type Quantity } from "./past";
-import { levelLines, levelOf, quotaQuantile } from "./percentile";
+import { levelLinesSliced, levelOf, quotaQuantile } from "./percentile";
 import {
 	countsFor,
 	type LineBlock,
@@ -26,6 +26,7 @@ import {
 	stopNow,
 	zeroPoints,
 } from "./stops";
+import { runNow, runSliced, type Sliced } from "./yield";
 
 const HOUR_MS = 3_600_000;
 const LIGHT = 10;
@@ -66,7 +67,27 @@ export function buildResponse(
 	ctx: EngineContext,
 	sim: SimulationResult,
 ): ForecastResponse {
+	return runNow(responseWork(ctx, sim));
+}
+
+/**
+ * buildResponse for the engine, which runs on the request-forwarding thread: the event loop
+ * runs about every SLICE_MS of work. Same response as buildResponse.
+ */
+export function buildResponseSliced(
+	ctx: EngineContext,
+	sim: SimulationResult,
+): Promise<ForecastResponse> {
+	return runSliced(responseWork(ctx, sim));
+}
+
+function* responseWork(
+	ctx: EngineContext,
+	sim: SimulationResult,
+): Sliced<ForecastResponse> {
 	const levels = responseLevels(ctx.input.settings);
+	const day = yield* buildBlock(ctx, sim, "day", levels);
+	const week = yield* buildBlock(ctx, sim, "week", levels);
 	return {
 		contractVersion: FORECAST_CONTRACT_VERSION,
 		computedAt: ctx.now,
@@ -74,8 +95,8 @@ export function buildResponse(
 		reason: null,
 		accounts: ctx.accounts.map((a) => a.accountId),
 		levels: namedLevels(),
-		day: buildBlock(ctx, sim, "day", levels),
-		week: buildBlock(ctx, sim, "week", levels),
+		day,
+		week,
 		fable: fable(ctx, sim),
 	};
 }
@@ -156,19 +177,19 @@ function blockIndices(
  * values with one weight keeps them ordered, and 0 is below all of them, so the
  * ordering holds at inserted points.
  */
-function blockLines(
+function* blockLines(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	levels: number[],
 	end: EpochMs,
-): LineBlock {
+): Sliced<LineBlock> {
 	const times = sim.axis.times;
 	let lastIndex = 0;
 	while (lastIndex + 1 < times.length && times[lastIndex + 1] <= end)
 		lastIndex++;
 	const series = sim.traces.map((t) => (quantity === "day" ? t.day : t.week));
-	const lines = levelLines(series, lastIndex + 1, levels);
+	const lines = yield* levelLinesSliced(series, lastIndex + 1, levels);
 	const need = levels.map((l) => daysAtZeroForLevel(series.length, l));
 	const cutoff = zeroPoints(ctx.accounts.length);
 
@@ -253,18 +274,18 @@ function blockLines(
 	return { times: outTimes, levels, values, end };
 }
 
-function buildBlock(
+function* buildBlock(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	levels: number[],
-): ForecastBlock {
+): Sliced<ForecastBlock> {
 	const end = quantity === "day" ? ctx.horizon.dayEnd : ctx.horizon.weekEnd;
-	const block = blockLines(ctx, sim, quantity, levels, end);
+	const block = yield* blockLines(ctx, sim, quantity, levels, end);
 	const stops = {
-		light: projectedStops(ctx, sim, quantity, block, LIGHT),
-		typical: projectedStops(ctx, sim, quantity, block, TYPICAL),
-		heavy: projectedStops(ctx, sim, quantity, block, HEAVY),
+		light: yield* projectedStops(ctx, sim, quantity, block, LIGHT),
+		typical: yield* projectedStops(ctx, sim, quantity, block, TYPICAL),
+		heavy: yield* projectedStops(ctx, sim, quantity, block, HEAVY),
 	};
 	const cutoff = zeroPoints(ctx.accounts.length);
 	const rounded = block.values.map((line) =>
@@ -277,6 +298,8 @@ function buildBlock(
 			fan[`p${level}`] = rounded[l];
 	});
 	const current = stopNow(ctx, quantity);
+	const gap = yield* shortfall(ctx, sim, quantity, block, stops.typical);
+	const odds = yield* stopOdds(ctx, sim, quantity, end, current);
 	return {
 		past: roundSeries(pastSeries(ctx, quantity)),
 		times: block.times,
@@ -287,8 +310,8 @@ function buildBlock(
 		stops,
 		stopNow: current,
 		pastStops: pastStops(ctx, quantity),
-		shortfall: shortfall(ctx, sim, quantity, block, stops.typical),
-		...stopOdds(ctx, sim, quantity, end, current),
+		shortfall: gap,
+		...odds,
 	};
 }
 
@@ -313,20 +336,21 @@ function median(values: number[]): number {
  * when that share (rounded) is at least one half. During a running stop the
  * chance is 1 and likelyStop is null: the client shows stopNow.
  */
-function stopOdds(
+function* stopOdds(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	end: EpochMs,
 	current: Interval | null,
-): { stopChance: number; likelyStop: LikelyStop | null } {
+): Sliced<{ stopChance: number; likelyStop: LikelyStop | null }> {
 	if (current) return { stopChance: 1, likelyStop: null };
 	const starts: number[] = [];
 	const lengths: number[] = [];
 	for (const trace of sim.traces) {
 		const one: SimulationResult = { ...sim, traces: [trace] };
-		const line = blockLines(ctx, one, quantity, [TYPICAL], end);
-		const first = projectedStops(ctx, one, quantity, line, TYPICAL)[0];
+		yield;
+		const line = yield* blockLines(ctx, one, quantity, [TYPICAL], end);
+		const first = (yield* projectedStops(ctx, one, quantity, line, TYPICAL))[0];
 		if (!first) continue;
 		starts.push(first.start);
 		lengths.push(first.end - first.start);

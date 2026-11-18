@@ -1,4 +1,5 @@
 import { quantileSorted } from "simple-statistics";
+import { runNow, type Sliced } from "./yield";
 
 /**
  * Quantile of quota left behind level pNN: pNN of demand is the value that quota left is at or
@@ -18,9 +19,22 @@ export function levelLines(
 	length: number,
 	levels: number[],
 ): Float64Array[] {
+	return runNow(levelLinesSliced(series, length, levels));
+}
+
+/** Simulated values levelLinesSliced sorts between two pauses (a fraction of a millisecond). */
+const CELLS_PER_STEP = 4096;
+
+/** levelLines as sliced work: it may pause after about CELLS_PER_STEP values. */
+export function* levelLinesSliced(
+	series: ArrayLike<number>[],
+	length: number,
+	levels: number[],
+): Sliced<Float64Array[]> {
 	const lines = levels.map(() => new Float64Array(length));
 	const quantiles = levels.map(quotaQuantile);
 	const column = new Float64Array(series.length);
+	const columnsPerStep = Math.ceil(CELLS_PER_STEP / Math.max(1, series.length));
 	for (let i = 0; i < length; i++) {
 		for (let s = 0; s < series.length; s++) column[s] = series[s][i];
 		column.sort();
@@ -29,6 +43,7 @@ export function levelLines(
 				series.length === 0
 					? 0
 					: quantileSorted(column as unknown as number[], quantiles[l]);
+		if ((i + 1) % columnsPerStep === 0) yield;
 	}
 	return lines;
 }

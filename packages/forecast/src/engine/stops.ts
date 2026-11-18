@@ -20,6 +20,7 @@ import {
 } from "./past";
 import { levelOf } from "./percentile";
 import { FULL_POINTS } from "./simulate";
+import type { Sliced } from "./yield";
 
 /**
  * Pooled quota left at or below this is 0. An account is full from FULL_POINTS
@@ -87,15 +88,16 @@ function meanK(ctx: EngineContext, quantity: Quantity): number {
  * inserted zero point) counts in proportion to the overlap: the trace holds
  * step totals only, so demand is taken as spread evenly over its step.
  */
-function unservedPoints(
+function* unservedPoints(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	interval: Interval,
-): number[] {
+): Sliced<number[]> {
 	const times = sim.axis.times;
 	const k = meanK(ctx, quantity);
-	return sim.traces.map((trace) => {
+	const points: number[] = [];
+	for (const trace of sim.traces) {
 		let units = 0;
 		for (let i = 1; i < times.length; i++) {
 			const from = Math.max(times[i - 1], interval.start);
@@ -103,8 +105,10 @@ function unservedPoints(
 			if (to > from)
 				units += (trace.unserved[i] * (to - from)) / (times[i] - times[i - 1]);
 		}
-		return units * k;
-	});
+		points.push(units * k);
+		yield;
+	}
+	return points;
 }
 
 /**
@@ -129,13 +133,13 @@ function unservedAtLevel(points: number[], level: number): number {
  * only when the level's unserved points inside reach settings.minStopPoints, so
  * zero quota with no demand (night, weekend) is not a stop.
  */
-export function projectedStops(
+export function* projectedStops(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	block: LineBlock,
 	level: number,
-): Interval[] {
+): Sliced<Interval[]> {
 	const values = block.values[block.levels.indexOf(level)];
 	const cutoff = zeroPoints(ctx.accounts.length);
 	const runs: { first: number; end: EpochMs }[] = [];
@@ -150,13 +154,14 @@ export function projectedStops(
 	}
 	if (first !== null) runs.push({ first, end: block.end });
 	const min = ctx.input.settings.minStopPoints;
-	return runs
-		.filter((run) => run.first > 0 && block.times[run.first] > ctx.now)
-		.map((run) => ({ start: block.times[run.first], end: run.end }))
-		.filter(
-			(stop) =>
-				unservedAtLevel(unservedPoints(ctx, sim, quantity, stop), level) >= min,
-		);
+	const stops: Interval[] = [];
+	for (const run of runs) {
+		if (run.first === 0 || block.times[run.first] <= ctx.now) continue;
+		const stop = { start: block.times[run.first], end: run.end };
+		const points = yield* unservedPoints(ctx, sim, quantity, stop);
+		if (unservedAtLevel(points, level) >= min) stops.push(stop);
+	}
+	return stops;
 }
 
 interface CurrentStop {
@@ -221,18 +226,19 @@ export function stopNow(
  * days (never out: +Infinity, i.e. after everyone). With no such day, the
  * account with the most quota left now, the one that would run out last.
  */
-function projectedOuts(
+function* projectedOuts(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	stop: Interval,
-): { last: number; outAt: number[] } {
+): Sliced<{ last: number; outAt: number[] }> {
 	const times = sim.axis.times;
 	const n = ctx.accounts.length;
 	const cutoff = zeroPoints(n);
 	const lastCount = new Array<number>(n).fill(0);
 	const outTimes: number[][] = Array.from({ length: n }, () => []);
 	for (const trace of sim.traces) {
+		yield;
 		const series = quantity === "day" ? trace.day : trace.week;
 		let zeroAt: EpochMs | null = null;
 		for (let i = 0; i < times.length && times[i] <= stop.end; i++)
@@ -315,13 +321,13 @@ export function spill(
  * stop. points = median over the simulated days of the unserved points inside it
  * (for the running stop from computedAt to its end, within the projection).
  */
-export function shortfall(
+export function* shortfall(
 	ctx: EngineContext,
 	sim: SimulationResult,
 	quantity: Quantity,
 	block: LineBlock,
 	typicalStops: Interval[],
-): Shortfall | null {
+): Sliced<Shortfall | null> {
 	const current = currentStop(ctx, quantity);
 	let stop: Interval;
 	let counted: Interval;
@@ -333,11 +339,11 @@ export function shortfall(
 	} else if (typicalStops.length > 0) {
 		stop = typicalStops[0];
 		counted = stop;
-		who = projectedOuts(ctx, sim, quantity, stop);
+		who = yield* projectedOuts(ctx, sim, quantity, stop);
 	} else {
 		return null;
 	}
-	const points = levelOf(unservedPoints(ctx, sim, quantity, counted), 50);
+	const points = levelOf(yield* unservedPoints(ctx, sim, quantity, counted), 50);
 	const pointsTenths = Math.round(points * TENTHS);
 	const fills = ctx.accounts.map((a) =>
 		fillAtNow(a, quantity, ctx.now, capRatio(ctx.calibration, a.accountId)),

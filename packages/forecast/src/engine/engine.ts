@@ -58,7 +58,7 @@ import {
 	planJobTransfer,
 	type ScenarioLadderOverride,
 } from "./plan-job";
-import { buildResponse, unavailableResponse } from "./response";
+import { buildResponseSliced, unavailableResponse } from "./response";
 import { SCENARIO_LADDER_TOP } from "./scenario-count";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
@@ -351,7 +351,7 @@ async function computeForecast(
 		override,
 	);
 
-	const response = buildResponse(ctx, result);
+	const response = await buildResponseSliced(ctx, result);
 	checkBlock(response.day);
 	checkBlock(response.week);
 	if (!ctx.inputs) return { available: true, response, plan };
