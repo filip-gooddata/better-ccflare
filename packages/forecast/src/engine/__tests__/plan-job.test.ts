@@ -5,6 +5,7 @@ import type { EngineContext } from "../model";
 import {
 	PLAN_BUDGET_MS,
 	PLAN_JOB_TIMEOUT_MS,
+	planJobContext,
 	planJobTransfer,
 	planReplyTransfer,
 	runPlanJob,
@@ -19,14 +20,15 @@ async function replayContext(): Promise<EngineContext> {
 	const ctx = await prepareEngineContext(buildInput(replayFixture()), {
 		noise: true,
 	});
-	if (ctx === "insufficient_history") throw new Error("fixture has no forecast");
+	if (ctx === "insufficient_history")
+		throw new Error("fixture has no forecast");
 	return ctx;
 }
 
 describe("plan job: budget and timeout come from the forecast spacing", () => {
-	test("the planner budget is half the minimum spacing; the job timeout is the spacing", () => {
+	test("the planner budget is half the minimum spacing; the job timeout is four spacings", () => {
 		expect(PLAN_BUDGET_MS).toBe(FORECAST_MIN_SPACING_MS / 2);
-		expect(PLAN_JOB_TIMEOUT_MS).toBe(FORECAST_MIN_SPACING_MS);
+		expect(PLAN_JOB_TIMEOUT_MS).toBe(4 * FORECAST_MIN_SPACING_MS);
 	});
 });
 
@@ -77,6 +79,38 @@ describe("plan job: the worker-side planner call", () => {
 				]),
 			);
 			expect(new Set(back)).toEqual(traceBuffers);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
+
+	test(
+		"the planner reads none of the input left out of the job context",
+		async () => {
+			const ctx = await replayContext();
+			const inline = await planForecast(await replayContext());
+			const input = { ...ctx.input };
+			for (const key of ["history", "accountHistory", "readings"] as const)
+				Object.defineProperty(input, key, {
+					get() {
+						throw new Error(`planner read input.${key}`);
+					},
+				});
+			const guarded = Object.defineProperty({ ...ctx, input }, "inputs", {
+				get() {
+					throw new Error("planner read ctx.inputs");
+				},
+			});
+			const planned = await planForecast(guarded);
+			expect(planned.plan).toEqual(inline.plan);
+			expect(planned.score).toEqual(inline.score);
+
+			const slim = planJobContext(ctx);
+			expect(slim.input.history).toEqual([]);
+			expect(slim.input.accountHistory).toEqual([]);
+			expect(slim.input.readings).toEqual([]);
+			expect("inputs" in slim).toBe(false);
+			expect(ctx.input.history.length).toBeGreaterThan(0);
+			expect(ctx.inputs).toBeDefined();
 		},
 		REPLAY_TIMEOUT_MS,
 	);

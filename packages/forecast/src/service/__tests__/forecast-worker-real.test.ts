@@ -116,20 +116,25 @@ async function replayContext() {
 	const ctx = await prepareEngineContext(buildInput(replayFixture()), {
 		noise: true,
 	});
-	if (ctx === "insufficient_history") throw new Error("fixture has no forecast");
+	if (ctx === "insufficient_history")
+		throw new Error("fixture has no forecast");
 	return ctx;
 }
 
 describe("forecast worker: the plan job", () => {
 	it("answers a plan job with the plan an inline planForecast gives", async () => {
 		const { planForecast } = await import("../../engine/planner");
-		const { PLAN_BUDGET_MS, PLAN_JOB_TIMEOUT_MS, planJobTransfer } =
-			await import("../../engine/plan-job");
+		const {
+			PLAN_BUDGET_MS,
+			PLAN_JOB_TIMEOUT_MS,
+			planJobContext,
+			planJobTransfer,
+		} = await import("../../engine/plan-job");
 		const inline = await planForecast(await replayContext());
 		const ctx = await replayContext();
 		const outcome = await sourceRunner().run(
 			"plan",
-			{ ctx, budgetMs: PLAN_BUDGET_MS },
+			{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
 			{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
 		);
 		if (outcome.status !== "ok") throw new Error(JSON.stringify(outcome));
@@ -142,8 +147,12 @@ describe("forecast worker: the plan job", () => {
 	}, 240_000);
 
 	it("keeps a 20 ms interval ticking while a plan job runs", async () => {
-		const { PLAN_BUDGET_MS, PLAN_JOB_TIMEOUT_MS, planJobTransfer } =
-			await import("../../engine/plan-job");
+		const {
+			PLAN_BUDGET_MS,
+			PLAN_JOB_TIMEOUT_MS,
+			planJobContext,
+			planJobTransfer,
+		} = await import("../../engine/plan-job");
 		const ctx = await replayContext();
 		let last = performance.now();
 		let maxGap = 0;
@@ -157,7 +166,7 @@ describe("forecast worker: the plan job", () => {
 		try {
 			const outcome = await sourceRunner().run(
 				"plan",
-				{ ctx, budgetMs: PLAN_BUDGET_MS },
+				{ ctx: planJobContext(ctx), budgetMs: PLAN_BUDGET_MS },
 				{ timeoutMs: 4 * PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
 			);
 			expect(outcome.status).toBe("ok");
