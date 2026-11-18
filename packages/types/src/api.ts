@@ -111,8 +111,11 @@ export interface StrategyConfigResponse {
 	strategy: string;
 	strategySource: "env" | "file" | "default";
 	sessionPace: SessionPaceSettings;
-	/** Effective forecast settings (always present). */
-	forecastSettings: ForecastSettings;
+	/**
+	 * Effective forecast settings (always present), plus `fanLevelCount`: the number of
+	 * levels in `fanLevels`, whether the fan was set by a count or a list.
+	 */
+	forecastSettings: ForecastSettings & { fanLevelCount: number };
 	/** Discovery of GET /api/forecast; present only while the forecast is enabled. */
 	forecast?: ForecastDiscovery;
 }

@@ -101,7 +101,10 @@ export function createConfigHandlers(
 				strategy,
 				strategySource: config.getStrategySource(),
 				sessionPace: getSessionPaceSettings(),
-				forecastSettings,
+				forecastSettings: {
+					...forecastSettings,
+					fanLevelCount: forecastSettings.fanLevels.length,
+				},
 			};
 			// Discovery of GET /api/forecast, only while the forecast is on
 			// (docs/forecast-endpoint.md section 1).
