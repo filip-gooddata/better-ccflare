@@ -26,12 +26,12 @@ import {
 	prague,
 	replayFixture,
 } from "./fixtures-engine";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const MIN = 60_000;
 const FIVE_HOURS = 5 * 60 * MIN;
-// Each test simulates 400 days, some several plans, each plan searching every quarter hour of the next
-// 24 h; the default 5 s is short under a loaded full suite.
-const REPLAY_TIMEOUT_MS = 600_000;
+// Each test simulates 400 days, some several plans, each searching the full grid (plan-timeout.ts).
+const REPLAY_TIMEOUT_MS = FULL_GRID_TIMEOUT_MS;
 
 async function contextOf(input: ForecastInput): Promise<EngineContext> {
 	const ctx = await prepareEngineContext(input, { noise: true });

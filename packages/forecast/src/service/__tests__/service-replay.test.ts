@@ -22,6 +22,7 @@ import {
 	replayFixture,
 } from "../../engine/__tests__/fixtures-engine";
 import { prague } from "../../engine/__tests__/fixtures-sim";
+import { FULL_GRID_TIMEOUT_MS } from "../../engine/__tests__/plan-timeout";
 import { createForecastEngine } from "../../engine/engine";
 import type { ForecastDb, UsageSnapshotDbRow } from "../../history/ports";
 import { FakeRunner, FakeStore } from "../../prewarm/__tests__/fakes";
@@ -159,53 +160,57 @@ function world() {
 }
 
 describe("forecast service with the real engine on the 2026-11-12 replay, pre-warm off", () => {
-	it("holds acct-b until 08:30 at 07:00 and again at 08:00, then routes new sessions to it, and never pre-warms", async () => {
-		const w = world();
-		expect(w.current.input.settings.prewarm).toBe(false);
-		expect(w.current.input.settings.routing).toBe(true);
+	it(
+		"holds acct-b until 08:30 at 07:00 and again at 08:00, then routes new sessions to it, and never pre-warms",
+		async () => {
+			const w = world();
+			expect(w.current.input.settings.prewarm).toBe(false);
+			expect(w.current.input.settings.routing).toBe(true);
 
-		// 07:00, while the plan holds acct-b closed.
-		await w.computeAt(prague(12, 7));
-		const early = w.service.forecastView();
-		expect(early?.plan?.openAt).toEqual({ "acct-b": REHOLD_AT });
-		const before = w.service.advisor.placeNewSession(w.clock.at);
-		expect(before?.rule).toBe("forecast-lookahead");
-		// "reset-soon" before amendment 5: the hold gains S 63.2 over opening acct-b at once
-		expect(before?.reason).toBe("low-point+63.2");
-		expect(before?.tiers).toEqual([["acct-a"], ["acct-b"]]);
-		const morning = w.service.provider();
-		expect(morning.available).toBe(true);
-		expect(morning.prewarm).toEqual({
-			enabled: false,
-			planned: [{ accountId: "acct-b", openAt: REHOLD_AT }],
-			last: [],
-		});
-		expect(validateForecastResponse(morning)).toEqual([]);
+			// 07:00, while the plan holds acct-b closed.
+			await w.computeAt(prague(12, 7));
+			const early = w.service.forecastView();
+			expect(early?.plan?.openAt).toEqual({ "acct-b": REHOLD_AT });
+			const before = w.service.advisor.placeNewSession(w.clock.at);
+			expect(before?.rule).toBe("forecast-lookahead");
+			// "reset-soon" before amendment 5: the hold gains S 63.2 over opening acct-b at once
+			expect(before?.reason).toBe("low-point+63.2");
+			expect(before?.tiers).toEqual([["acct-a"], ["acct-b"]]);
+			const morning = w.service.provider();
+			expect(morning.available).toBe(true);
+			expect(morning.prewarm).toEqual({
+				enabled: false,
+				planned: [{ accountId: "acct-b", openAt: REHOLD_AT }],
+				last: [],
+			});
+			expect(validateForecastResponse(morning)).toEqual([]);
 
-		// 08:00, during the hold; the plan computed now still holds acct-b until 08:30.
-		await w.computeAt(OPEN_AT, { usedPct: 23, resetsAt: prague(12, 11) });
-		expect(w.service.forecastView()?.plan?.openAt).toEqual({
-			"acct-b": REHOLD_AT,
-		});
-		const held = w.service.advisor.placeNewSession(w.clock.at);
-		expect(held?.rule).toBe("forecast-lookahead");
-		expect(held?.reason).toBe("low-point+17.1");
-		expect(held?.tiers).toEqual([["acct-a"], ["acct-b"]]);
+			// 08:00, during the hold; the plan computed now still holds acct-b until 08:30.
+			await w.computeAt(OPEN_AT, { usedPct: 23, resetsAt: prague(12, 11) });
+			expect(w.service.forecastView()?.plan?.openAt).toEqual({
+				"acct-b": REHOLD_AT,
+			});
+			const held = w.service.advisor.placeNewSession(w.clock.at);
+			expect(held?.rule).toBe("forecast-lookahead");
+			expect(held?.reason).toBe("low-point+17.1");
+			expect(held?.tiers).toEqual([["acct-a"], ["acct-b"]]);
 
-		// 08:30, no hold gains the gate: the idle acct-b heads the tiers (amendment 5, E1).
-		await w.computeAt(REHOLD_AT, { usedPct: 29, resetsAt: prague(12, 11) });
-		expect(w.service.forecastView()?.plan?.openAt).toEqual({
-			"acct-b": REHOLD_AT,
-		});
-		const due = w.service.advisor.placeNewSession(w.clock.at);
-		expect(due?.rule).toBe("forecast-open");
-		expect(due?.tiers).toEqual([["acct-b"], ["acct-a"]]);
-		expect(due?.reason).toBe("open-ahead+1.1");
-		const later = w.service.provider();
-		expect(later.prewarm?.enabled).toBe(false);
-		expect(validateForecastResponse(later)).toEqual([]);
+			// 08:30, no hold gains the gate: the idle acct-b heads the tiers (amendment 5, E1).
+			await w.computeAt(REHOLD_AT, { usedPct: 29, resetsAt: prague(12, 11) });
+			expect(w.service.forecastView()?.plan?.openAt).toEqual({
+				"acct-b": REHOLD_AT,
+			});
+			const due = w.service.advisor.placeNewSession(w.clock.at);
+			expect(due?.rule).toBe("forecast-open");
+			expect(due?.tiers).toEqual([["acct-b"], ["acct-a"]]);
+			expect(due?.reason).toBe("open-ahead+1.1");
+			const later = w.service.provider();
+			expect(later.prewarm?.enabled).toBe(false);
+			expect(validateForecastResponse(later)).toEqual([]);
 
-		expect(w.runner.calls).toEqual([]);
-		await w.service.stop();
-	}, 600_000);
+			expect(w.runner.calls).toEqual([]);
+			await w.service.stop();
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });

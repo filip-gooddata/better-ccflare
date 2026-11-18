@@ -22,6 +22,7 @@ import {
 	measureYield,
 	prague,
 } from "./fixtures-sim";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 /**
  * 2026-11-12 shape (research 17), heavy day: both windows closed in the morning; work starts at
@@ -53,57 +54,61 @@ function nov12(prewarm = true) {
 }
 
 describe("planForecast: 2026-11-12 shape", () => {
-	test("opening a window early lifts the heavy low point and removes the heavy stop", async () => {
-		const ctx = nov12(true);
-		const { value, wallMs, longestMs, turns } = await measureYield(() =>
-			planForecast(ctx),
-		);
-		const { plan, score, baseline, candidates } = value;
-		console.log(
-			`planForecast 400 days: wall ${wallMs.toFixed(0)} ms, ${candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
-		);
-		console.log(
-			`baseline: low point ${baseline.score.lowPoint.toFixed(1)}; plan: low point ${score.lowPoint.toFixed(1)}, openAt ${JSON.stringify(
-				Object.fromEntries(
-					Object.entries(plan.openAt).map(([k, v]) => [
-						k,
-						v && new Date(v).toISOString(),
-					]),
-				),
-			)}, placement ${JSON.stringify(plan.placement)}`,
-		);
-		// On demand: the first account fills about 13:17, the second about 14:55 → stop to 16:00.
-		const baseOuts = baseline.result.traces[360].outs;
-		// Day 360 of 400 is the heavy (p90) day: first account full 13:19, second 14:54. The idle
-		// acct-b opens at the second demand step, 11:05 (amendment 5, E1), so acct-a fills later.
-		expect(baseOuts.slice(0, 2)).toEqual([
-			{ account: 0, at: prague(12, 13, 19), limit: "five_hour" },
-			{ account: 1, at: prague(12, 14, 54), limit: "five_hour" },
-		]);
-		// The heavy day is 62.4 points short (unserved demand counted below zero, amendment 5 E2).
-		expect(baseline.score.lowPoint).toBeCloseTo(-62.4, 1);
-		// The plan opens both windows ahead of work, staggered: acct-b at 08:00, acct-a at 09:30 (resets
-		// 13:00, 14:30). Neither 09:30 nor 08:00 is a peak of an account's single-opening curve (flat
-		// 08:20 to 09:00); coordinate refinement finds the pair.
-		expect(plan.openAt).toEqual({
-			"acct-a": prague(12, 9, 30),
-			"acct-b": prague(12, 8),
-		});
-		expect(score.dayLowPoints).toBeCloseTo(104.5, 1);
-		expect(score.lowPoint).toBeCloseTo(104.5, 1);
-		expect(plan.placement).toEqual({
-			tiers: [["acct-b"], ["acct-a"]],
-			// New sessions now (07:30) go to acct-b, whose window the plan opens at 08:00, not now.
-			rule: "forecast-lookahead",
-			// The gain of S over on demand: 104.5 - (-62.4).
-			reason: "open-ahead+166.9",
-		});
-		expect(plan.computedAt).toBe(ctx.now);
-		expect(plan.workStartMinute).toBe(660);
-		expect(plan.moves).toEqual([]);
-		expect(compareScores(score, baseline.score)).toBeLessThan(0);
-		expect(longestMs).toBeLessThan(60);
-	}, 300_000);
+	test(
+		"opening a window early lifts the heavy low point and removes the heavy stop",
+		async () => {
+			const ctx = nov12(true);
+			const { value, wallMs, longestMs, turns } = await measureYield(() =>
+				planForecast(ctx),
+			);
+			const { plan, score, baseline, candidates } = value;
+			console.log(
+				`planForecast 400 days: wall ${wallMs.toFixed(0)} ms, ${candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
+			);
+			console.log(
+				`baseline: low point ${baseline.score.lowPoint.toFixed(1)}; plan: low point ${score.lowPoint.toFixed(1)}, openAt ${JSON.stringify(
+					Object.fromEntries(
+						Object.entries(plan.openAt).map(([k, v]) => [
+							k,
+							v && new Date(v).toISOString(),
+						]),
+					),
+				)}, placement ${JSON.stringify(plan.placement)}`,
+			);
+			// On demand: the first account fills about 13:17, the second about 14:55 → stop to 16:00.
+			const baseOuts = baseline.result.traces[360].outs;
+			// Day 360 of 400 is the heavy (p90) day: first account full 13:19, second 14:54. The idle
+			// acct-b opens at the second demand step, 11:05 (amendment 5, E1), so acct-a fills later.
+			expect(baseOuts.slice(0, 2)).toEqual([
+				{ account: 0, at: prague(12, 13, 19), limit: "five_hour" },
+				{ account: 1, at: prague(12, 14, 54), limit: "five_hour" },
+			]);
+			// The heavy day is 62.4 points short (unserved demand counted below zero, amendment 5 E2).
+			expect(baseline.score.lowPoint).toBeCloseTo(-62.4, 1);
+			// The plan opens both windows ahead of work, staggered: acct-b at 08:00, acct-a at 09:30 (resets
+			// 13:00, 14:30). Neither 09:30 nor 08:00 is a peak of an account's single-opening curve (flat
+			// 08:20 to 09:00); coordinate refinement finds the pair.
+			expect(plan.openAt).toEqual({
+				"acct-a": prague(12, 9, 30),
+				"acct-b": prague(12, 8),
+			});
+			expect(score.dayLowPoints).toBeCloseTo(104.5, 1);
+			expect(score.lowPoint).toBeCloseTo(104.5, 1);
+			expect(plan.placement).toEqual({
+				tiers: [["acct-b"], ["acct-a"]],
+				// New sessions now (07:30) go to acct-b, whose window the plan opens at 08:00, not now.
+				rule: "forecast-lookahead",
+				// The gain of S over on demand: 104.5 - (-62.4).
+				reason: "open-ahead+166.9",
+			});
+			expect(plan.computedAt).toBe(ctx.now);
+			expect(plan.workStartMinute).toBe(660);
+			expect(plan.moves).toEqual([]);
+			expect(compareScores(score, baseline.score)).toBeLessThan(0);
+			expect(longestMs).toBeLessThan(60);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 
 	test("with pre-warm off nothing opens ahead: no demand before 11:00, so no opening gains openMinGainPoints", async () => {
 		const { plan, score, baseline } = await planForecast(nov12(false));
@@ -382,32 +387,36 @@ describe("scorePlan", () => {
 });
 
 describe("planForecast cost", () => {
-	test("400 days, 2 accounts, Monday morning to Friday 24:00: bounded and yielding", async () => {
-		const now = prague(9, 7, 30);
-		const ctx = makeCtx({
-			now,
-			spread: 0.3,
-			accounts: [
-				account({ id: "acct-a" }),
-				account({ id: "acct-b", fiveUsed: 20, fiveReset: now + HOUR }),
-			],
-			kW: { "acct-a": 0.05, "acct-b": 0.05 },
-			rate: (m, w) => (w <= 5 && m >= 540 && m < 1080 ? 0.6 : 0),
-			settings: { prewarm: true },
-			workStartMinute: 540,
-		});
-		const { value, wallMs, longestMs, turns } = await measureYield(() =>
-			planForecast(ctx),
-		);
-		console.log(
-			`planForecast week horizon: ${value.result.axis.times.length} samples, wall ${wallMs.toFixed(0)} ms, ${value.candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
-		);
-		// One closed account: the baseline, 96 quarter hours and their refinement, the peaks, a refinement
-		// scan and the preferences; the deadline, not a list, bounds the search in service.
-		expect(value.candidates).toBe(109);
-		expect(longestMs).toBeLessThan(60);
-		expect(wallMs).toBeLessThan(5000);
-	}, 300_000);
+	test(
+		"400 days, 2 accounts, Monday morning to Friday 24:00: bounded and yielding",
+		async () => {
+			const now = prague(9, 7, 30);
+			const ctx = makeCtx({
+				now,
+				spread: 0.3,
+				accounts: [
+					account({ id: "acct-a" }),
+					account({ id: "acct-b", fiveUsed: 20, fiveReset: now + HOUR }),
+				],
+				kW: { "acct-a": 0.05, "acct-b": 0.05 },
+				rate: (m, w) => (w <= 5 && m >= 540 && m < 1080 ? 0.6 : 0),
+				settings: { prewarm: true },
+				workStartMinute: 540,
+			});
+			const { value, wallMs, longestMs, turns } = await measureYield(() =>
+				planForecast(ctx),
+			);
+			console.log(
+				`planForecast week horizon: ${value.result.axis.times.length} samples, wall ${wallMs.toFixed(0)} ms, ${value.candidates} candidates, longest slice ${longestMs.toFixed(1)} ms, ${turns} turns`,
+			);
+			// One closed account: the baseline, 96 quarter hours and their refinement, the peaks, a refinement
+			// scan and the preferences; the deadline, not a list, bounds the search in service.
+			expect(value.candidates).toBe(109);
+			expect(longestMs).toBeLessThan(60);
+			expect(wallMs).toBeLessThan(5000);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });
 
 describe("placement: a held account goes behind every unheld one (amendment 5, E3)", () => {
