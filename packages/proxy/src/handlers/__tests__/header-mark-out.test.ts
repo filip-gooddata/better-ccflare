@@ -428,6 +428,89 @@ describe("observeLimitHeaders", () => {
 		expect(cached("a").seven_day.utilization).toBe(21);
 	});
 
+	it("an overall rejection without a claim marks the fuller window out at once", () => {
+		const { ctx } = makeCtx();
+		seedUsage("a");
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}status`]: "rejected" }), 429),
+			makeAccount("a"),
+		);
+		expect(limitKinds(ctx, "a")).toEqual(["five_hour"]);
+	});
+
+	it("an unclaimed rejection leaves a spent family row to the family classifier", () => {
+		usageCache.set("a", {
+			five_hour: {
+				utilization: 40,
+				resets_at: new Date(FIVE_HOUR_RESET).toISOString(),
+			},
+			seven_day: {
+				utilization: 20,
+				resets_at: new Date(SEVEN_DAY_RESET).toISOString(),
+			},
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: new Date(SEVEN_DAY_RESET).toISOString(),
+					scope: { model: { id: null, display_name: "Opus" }, surface: null },
+				},
+			],
+		} as never);
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}status`]: "rejected" }), 429),
+			makeAccount("a"),
+		);
+		expect(cached("a").five_hour.utilization).toBe(42);
+		expect(cached("a").seven_day.utilization).toBe(21);
+	});
+
+	it("a poll already in flight cannot undo the mark, and a fresh read follows", async () => {
+		refreshSpy.mockRestore();
+		const usageBody = (percent: number) =>
+			new Response(
+				JSON.stringify({
+					five_hour: {
+						utilization: percent,
+						resets_at: new Date(FIVE_HOUR_RESET).toISOString(),
+					},
+					seven_day: {
+						utilization: 21,
+						resets_at: new Date(SEVEN_DAY_RESET).toISOString(),
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			);
+		let releaseStale: (r: Response) => void = () => {};
+		const fetchMock = mock((_url: unknown) =>
+			fetchMock.mock.calls.length === 1
+				? new Promise<Response>((resolve) => {
+						releaseStale = resolve;
+					})
+				: Promise.resolve(usageBody(100)),
+		);
+		globalThis.fetch = fetchMock as unknown as typeof fetch;
+		usageCache.startPolling("a", "token", "anthropic", 24 * HOUR);
+		const stalePoll = usageCache.refreshNow("a");
+		await flush();
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+
+		const { ctx } = makeCtx();
+		observeLimitHeaders(
+			respond(allowedHeaders({ [`${P}5h-utilization`]: "1.0" })),
+			makeAccount("a"),
+		);
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
+
+		releaseStale(usageBody(40));
+		await stalePoll;
+		await flush();
+
+		expect(limitKinds(ctx, "a")).toContain("five_hour");
+		expect(fetchMock).toHaveBeenCalledTimes(2);
+		expect(cached("a").five_hour.utilization).toBe(100);
+	});
+
 	it("below-threshold headers change nothing", async () => {
 		const { ctx } = makeCtx();
 		seedUsage("a");
@@ -508,6 +591,27 @@ describe("overage cooldown in processProxyResponse", () => {
 				reason: "overage_in_use",
 			},
 		]);
+	});
+
+	it("holds until the reset even with explicit-reset honouring switched off", async () => {
+		const previous = process.env.CCFLARE_RATE_LIMIT_HONOR_EXPLICIT_RESET;
+		process.env.CCFLARE_RATE_LIMIT_HONOR_EXPLICIT_RESET = "false";
+		try {
+			const { ctx } = makeCtx();
+			const account = makeAccount("a");
+			await processProxyResponse(
+				respond(allowedHeaders({ [`${P}overage-in-use`]: "true" })),
+				account,
+				ctx,
+			);
+			expect(account.rate_limited_until).toBe(atSecond(FIVE_HOUR_RESET));
+		} finally {
+			if (previous === undefined) {
+				delete process.env.CCFLARE_RATE_LIMIT_HONOR_EXPLICIT_RESET;
+			} else {
+				process.env.CCFLARE_RATE_LIMIT_HONOR_EXPLICIT_RESET = previous;
+			}
+		}
 	});
 
 	it("is not undone by the success clear of an older bench", async () => {

@@ -103,20 +103,51 @@ function familyOfClaim(parsed: UnifiedLimitHeaders): string | null {
 /**
  * The account-wide window to mark full when the response says the account is
  * out but neither window header crossed on its own: the window an account-wide
- * claim (`five_hour`, `seven_day`) names; with overage in use and no claim or
- * one that names no family, the fuller of the two. Otherwise no window: a
- * family claim is the family block's business (this runs before the 429
- * classifiers, which read the same cache), and an overall rejection without
- * an account-wide claim is benched by the rate-limit path.
+ * claim (`five_hour`, `seven_day`) names; with no claim or one that names no
+ * family, the fuller of the two. A family claim marks no window: that is the
+ * family block's business. This runs before the 429 classifiers, which read
+ * the same cache to tell a family refusal from an account one, so an overall
+ * rejection without a claim marks nothing either while the readings show a
+ * family row spent (the classifier may call that refusal family-scoped) or
+ * there are no readings at all (it reports the refusal unclassified). Any
+ * other unclaimed rejection the classifier benches account-wide anyway.
  */
-function bindingWindow(parsed: UnifiedLimitHeaders): CacheWindowKey | null {
+function bindingWindow(
+	parsed: UnifiedLimitHeaders,
+	previous: UsageData,
+	now: number,
+): CacheWindowKey | null {
 	const claim = claimOf(parsed);
 	if (claim === "five_hour") return "five_hour";
 	if (claim === "seven_day") return "seven_day";
-	if (!parsed.overageInUse || familyOfClaim(parsed) !== null) return null;
+	if (familyOfClaim(parsed) !== null) return null;
+	if (
+		!parsed.overageInUse &&
+		(!hasReadings(previous) || hasSpentFamilyRow(previous, now))
+	) {
+		return null;
+	}
 	const five = parsed.fiveHour.utilization ?? -1;
 	const seven = parsed.sevenDay.utilization ?? -1;
 	return seven > five ? "seven_day" : "five_hour";
+}
+
+function hasReadings(usage: UsageData): boolean {
+	return (
+		usage.five_hour != null ||
+		usage.seven_day != null ||
+		(Array.isArray(usage.limits) && usage.limits.length > 0)
+	);
+}
+
+function hasSpentFamilyRow(usage: UsageData, now: number): boolean {
+	if (!Array.isArray(usage.limits)) return false;
+	return usage.limits.some((limit) => {
+		if (limit?.kind !== "weekly_scoped") return false;
+		if (typeof limit.percent !== "number" || limit.percent < 100) return false;
+		const resetMs = limit.resets_at ? Date.parse(limit.resets_at) : Number.NaN;
+		return !Number.isFinite(resetMs) || resetMs > now;
+	});
 }
 
 function cacheWindow(
@@ -141,10 +172,11 @@ function cacheWindow(
 function writeUsageFromHeaders(
 	accountId: string,
 	parsed: UnifiedLimitHeaders,
-	forced: CacheWindowKey | null,
+	windowOut: boolean,
 ): void {
 	const previous = (usageCache.get(accountId) ?? {}) as UsageData;
 	const next: UsageData = { ...previous };
+	const forced = windowOut ? null : bindingWindow(parsed, previous, Date.now());
 	const five = cacheWindow(
 		parsed.fiveHour,
 		previous.five_hour,
@@ -231,11 +263,7 @@ export function observeLimitHeaders(
 		// keep the account for the others.
 		markFamilyExhausted(account.id, family, parsed.resetMs);
 	} else {
-		writeUsageFromHeaders(
-			account.id,
-			parsed,
-			windowOut ? null : bindingWindow(parsed),
-		);
+		writeUsageFromHeaders(account.id, parsed, windowOut);
 	}
 	log.warn(
 		`[ccflare] account=${account.name} limit_header_mark overage_in_use=${parsed.overageInUse} status=${parsed.status ?? "none"} 5h=${parsed.fiveHour.utilization ?? "?"}/${parsed.fiveHour.status ?? "?"} 7d=${parsed.sevenDay.utilization ?? "?"}/${parsed.sevenDay.status ?? "?"} reset=${parsed.resetMs !== null ? new Date(parsed.resetMs).toISOString() : "none"}`,

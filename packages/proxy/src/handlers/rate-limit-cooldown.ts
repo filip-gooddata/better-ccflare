@@ -316,7 +316,9 @@ export function applyRateLimitCooldown(
 				? Math.min(rateLimitInfo.resetTime, capUntil)
 				: capUntil;
 	} else if (
-		isExplicitResetHonoured() &&
+		// A response served on extra usage names the reset of a spent plan
+		// limit; benching for less would let the next request spend credits.
+		(isExplicitResetHonoured() || reason === "overage_in_use") &&
 		!rateLimitInfo.resetIsInferred &&
 		rateLimitInfo.resetTime != null &&
 		rateLimitInfo.resetTime > now
