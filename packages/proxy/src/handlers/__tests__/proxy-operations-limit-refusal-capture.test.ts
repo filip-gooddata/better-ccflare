@@ -9,7 +9,6 @@ import {
 } from "bun:test";
 import type { Account, RequestMeta } from "@better-ccflare/types";
 import * as discard from "../discard-body-cancel";
-import { markAllLimitedSelection } from "../limit-blocked";
 import {
 	clearLimitRefusalCache,
 	getCachedLimitRefusal,
@@ -247,7 +246,6 @@ describe("holdLimitRefusal — per-account capture of the last real 429", () => 
 		globalThis.fetch = mock(async () => response);
 		const account = makeAccount({ id: "acc-held" });
 		const meta = makeRequestMeta();
-		markAllLimitedSelection(meta, account.id);
 		const held: HeldLimitRefusal[] = [];
 
 		await run(makeContext(true), account, meta, (r) => held.push(r));

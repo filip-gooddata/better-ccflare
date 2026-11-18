@@ -10,7 +10,6 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import { markAllLimitedSelection } from "../limit-blocked";
 import { clearFamilyBlocks, getFamilyBlock } from "../model-capacity";
 import { proxyWithAccount } from "../proxy-operations";
 import type { HeldLimitRefusal, ProxyContext } from "../proxy-types";
@@ -374,7 +373,6 @@ describe("proxyWithAccount — family-scoped 429", () => {
 		const account = makeAccount();
 		usageCache.set(account.id, usage() as never);
 		const meta = makeRequestMeta();
-		markAllLimitedSelection(meta, account.id);
 		const held: HeldLimitRefusal[] = [];
 
 		const result = await run(ctx, account, meta, (r) => held.push(r));

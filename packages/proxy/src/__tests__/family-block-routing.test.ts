@@ -278,7 +278,7 @@ async function send(ctx: ProxyContext, request = makeRequest()) {
 	}
 }
 
-async function expectUpstreamIdentity(
+async function _expectUpstreamIdentity(
 	received: Response | Error,
 	expected: { status: number; headers: Record<string, string>; body: string },
 ) {
@@ -322,7 +322,7 @@ afterEach(() => {
 for (const capacityRouting of [false, true]) {
 	describe(`every account blocked for the family (capacity routing ${capacityRouting ? "on" : "off"})`, () => {
 		for (const stream of [false, true]) {
-			it(`forwards to the account whose block ends first and returns its upstream 429 unchanged (stream=${stream})`, async () => {
+			it(`answers the local family 429 of the account whose block ends first and forwards nothing (stream=${stream})`, async () => {
 				const a = makeAccount("a");
 				const b = makeAccount("b");
 				blockFamily("a", "fable", NOW + 50 * HOUR, "header");
@@ -332,14 +332,26 @@ for (const capacityRouting of [false, true]) {
 				);
 				const { ctx } = makeCtx([a, b], paceStrategy(), { capacityRouting });
 
-				const response = await send(ctx, makeRequest({ stream }));
+				const response = (await send(ctx, makeRequest({ stream }))) as Response;
 
-				expect(calls).toEqual(["b"]);
-				await expectUpstreamIdentity(response, {
-					status: 429,
-					headers: limitHeaders(NOW + 20 * HOUR, "b"),
-					body: limitBody("b"),
-				});
+				expect(calls).toEqual([]);
+				expect(response.status).toBe(429);
+				expect(response.headers.get("x-should-retry")).toBe("true");
+				expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+					"rejected",
+				);
+				expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+					String(Math.floor((NOW + 20 * HOUR) / 1000)),
+				);
+				expect(
+					response.headers.get(
+						"anthropic-ratelimit-unified-representative-claim",
+					),
+				).toBe("seven_day_fable");
+				expect(response.headers.get("retry-after")).toBe(String(20 * 3600));
+				expect(response.headers.get("x-upstream-account")).toBeNull();
+				const body = (await response.json()) as { error: { type: string } };
+				expect(body.error.type).toBe("rate_limit_error");
 			});
 		}
 

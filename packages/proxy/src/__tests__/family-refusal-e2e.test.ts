@@ -393,6 +393,56 @@ async function expectUpstreamRefusal(
 	expect(text).not.toContain("model_family_exhausted");
 }
 
+const retryAfterFor = (resetAt: number) =>
+	String(Math.max(1, Math.floor(resetAt / 1000 - Date.now() / 1000)));
+
+/** A remembered real refusal answered locally: body as received, retry-after and date rebased. */
+async function expectReplayedRefusal(
+	received: Response | Error,
+	expected: Refusal,
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	for (const [name, value] of Object.entries(expected.headers)) {
+		if (HOP_BY_HOP.has(name) || name === "retry-after") continue;
+		expect([name, response.headers.get(name)]).toEqual([name, value]);
+	}
+	const resetAt =
+		Number(expected.headers["anthropic-ratelimit-unified-reset"]) * 1000;
+	expect(response.headers.get("retry-after")).toBe(retryAfterFor(resetAt));
+	expect(response.headers.get("date")).toBe(new Date(Date.now()).toUTCString());
+	expect(await response.text()).toBe(expected.body);
+}
+
+/** The local 429 built from readings for an account whose limit ends at resetAt. */
+async function expectBuiltLimit429(
+	received: Response | Error,
+	resetAt: number,
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	expect(response.headers.get("x-should-retry")).toBe("true");
+	expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+		"rejected",
+	);
+	expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+		String(Math.floor(resetAt / 1000)),
+	);
+	expect(response.headers.get("retry-after")).toBe(retryAfterFor(resetAt));
+	expect(response.headers.get("x-upstream-account")).toBeNull();
+	const body = (await response.json()) as { error: { type: string } };
+	expect(body.error.type).toBe("rate_limit_error");
+}
+
+/** Upstream requests per account seen by the fake fetch. */
+function perAccount(calls: Array<{ account: string }>) {
+	const counts: Record<string, number> = {};
+	for (const { account } of calls) counts[account] = (counts[account] ?? 0) + 1;
+	return counts;
+}
+
 const logged = (pattern: string | RegExp) =>
 	logs.filter((line) =>
 		typeof pattern === "string" ? line.includes(pattern) : pattern.test(line),
@@ -430,7 +480,7 @@ afterEach(() => {
 });
 
 describe("scenario 1: the measured incident replayed", () => {
-	it("blocks Fable on gooddata only, replays the upstream 429, keeps Opus on gooddata, sends Fable elsewhere", async () => {
+	it("blocks Fable on gooddata only, answers the local 429 of gooddata-ai, keeps Opus on gooddata, sends Fable elsewhere", async () => {
 		usageCache.set(GD, usage(measuredGooddata()));
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
@@ -464,9 +514,9 @@ describe("scenario 1: the measured incident replayed", () => {
 		).toHaveLength(1);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		// gooddata-ai is usable again at 11:00Z, before the Fable reset, so the
-		// rule forwards once to it and the client gets that upstream 429 as is.
-		expect(calls.map((c) => c.account)).toEqual([GD, AI]);
-		await expectUpstreamRefusal(first, aiRefusal);
+		// rule names it; nothing more goes upstream and the 429 is built locally.
+		expect(perAccount(calls)).toEqual({ [GD]: 1 });
+		await expectBuiltLimit429(first, FIVE_HOUR_RESET_AI);
 		expect(row(GD).rate_limited_until).toBeNull();
 
 		// Opus on gooddata is untouched by the Fable block.
@@ -702,7 +752,7 @@ describe("scenario 2: sticky sessions after a family 429", () => {
 });
 
 describe("scenario 3: Fable out on every account", () => {
-	it("returns an upstream 429 unchanged, benches neither account, and still routes Opus", async () => {
+	it("replays the upstream 429 rebased, asks nothing more upstream, benches neither account, and still routes Opus", async () => {
 		const aiFableReset = NOW + 20 * HOUR;
 		usageCache.set(GD, usage(measuredGooddata()));
 		usageCache.set(
@@ -726,9 +776,9 @@ describe("scenario 3: Fable out on every account", () => {
 		);
 
 		const first = await send(ctx, makeRequest(FABLE));
-		// Both refuse; gooddata-ai's block ends first, so its 429 is the answer.
-		expect(new Set(calls.map((c) => c.account))).toEqual(new Set([GD, AI]));
-		await expectUpstreamRefusal(first, aiRefusal);
+		// Both refuse once; gooddata-ai's block ends first, so its 429 is the answer.
+		expect(perAccount(calls)).toEqual({ [GD]: 1, [AI]: 1 });
+		await expectReplayedRefusal(first, aiRefusal);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
 		expect(getFamilyBlock(AI, "fable", Date.now())?.until).toBe(aiFableReset);
@@ -736,11 +786,13 @@ describe("scenario 3: Fable out on every account", () => {
 		expect(row(AI).rate_limited_until).toBeNull();
 		expect(writes).toEqual([]);
 
-		// With both blocks standing, the next Fable request still gets an
-		// upstream 429 through the all-limited rule, not a local error.
+		// With both blocks standing, the next Fable request gets gooddata-ai's
+		// remembered 429 through the all-limited rule, with nothing sent upstream.
 		logs = [];
+		const secondBefore = calls.length;
 		const second = await send(ctx, makeRequest(FABLE));
-		await expectUpstreamRefusal(second, aiRefusal);
+		expect(perAccount(calls.slice(secondBefore))).toEqual({});
+		await expectReplayedRefusal(second, aiRefusal);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(writes).toEqual([]);
 
@@ -896,7 +948,7 @@ describe("scenario 7: a full family known from usage, before any refusal", () =>
 	// The second measured case (2026-11-13T12:07:24.338Z): the Fable session
 	// mapped to gooddata-ai fails over while gooddata reads Fable 100 % with
 	// overage reported as enabled and spent, and no family block exists.
-	it("never sends the Fable request to gooddata, replays the 429 of gooddata-ai, still serves Opus on gooddata", async () => {
+	it("sends the Fable request nowhere, answers the local 429 of gooddata-ai, still serves Opus on gooddata", async () => {
 		const at = Date.parse("2026-11-13T12:07:24.338Z");
 		const aiOutUntil = Date.parse("2026-11-13T16:00:00.229Z");
 		setSystemTime(new Date(at - 10 * 60_000));
@@ -944,9 +996,8 @@ describe("scenario 7: a full family known from usage, before any refusal", () =>
 		logs = [];
 		const before = calls.length;
 		const response = await send(ctx, makeRequest(FABLE, { session }));
-		expect(calls.slice(before).filter((c) => c.account === GD)).toEqual([]);
-		expect(calls.slice(before)).toEqual([{ account: AI, model: FABLE }]);
-		await expectUpstreamRefusal(response, aiRefusal);
+		expect(perAccount(calls.slice(before))).toEqual({});
+		await expectBuiltLimit429(response, aiOutUntil);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(writes.filter((w) => w.id === GD)).toHaveLength(gdWritesBefore);

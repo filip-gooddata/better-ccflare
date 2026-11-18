@@ -191,8 +191,8 @@ for (const mode of ["off", "exhausted"] as const) {
 				FABLE,
 			);
 
-			expect(result.map((acc) => acc.id)).toEqual(["b"]);
-			expect(getModelFamilyExhaustionInfo(meta)).toBeNull();
+			// The pick names whose limit the answer describes; nothing is forwarded.
+			expect(result).toEqual([]);
 			expect(seen).toHaveLength(1);
 			expect(seen[0].map((entry) => [entry.account.id, entry.limits])).toEqual([
 				["a", [{ kind: "family", family: "fable", resetAt: aUntil }]],
