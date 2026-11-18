@@ -1413,15 +1413,29 @@ OAuth tokens will need to be re-authenticated.
 		return this.webToolCalls.deleteOlderThan(cutoff);
 	}
 
-	async forceResetAccountRateLimit(accountId: string): Promise<boolean> {
+	/** Manual reset; keeps an active `overage_in_use` bench (see clearRateLimitState). */
+	async forceResetAccountRateLimit(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<boolean> {
 		return withDatabaseRetry(
 			async () => {
-				const changes = await this.accounts.clearRateLimitState(accountId);
+				const changes = await this.accounts.clearRateLimitState(
+					accountId,
+					now,
+				);
 				return changes >= 0;
 			},
 			this.retryConfig,
 			"forceResetAccountRateLimit",
 		);
+	}
+
+	async getActiveOverageBenchUntil(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<number | null> {
+		return this.accounts.getActiveOverageBenchUntil(accountId, now);
 	}
 
 	async pauseAccount(accountId: string, reason = "manual"): Promise<void> {

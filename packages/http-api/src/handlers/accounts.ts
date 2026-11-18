@@ -43,12 +43,12 @@ import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
-	clearFamilyBlocksForAccount,
 	clearFamilyExhaustionForAccount,
 	clearModelCooldownsForAccount,
 	clearOpenAICompatibleModelCacheForAccount,
 	clearPendingRotation,
 	clearVisionCapability,
+	getFamilyBlocksForAccount,
 	getPeakHoursState,
 	getUsageThrottleStatus,
 	refreshCodexUsageForAccount,
@@ -3935,9 +3935,61 @@ export function createAccountModelFallbacksUpdateHandler(
 	};
 }
 
+/** Limit holds a manual reset leaves in place, reported to the operator. */
+export interface KeptLimitHolds {
+	overageBench: { until: number; untilIso: string } | null;
+	familyBlocks: Array<{
+		family: string;
+		until: number;
+		untilIso: string;
+		source: string;
+	}>;
+}
+
+async function keptLimitHolds(
+	dbOps: DatabaseOperations,
+	accountId: string,
+	now: number,
+): Promise<KeptLimitHolds> {
+	const benchUntil = await dbOps.getActiveOverageBenchUntil(accountId, now);
+	return {
+		overageBench:
+			benchUntil === null
+				? null
+				: { until: benchUntil, untilIso: new Date(benchUntil).toISOString() },
+		familyBlocks: getFamilyBlocksForAccount(accountId, now)
+			.sort((a, b) => a.family.localeCompare(b.family))
+			.map((block) => ({
+				family: block.family,
+				until: block.until,
+				untilIso: new Date(block.until).toISOString(),
+				source: block.source,
+			})),
+	};
+}
+
+function describeKeptLimitHolds(kept: KeptLimitHolds): string {
+	const parts: string[] = [];
+	if (kept.overageBench) {
+		parts.push(
+			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage reading shows five-hour and weekly below 100%.`,
+		);
+	}
+	if (kept.familyBlocks.length > 0) {
+		parts.push(
+			`Kept family blocks until their reset: ${kept.familyBlocks
+				.map((block) => `${block.family} until ${block.untilIso}`)
+				.join(", ")}.`,
+		);
+	}
+	return parts.join(" ");
+}
+
 /**
- * Create an account force-reset rate limit handler
- * Clears rate limit lock fields and triggers immediate usage refresh when possible.
+ * Create an account force-reset rate limit handler.
+ * Clears ordinary cooldown fields and triggers an immediate usage refresh when
+ * possible. Keeps an active overage_in_use bench and unexpired family blocks,
+ * and reports them in `kept`.
  */
 export function createAccountForceResetRateLimitHandler(
 	dbOps: DatabaseOperations,
@@ -3958,7 +4010,11 @@ export function createAccountForceResetRateLimitHandler(
 				return errorResponse(NotFound("Account not found"));
 			}
 
-			const resetSuccess = dbOps.forceResetAccountRateLimit(accountId);
+			// Keeps an active overage_in_use bench; the family blocks are kept
+			// too. Both stand for known exhausted capacity, and lifting them
+			// before a reading confirms recovery could serve the next request
+			// from extra usage.
+			const resetSuccess = await dbOps.forceResetAccountRateLimit(accountId);
 			if (!resetSuccess) {
 				return errorResponse(
 					new Error(
@@ -3967,9 +4023,6 @@ export function createAccountForceResetRateLimitHandler(
 				);
 			}
 			clearAccountRefreshCache(accountId);
-			// A hand reset lifts the account's per-family blocks too, not only
-			// the account-wide one.
-			clearFamilyBlocksForAccount(accountId);
 
 			// Trigger immediate poll if this server has a polling token provider for the account.
 			let usagePollTriggered = await usageCache.refreshNow(accountId);
@@ -4002,10 +4055,24 @@ export function createAccountForceResetRateLimitHandler(
 				`Force-reset rate limit for account '${account.name}' (usage poll triggered: ${usagePollTriggered})`,
 			);
 
+			// Read after the refresh: a recovery reading may have released the bench.
+			const now = Date.now();
+			const kept = await keptLimitHolds(dbOps, accountId, now);
+			if (kept.overageBench || kept.familyBlocks.length > 0) {
+				log.info(
+					`Force-reset kept limit holds for account '${account.name}': ${describeKeptLimitHolds(kept)}`,
+				);
+			}
+
 			return jsonResponse({
 				success: true,
-				message: `Rate limit state cleared for account '${account.name}'`,
+				message: `Rate limit state cleared for account '${account.name}'.${
+					kept.overageBench || kept.familyBlocks.length > 0
+						? ` ${describeKeptLimitHolds(kept)}`
+						: ""
+				}`,
 				usagePollTriggered,
+				kept,
 			});
 		} catch (error) {
 			log.error("Account force-reset rate limit error:", error);

@@ -517,20 +517,44 @@ export class AccountRepository extends BaseRepository<Account> {
 		return changes > 0;
 	}
 
-	async clearRateLimitState(accountId: string): Promise<number> {
+	/**
+	 * Manual reset. Clears every cooldown field except an `overage_in_use`
+	 * bench still ahead of `now`: that bench means the account was being
+	 * served from extra usage, and it lifts only at its reset or on a newer
+	 * usage reading showing both windows below 100 %.
+	 */
+	async clearRateLimitState(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<number> {
+		const benchActive =
+			"(rate_limited_reason = 'overage_in_use' AND rate_limited_until > ?)";
 		return this.runWithChanges(
 			`UPDATE accounts
 			 SET
-			 	rate_limited_until = NULL,
-			 	rate_limited_reason = NULL,
-			 	rate_limited_at = NULL,
+			 	rate_limited_until = CASE WHEN ${benchActive} THEN rate_limited_until ELSE NULL END,
+			 	rate_limited_reason = CASE WHEN ${benchActive} THEN rate_limited_reason ELSE NULL END,
+			 	rate_limited_at = CASE WHEN ${benchActive} THEN rate_limited_at ELSE NULL END,
 			 	rate_limit_reset = NULL,
 			 	rate_limit_reset_at = NULL,
 			 	rate_limit_status = NULL,
 			 	rate_limit_remaining = NULL
 			 WHERE id = ?`,
-			[accountId],
+			[now, now, now, accountId],
 		);
+	}
+
+	/** End (epoch ms) of the account's `overage_in_use` bench if still ahead of `now`. */
+	async getActiveOverageBenchUntil(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<number | null> {
+		const row = await this.get<{ rate_limited_until: number | string }>(
+			`SELECT rate_limited_until FROM accounts
+			 WHERE id = ? AND rate_limited_reason = 'overage_in_use' AND rate_limited_until > ?`,
+			[accountId, now],
+		);
+		return row ? Number(row.rate_limited_until) : null;
 	}
 
 	async pause(accountId: string, reason = "manual"): Promise<void> {
