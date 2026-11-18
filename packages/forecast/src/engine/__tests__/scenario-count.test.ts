@@ -10,8 +10,8 @@ import {
 	prebuiltScenarioSource,
 	SCENARIO_LADDER_START,
 	SCENARIO_LADDER_TOP,
-	SE_SPLITS,
 	type ScenarioSource,
+	SE_SPLITS,
 	scenarioLadder,
 	scenarioRangeSource,
 	seTargetPoints,
@@ -46,7 +46,10 @@ function rangeOf(ctx: EngineContext): ScenarioSource {
 	);
 }
 
-function withScenarios(ctx: EngineContext, scenarios: Scenarios): EngineContext {
+function withScenarios(
+	ctx: EngineContext,
+	scenarios: Scenarios,
+): EngineContext {
 	return { ...ctx, scenarios };
 }
 

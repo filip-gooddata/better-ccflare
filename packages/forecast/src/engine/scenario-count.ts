@@ -223,8 +223,11 @@ export async function chooseScenarioCount(
 	const plan = onDemandPlan(ctx);
 	if (ladder.length === 0) throw new Error("empty scenario ladder");
 
-	let scenarios: Scenarios | null = null;
-	let baseline: SimulationResult | null = null;
+	const units: Float32Array[] = [];
+	const fable: Float32Array[] = [];
+	const traces: SimTrace[] = [];
+	let scenarios: Scenarios | undefined;
+	let baseline: SimulationResult | undefined;
 	let built = 0;
 	let buildMs = 0;
 	let simMs = 0;
@@ -237,20 +240,15 @@ export async function chooseScenarioCount(
 		let t = now();
 		const added = await source(built, n);
 		buildMs += now() - t;
-		scenarios = scenarios
-			? {
-					...scenarios,
-					units: scenarios.units.concat(added.units),
-					fable: scenarios.fable.concat(added.fable),
-				}
-			: added;
+		units.push(...added.units);
+		fable.push(...added.fable);
+		scenarios = { ...added, units: units.slice(), fable: fable.slice() };
 		await yieldToEventLoop();
 		t = now();
 		const extra = await simulate({ ...ctx, scenarios: added }, plan);
 		simMs += now() - t;
-		baseline = baseline
-			? { ...baseline, traces: baseline.traces.concat(extra.traces) }
-			: extra;
+		traces.push(...extra.traces);
+		baseline = { ...extra, traces: traces.slice() };
 		built = n;
 		await yieldToEventLoop();
 		t = now();

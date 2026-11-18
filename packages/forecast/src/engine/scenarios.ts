@@ -205,7 +205,9 @@ export async function buildScenarios(
 		0,
 		Math.floor(days ? days.to : settings.simulatedDays),
 	);
-	const first = days ? Math.min(simulated, Math.max(0, Math.floor(days.from))) : 0;
+	const first = days
+		? Math.min(simulated, Math.max(0, Math.floor(days.from)))
+		: 0;
 	const shiftMax = Math.max(
 		0,
 		Math.floor((settings.timeShiftMin * 60_000) / BUCKET_MS),
