@@ -1,4 +1,5 @@
 import type {
+	DaytypesResult,
 	LearnedDemand,
 	Partition,
 	RowChoice,
@@ -7,7 +8,7 @@ import type { PaceFitState } from "../engine/pace/types";
 import type { EpochMs } from "../types";
 
 /** The pooled series (buffers transferred), the instant it is fitted at, and the settings the learners start from. */
-interface SeriesPayload {
+export interface SeriesPayload {
 	start: EpochMs;
 	units: Float64Array;
 	censored: Uint8Array;
@@ -35,10 +36,18 @@ export interface ForecastWorkerJobs {
 		payload: SeriesPayload & { daytypes: RowChoice<Partition> | null };
 		result: { pace: PaceFitState; learned: LearnedDemand };
 	};
-	/** F2 row 1 (day types): one full E4 fit per candidate partition, scored and selected. */
+	/**
+	 * F2 row 1 (day types, DESIGN-F2 R3-2): `daytypes` is the stored choice
+	 * (its served partition is served now) and `pending` the switch waiting
+	 * for confirmation. Nothing pending: one full E4 fit per family partition,
+	 * scored and selected. Pending: the nested comparison of present vs pending.
+	 */
 	daytypes: {
-		payload: SeriesPayload;
-		result: RowChoice<Partition>;
+		payload: SeriesPayload & {
+			daytypes: RowChoice<Partition> | null;
+			pending: Partition | null;
+		};
+		result: DaytypesResult;
 	};
 }
 

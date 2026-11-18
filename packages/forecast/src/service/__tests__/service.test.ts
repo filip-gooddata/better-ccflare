@@ -2307,6 +2307,8 @@ class FakeRefitRunner implements PaceRefitRunner {
 		demand: RefitDemandSettings;
 		timeoutMs: number;
 		signal?: AbortSignal;
+		daytypes?: RowChoice<Partition> | null;
+		pending?: Partition | null;
 	}[] = [];
 	manualDaytypes = false;
 	/** Main refits running now (started, not finished); a row-1 job records this when it starts. */
@@ -2318,7 +2320,12 @@ class FakeRefitRunner implements PaceRefitRunner {
 		series: PaceSeries,
 		now: EpochMs,
 		demand: RefitDemandSettings,
-		opts: { timeoutMs: number; signal?: AbortSignal },
+		opts: {
+			timeoutMs: number;
+			signal?: AbortSignal;
+			daytypes?: RowChoice<Partition> | null;
+			pending?: Partition | null;
+		},
 	): Promise<DaytypesOutcome> {
 		this.daytypesCalls.push({ series, now, demand, ...opts });
 		this.mainRunningAtDaytypesStart.push(this.runningMain);
@@ -2782,7 +2789,13 @@ describe("forecast service: F2 row 1 in its own worker job", () => {
 		await flush();
 		await h.runner.finish(ok());
 		const choice = row1(MON_FRI);
-		const outcome: DaytypesOutcome = { status: "ok", choice, ms: 50_000 };
+		const outcome: DaytypesOutcome = {
+			status: "ok",
+			choice,
+			pending: null,
+			nested: false,
+			ms: 50_000,
+		};
 		await h.runner.finishDaytypes(outcome);
 		expect(h.daytypesLines()).toEqual([
 			formatF2DaytypesLine(outcome, null, h.time.clock.now()),
@@ -2809,7 +2822,13 @@ describe("forecast service: F2 row 1 in its own worker job", () => {
 		expect(h.runner.calls[1]?.daytypes).toBeNull();
 		await h.runner.finish(ok());
 		const choice = row1(MON_FRI);
-		await h.runner.finishDaytypes({ status: "ok", choice, ms: 1 });
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice,
+			pending: null,
+			nested: false,
+			ms: 1,
+		});
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls[2]?.daytypes).toEqual(choice);
 		await h.runner.finish(ok());
@@ -2842,14 +2861,26 @@ describe("forecast service: F2 row 1 in its own worker job", () => {
 		await flush();
 		await h.runner.finish(ok());
 		const c1 = row1(MON_FRI);
-		await h.runner.finishDaytypes({ status: "ok", choice: c1, ms: 1 });
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice: c1,
+			pending: null,
+			nested: false,
+			ms: 1,
+		});
 		h.settings.current = { ...h.settings.current, historyHalfLifeDays: 7 };
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls[1]?.daytypes).toBeNull();
 		await h.runner.finish(ok());
 		expect(h.runner.daytypesCalls[1]?.demand.historyHalfLifeDays).toBe(7);
 		const c2 = row1([0, 0, 0, 0, 1, 2, 2]);
-		await h.runner.finishDaytypes({ status: "ok", choice: c2, ms: 1 });
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice: c2,
+			pending: null,
+			nested: false,
+			ms: 1,
+		});
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls[2]?.daytypes).toEqual(c2);
 		await h.runner.finish(ok());
@@ -2862,6 +2893,55 @@ describe("forecast service: F2 row 1 in its own worker job", () => {
 		h.settings.current = { ...h.settings.current, historyHalfLifeDays: 14 };
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls[3]?.daytypes).toBeNull();
+	});
+
+	it("a pending partition goes to the next row-1 job with the stored choice, and is dropped after a demand setting changes (R3-2)", async () => {
+		const h = refitHarness();
+		h.runner.manualDaytypes = true;
+		await h.service.runOnce();
+		await flush();
+		await h.runner.finish(ok());
+		expect(h.runner.daytypesCalls[0]?.daytypes).toBeNull();
+		expect(h.runner.daytypesCalls[0]?.pending).toBeNull();
+		const present: Partition = [1, 0, 0, 0, 0, 2, 2];
+		const c1 = row1(present);
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice: c1,
+			pending: MON_FRI,
+			nested: false,
+			ms: 1,
+		});
+		await h.time.advance(60 * MIN);
+		// the main job serves the stored choice: the pending partition is not fitted there
+		expect(h.runner.calls[1]?.daytypes).toEqual(c1);
+		await h.runner.finish(ok());
+		expect(h.runner.daytypesCalls[1]?.daytypes).toEqual(c1);
+		expect(h.runner.daytypesCalls[1]?.pending).toEqual(MON_FRI);
+		const c2 = row1(MON_FRI);
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice: c2,
+			pending: null,
+			nested: true,
+			ms: 1,
+		});
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls[2]?.daytypes).toEqual(c2);
+		await h.runner.finish(ok());
+		expect(h.runner.daytypesCalls[2]?.pending).toBeNull();
+		await h.runner.finishDaytypes({
+			status: "ok",
+			choice: c2,
+			pending: [0, 0, 0, 0, 1, 2, 2],
+			nested: false,
+			ms: 1,
+		});
+		h.settings.current = { ...h.settings.current, historyHalfLifeDays: 7 };
+		await h.time.advance(60 * MIN);
+		await h.runner.finish(ok());
+		expect(h.runner.daytypesCalls[3]?.daytypes).toBeNull();
+		expect(h.runner.daytypesCalls[3]?.pending).toBeNull();
 	});
 
 	it("stop aborts a running row-1 job and logs nothing for it", async () => {

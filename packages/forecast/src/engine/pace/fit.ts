@@ -152,30 +152,117 @@ export const meanSd = (d: number[]) => {
 	return { mu, sd };
 };
 
-export function fitPaceModel(
+/**
+ * What a fit and the row-1 scorers share for one series and partition: the
+ * calendar to the cut, the band rows, the ISO weeks in row order, each week's
+ * scoring support (its first test day to the last day its targets touch) and
+ * the per-day censor prefix (R3-3: a target touching a day with any censored
+ * bucket is not scored).
+ */
+function fitFrame(
 	series: PaceSeries,
 	now: EpochMs,
-	partition: ArrayLike<number> = PRESENT_GROUP,
-): PaceFitState {
+	partition: ArrayLike<number>,
+) {
 	const present = isPresentGroup(partition);
 	const group: ArrayLike<number> = present
 		? PRESENT_GROUP
 		: normalizeGroup(partition);
 	const names: string[] = present ? [...DAY_TYPES] : groupNames(group);
-	const grammar = paceGrammar();
-	const m = grammar.length;
-	const floor = floorOf(m);
 	const n = series.units.length;
 	const cut = Math.max(
 		0,
 		Math.min(n, Math.floor((now - series.start) / BUCKET_MS)),
 	);
 	const cal = buildCalendar(series.start, cut, series.timeZone, group);
-	const ctx = new GrammarContext(cal);
 	const cutDay = cut > 0 ? (cal.dayIdx[cut - 1] as number) : 0;
 	const PU = prefix(series.units, cut);
 	const PC = prefix(series.censored, cut);
 	const rows = bandRows(cal, cut);
+	const weeks: number[] = [];
+	const r0 = rows[0] as BandRows;
+	for (let q = 0; q < r0.n; q++) {
+		const w = r0.week[q] as number;
+		if (weeks[weeks.length - 1] !== w && !weeks.includes(w)) weeks.push(w);
+	}
+	const support = new Map<number, [number, number]>();
+	for (const R of rows)
+		for (let q = 0; q < R.n; q++) {
+			const wk = R.week[q] as number;
+			const lo = R.day[q] as number;
+			const hi = cal.dayIdx[(R.b[q] as number) - 1] as number;
+			const s = support.get(wk);
+			if (!s) support.set(wk, [lo, hi]);
+			else support.set(wk, [Math.min(s[0], lo), Math.max(s[1], hi)]);
+		}
+	const flag = new Uint8Array(cal.days.length);
+	for (let i = 0; i < cut; i++)
+		if (series.censored[i]) flag[cal.dayIdx[i] as number] = 1;
+	const censoredDays = new Int32Array(cal.days.length + 1);
+	for (let d = 0; d < flag.length; d++)
+		censoredDays[d + 1] = (censoredDays[d] as number) + (flag[d] as number);
+	return {
+		present,
+		group,
+		names,
+		cut,
+		cal,
+		cutDay,
+		PU,
+		PC,
+		rows,
+		weeks,
+		support,
+		censoredDays,
+	};
+}
+
+/** R3-3: true when the target [a, b) touches a local day with any censored bucket. */
+function targetCensored(
+	cal: PaceCalendar,
+	censoredDays: Int32Array,
+	a: number,
+	b: number,
+): boolean {
+	const d0 = cal.dayIdx[a] as number;
+	const d1 = cal.dayIdx[b - 1] as number;
+	return (censoredDays[d1 + 1] as number) - (censoredDays[d0] as number) > 0;
+}
+
+/**
+ * `lean`: the served model only, for row 1's nested fits (R3-2): no
+ * out-of-fold served loss (`oof` empty) and no day-type diagnostic
+ * (`dayTypeComparison` empty). Selection, ridge, lambda, R^2 gate, cells and
+ * baseline are exactly the full fit's.
+ */
+export interface FitOptions {
+	lean?: boolean;
+}
+
+export function fitPaceModel(
+	series: PaceSeries,
+	now: EpochMs,
+	partition: ArrayLike<number> = PRESENT_GROUP,
+	{ lean = false }: FitOptions = {},
+): PaceFitState {
+	const {
+		present,
+		group,
+		names,
+		cut,
+		cal,
+		cutDay,
+		PU,
+		PC,
+		rows,
+		weeks,
+		support,
+		censoredDays,
+	} = fitFrame(series, now, partition);
+	const grammar = paceGrammar();
+	const m = grammar.length;
+	const floor = floorOf(m);
+	const ctx = new GrammarContext(cal);
 
 	const profile = (trainDay: (d: number) => boolean) =>
 		baselineProfile(
@@ -192,12 +279,6 @@ export function fitPaceModel(
 		PB: baselinePrefix(cal, prof, group, cut),
 	});
 
-	const weeks: number[] = [];
-	const r0 = rows[0] as BandRows;
-	for (let q = 0; q < r0.n; q++) {
-		const w = r0.week[q] as number;
-		if (weeks[weeks.length - 1] !== w && !weeks.includes(w)) weeks.push(w);
-	}
 	const folds: Fold[] = weeks.map((wk) => ({
 		week: wk,
 		P: sums(
@@ -212,17 +293,7 @@ export function fitPaceModel(
 	// reach up to a week past it, so the baseline and the refitted cells train
 	// without every local day from the week's first to the last day any of its
 	// test rows' targets touch (E4's selection folds above are unchanged).
-	const support = new Map<number, [number, number]>();
-	for (const R of rows)
-		for (let q = 0; q < R.n; q++) {
-			const wk = R.week[q] as number;
-			const lo = R.day[q] as number;
-			const hi = cal.dayIdx[(R.b[q] as number) - 1] as number;
-			const s = support.get(wk);
-			if (!s) support.set(wk, [lo, hi]);
-			else support.set(wk, [Math.min(s[0], lo), Math.max(s[1], hi)]);
-		}
-	const scoreFolds: ScoreFold[] = weeks.map((wk) => {
+	const scoreFolds: ScoreFold[] = (lean ? [] : weeks).map((wk) => {
 		const [lo, hi] = support.get(wk) as [number, number];
 		return {
 			week: wk,
@@ -247,6 +318,7 @@ export function fitPaceModel(
 			floor,
 			names,
 			scoreFolds,
+			censoredDays,
 		);
 		bands.push(res.fit);
 		cellsEstablished += res.fit.cells.length;
@@ -257,19 +329,21 @@ export function fitPaceModel(
 	const days = cal.days.filter(
 		(D, d) => d < cutDay && D.end - D.first >= 270,
 	).length;
-	const dayTypeComparison = compareDayTypes({
-		cal,
-		ctx,
-		units: series.units,
-		censored: series.censored,
-		PU,
-		PC,
-		cut,
-		cutDay,
-		weeks,
-		rows,
-		features: bands.map((b) => b.feature),
-	});
+	const dayTypeComparison = lean
+		? []
+		: compareDayTypes({
+				cal,
+				ctx,
+				units: series.units,
+				censored: series.censored,
+				PU,
+				PC,
+				cut,
+				cutDay,
+				weeks,
+				rows,
+				features: bands.map((b) => b.feature),
+			});
 	const baseline = {} as PaceFitState["baseline"];
 	names.forEach((t, g) => {
 		baseline[t] = Array.from(finalProfile[g] as Float64Array);
@@ -318,6 +392,7 @@ function fitBand(
 	floor: number,
 	names: string[],
 	scoreFolds: ScoreFold[],
+	censoredDays: Int32Array,
 ): {
 	fit: PaceBandFit;
 	below: PaceFitState["belowFloor"];
@@ -624,7 +699,8 @@ function fitBand(
 	// training rows at the cell's lambda (scoring folds: baseline and training
 	// rows clear of every day the held-out week's targets touch); the plain line (0) when the band has no
 	// feature, the cell is not served, the feature is missing or the fold is too
-	// small. Summed per ISO week (the held-out fold).
+	// small. A test row whose target touches a day with any censored bucket is
+	// not scored (R3-3). Summed per ISO week (the held-out fold).
 	const oof = new Map<number, number>();
 	const served = new Map<number, number>();
 	if (feature)
@@ -687,6 +763,8 @@ function fitBand(
 		const u = -1 - f.week;
 		for (let q = 0; q < R.n; q++) {
 			if (!test[q]) continue;
+			if (targetCensored(cal, censoredDays, R.a[q] as number, R.b[q] as number))
+				continue;
 			const yv = y[q] as number;
 			if (Number.isNaN(yv)) continue;
 			let yhat = 0;
@@ -719,4 +797,84 @@ function fitBand(
 		below,
 		oof,
 	};
+}
+
+/**
+ * Row 1's nested out-of-fold loss (DESIGN-F2 R3-2): per ISO week w, a full
+ * E4 fit (`fit`, lean: its own selection, ridge, lambda and R^2 gate, without
+ * the diagnostics it does not serve) on the series
+ * with every local day from w's first test day to the last day its targets
+ * touch censored, so none of it trains, then w's test rows scored with that
+ * fit's served model as `PaceFitState.oof` scores them: target and feature
+ * against the fit's baseline on the real series, prediction coef *
+ * (clip(x) - mean) / sd of the served cell (target group, origin hour), 0
+ * without one. Rows whose target touches a censored day are not scored (R3-3).
+ * Units are -1 - week key, as in `oof`; a week with no scored row has none.
+ */
+export function nestedOof(
+	series: PaceSeries,
+	now: EpochMs,
+	partition: ArrayLike<number> = PRESENT_GROUP,
+	fit: (
+		series: PaceSeries,
+		now: EpochMs,
+		partition?: ArrayLike<number>,
+		options?: FitOptions,
+	) => PaceFitState = fitPaceModel,
+): { units: number[]; loss: number[] } {
+	const { group, names, cut, cal, PU, PC, rows, weeks, support, censoredDays } =
+		fitFrame(series, now, partition);
+	const ctx = new GrammarContext(cal);
+	const byUnit = new Map<number, number>();
+	for (const wk of weeks) {
+		const [lo, hi] = support.get(wk) as [number, number];
+		const censored = Uint8Array.from(series.censored);
+		for (let i = 0; i < cut; i++) {
+			const d = cal.dayIdx[i] as number;
+			if (d >= lo && d <= hi) censored[i] = 1;
+		}
+		const state = fit({ ...series, censored }, now, partition, { lean: true });
+		const prof = names.map((t) =>
+			Float64Array.from(state.baseline[t as keyof PaceFitState["baseline"]]),
+		);
+		const P: SpanSums = {
+			PU,
+			PC,
+			PB: baselinePrefix(cal, prof, group, cut),
+		};
+		let sum = 0;
+		let scored = false;
+		rows.forEach((R, bi) => {
+			const band = state.bands[bi] as PaceBandFit;
+			const feature = band.feature;
+			const cells = new Map<number, PaceCellFit>();
+			for (const c of band.cells)
+				cells.set(names.indexOf(c.dayType) * 24 + c.hour, c);
+			for (let q = 0; q < R.n; q++) {
+				if ((R.week[q] as number) !== wk) continue;
+				const a = R.a[q] as number;
+				const b = R.b[q] as number;
+				if (targetCensored(cal, censoredDays, a, b)) continue;
+				const yv = lr(P, a, b);
+				if (Number.isNaN(yv)) continue;
+				let yhat = 0;
+				if (feature) {
+					const c = cells.get(
+						(R.cls[q] as number) * 24 +
+							(Math.round((R.minute[q] as number) / 60) % 24),
+					);
+					const x = c ? ctx.value(feature, P, R.o[q] as number, a, b) : NaN;
+					if (c && !Number.isNaN(x)) {
+						const xc = Math.min(c.hi, Math.max(c.lo, x));
+						yhat = (c.coef * (xc - c.mean)) / c.sd;
+					}
+				}
+				sum += (yv - yhat) ** 2;
+				scored = true;
+			}
+		});
+		if (scored) byUnit.set(-1 - wk, sum);
+	}
+	const units = [...byUnit.keys()].sort((a, b) => a - b);
+	return { units, loss: units.map((u) => byUnit.get(u) as number) };
 }

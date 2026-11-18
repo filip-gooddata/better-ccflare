@@ -196,12 +196,36 @@ describe("forecast f2 daytypes log line", () => {
 	it("on success prints the job time and the row-1 entry in the f2 learn format", () => {
 		expect(
 			formatF2DaytypesLine(
-				{ status: "ok", choice: stored, ms: 58048.6 },
+				{
+					status: "ok",
+					choice: stored,
+					pending: null,
+					nested: false,
+					ms: 58048.6,
+				},
 				null,
 				T,
 			),
 		).toBe(
-			"forecast f2 daytypes ms=58049 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
+			"forecast f2 daytypes ms=58049 nested=0 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
+		);
+	});
+
+	it("marks a nested confirmation job with nested=1", () => {
+		expect(
+			formatF2DaytypesLine(
+				{
+					status: "ok",
+					choice: stored,
+					pending: null,
+					nested: true,
+					ms: 90_000,
+				},
+				null,
+				T,
+			),
+		).toBe(
+			"forecast f2 daytypes ms=90000 nested=1 rows=daytypes:0111122/0000011/0111122/2/1.9/0.1/0.25/6/4/0",
 		);
 	});
 

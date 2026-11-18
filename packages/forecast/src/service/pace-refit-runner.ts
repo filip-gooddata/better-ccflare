@@ -40,7 +40,15 @@ export type PaceRefitOutcome =
 	| { status: "error"; reason: PaceRefitFailure; ms: number };
 
 export type DaytypesOutcome =
-	| { status: "ok"; choice: RowChoice<Partition>; ms: number }
+	| {
+			status: "ok";
+			choice: RowChoice<Partition>;
+			/** The switch waiting for the next job's nested confirmation (R3-2). */
+			pending: Partition | null;
+			/** True when this job ran the nested confirmation. */
+			nested: boolean;
+			ms: number;
+	  }
 	| { status: "timeout"; ms: number }
 	| { status: "error"; reason: PaceRefitFailure; ms: number };
 
@@ -60,12 +68,22 @@ export interface PaceRefitRunner {
 			daytypes?: RowChoice<Partition> | null;
 		},
 	): Promise<PaceRefitOutcome>;
-	/** Scores F2 row 1 (one E4 fit per candidate partition) in its own worker job. Transfers the series' buffers like `run`. */
+	/**
+	 * Runs the F2 row-1 job in its own worker: family scoring, or with
+	 * `options.pending` the nested confirmation (R3-2). `options.daytypes` is
+	 * the stored choice (null or absent: present served). Transfers the
+	 * series' buffers like `run`.
+	 */
 	runDaytypes(
 		series: PaceSeries,
 		now: EpochMs,
 		demand: RefitDemandSettings,
-		options: { timeoutMs: number; signal?: AbortSignal },
+		options: {
+			timeoutMs: number;
+			signal?: AbortSignal;
+			daytypes?: RowChoice<Partition> | null;
+			pending?: Partition | null;
+		},
 	): Promise<DaytypesOutcome>;
 }
 
@@ -120,15 +138,20 @@ export function createPaceRefitRunner(
 				ms: outcome.ms,
 			};
 		},
-		async runDaytypes(series, now, demand, { timeoutMs, signal }) {
+		async runDaytypes(
+			series,
+			now,
+			demand,
+			{ timeoutMs, signal, daytypes = null, pending = null },
+		) {
 			const { units, censored } = series;
 			const outcome = await worker.run(
 				"daytypes",
-				payloadOf(series, now, demand),
+				{ ...payloadOf(series, now, demand), daytypes, pending },
 				{ timeoutMs, signal, transfer: [units.buffer, censored.buffer] },
 			);
 			if (outcome.status === "ok")
-				return { status: "ok", choice: outcome.result, ms: outcome.ms };
+				return { status: "ok", ...outcome.result, ms: outcome.ms };
 			if (outcome.status === "timeout") return outcome;
 			return {
 				status: "error",

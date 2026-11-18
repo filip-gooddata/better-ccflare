@@ -1,7 +1,7 @@
 import { WORK_START_RECENT_DAYS } from "../days";
-import { PRESENT_PARTITION } from "./partition";
+import { PRESENT_PARTITION, partitionKey } from "./partition";
 import { scoreBandwidth } from "./rows/bandwidth";
-import { scoreDaytypes } from "./rows/daytypes";
+import { scoreDaytypes, scoreDaytypesNested } from "./rows/daytypes";
 import { scoreHalflife } from "./rows/halflife";
 import { scoreJitter } from "./rows/jitter";
 import { scoreLookback } from "./rows/lookback";
@@ -10,6 +10,7 @@ import { scoreWorkstartSample } from "./rows/workstart-sample";
 import { scoreWorkstartShare } from "./rows/workstart-share";
 import { selectRow } from "./select";
 import type {
+	DaytypesResult,
 	DemandSettings,
 	LearnedDemand,
 	LearnInput,
@@ -18,7 +19,7 @@ import type {
 	RowChoice,
 } from "./types";
 
-export { makePartitionFitter } from "./fit-hook";
+export { makeNestedScorer, makePartitionFitter } from "./fit-hook";
 export {
 	isPresentPartition,
 	normalizePartition,
@@ -45,12 +46,47 @@ export function presentDemand(settings: DemandSettings): LearnedDemand {
 }
 
 /**
- * Row 1 (day types): scores every candidate partition with its own full E4 fit
- * and selects. Runs in its own worker job, after the main refit job, because
- * one fit per candidate is too slow for the main job (REPORT.md section 4).
+ * Row 1 (day types), DESIGN-F2 R3-2. Runs in its own worker job, after the
+ * main refit job, because one fit per candidate is too slow for the main job
+ * (REPORT.md section 4). `prior` is the stored state: the partition served now
+ * and the pending one.
+ *
+ * Nothing pending: scores the family unnested. A selection that would switch
+ * (on, chosen not the served partition) does not switch: the served partition
+ * stays and the chosen one becomes pending. Otherwise the selection is served
+ * (present when off).
+ *
+ * Pending X: instead of family scoring, the nested comparison of present vs X
+ * (`input.nestedLoss`) selected with the family's m and floor; X is served iff
+ * it passes, else the served partition stays. Pending is cleared either way.
  */
-export function learnDaytypes(input: LearnInput): RowChoice<Partition> {
-	return selectRow(scoreDaytypes(input));
+export function learnDaytypes(
+	input: LearnInput,
+	prior: { served: Partition; pending: Partition | null } = {
+		served: PRESENT_PARTITION,
+		pending: null,
+	},
+): DaytypesResult {
+	if (prior.pending) {
+		if (!input.nestedLoss)
+			throw new Error("row 1: a pending partition needs the nested scorer");
+		const choice = selectRow(
+			scoreDaytypesNested(input, prior.pending, input.nestedLoss),
+		);
+		return {
+			choice: choice.on ? choice : { ...choice, served: prior.served },
+			pending: null,
+			nested: true,
+		};
+	}
+	const choice = selectRow(scoreDaytypes(input));
+	if (choice.on && partitionKey(choice.chosen) !== partitionKey(prior.served))
+		return {
+			choice: { ...choice, served: prior.served },
+			pending: choice.chosen,
+			nested: false,
+		};
+	return { choice, pending: null, nested: false };
 }
 
 /**
