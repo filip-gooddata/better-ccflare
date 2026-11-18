@@ -9,6 +9,8 @@ import {
 	REASON_MIN_GAIN_POINTS,
 	REPORT_STEP_POINTS,
 } from "../planner";
+import type { SimulationResult } from "../model";
+import { simulate } from "../simulate";
 import { account, HOUR, MIN, makeCtx, prague, session } from "./fixtures-sim";
 
 const PRAGUE = "Europe/Prague";
@@ -266,5 +268,36 @@ describe("planForecast search bounded by a deadline", () => {
 		expect(search.cutByDeadline).toBe(false);
 		expect(search.combos.evaluated).toBe(search.combos.available);
 		expect(search.moves.evaluated).toBe(search.moves.available);
+	}, 60_000);
+});
+
+describe("the search keeps scores, not simulations", () => {
+	test("after a full-grid plan only the baseline and the chosen plan's simulations stay reachable", async () => {
+		const ctx = makeCtx({
+			now: prague(12, 7, 30),
+			days: 5,
+			accounts: [
+				account({ id: "acct-a", fiveUsed: 40, fiveReset: prague(12, 10) }),
+				account({ id: "acct-b" }),
+			],
+			rate: (m, w) => (w <= 5 && m >= 480 && m < 960 ? 0.9 : 0),
+		});
+		const made: WeakRef<SimulationResult>[] = [];
+		const spy: typeof simulate = async (c, plan) => {
+			const result = await simulate(c, plan);
+			made.push(new WeakRef(result));
+			return result;
+		};
+		const value = await planForecast(ctx, { simulate: spy });
+		// One simulation per candidate, and one more for the chosen plan unless it is the baseline.
+		expect(value.candidates).toBeGreaterThan(value.search.stage1);
+		expect(made.length).toBeGreaterThanOrEqual(value.candidates);
+		Bun.gc(true);
+		const alive = made.filter((ref) => ref.deref() !== undefined).length;
+		// The two the result returns (baseline and chosen), with slack for references the collector
+		// scans conservatively. Keeping every candidate would leave about a hundred reachable.
+		expect(alive).toBeLessThanOrEqual(4);
+		expect(value.result.traces.length).toBe(5);
+		expect(value.baseline.result.traces.length).toBe(5);
 	}, 60_000);
 });

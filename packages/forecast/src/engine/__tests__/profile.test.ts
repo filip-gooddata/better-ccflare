@@ -24,19 +24,15 @@ async function heavyLow(
 }
 
 describe("aggregated usage profile", () => {
-	test(
-		"gives a forecast: 37 recorded days, calibrated, both blocks",
-		async () => {
-			const result = await createForecastEngine().compute(
-				buildInput(profileFixture()),
-			);
-			expect(result.available).toBe(true);
-			if (!result.available) return;
-			expect(result.response.day?.times.length).toBeGreaterThan(100);
-			expect(result.response.week).not.toBeNull();
-		},
-		FULL_GRID_TIMEOUT_MS,
-	);
+	test("gives a forecast: 37 recorded days, calibrated, both blocks", async () => {
+		const result = await createForecastEngine().compute(
+			buildInput(profileFixture()),
+		);
+		expect(result.available).toBe(true);
+		if (!result.available) return;
+		expect(result.response.day?.times.length).toBeGreaterThan(100);
+		expect(result.response.week).not.toBeNull();
+	});
 
 	test("learned work start (amendment A3): the minute by which 5 % of a work day's demand is used, not the overnight first request", async () => {
 		const replay = await prepareEngineContext(buildInput(replayFixture()), {

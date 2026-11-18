@@ -39,6 +39,8 @@ export interface PlanSearchOptions {
 	now?: () => number;
 	/** On the `now` clock: combinations of two or more openings and moves stop once it has passed. None: unbounded. */
 	deadline?: number;
+	/** The simulation; default simulate. A seam for tests that watch what the search keeps. */
+	simulate?: typeof simulate;
 }
 
 /** What one planner search covered. */
@@ -401,6 +403,7 @@ export async function planForecast(
 	search: PlannerSearch;
 }> {
 	const clock = options.now ?? (() => performance.now());
+	const run = options.simulate ?? simulate;
 	const startedAt = clock();
 	const deadline = options.deadline ?? Number.POSITIVE_INFINITY;
 	let cutByDeadline = false;
@@ -418,7 +421,7 @@ export async function planForecast(
 		const known = cache.get(key);
 		if (known) return known;
 		if (cache.size > 0) await yieldToEventLoop();
-		const result = await simulate(ctx, plan);
+		const result = await run(ctx, plan);
 		baselineResult ??= result;
 		const evaluated = { plan, score: scorePlan(ctx, result, plan) };
 		cache.set(key, evaluated);
@@ -606,7 +609,7 @@ export async function planForecast(
 	const baselineSim: SimulationResult = baselineResult;
 	// The simulation is deterministic for one context, so the chosen plan's is the one it was scored on.
 	const bestResult =
-		best === baseline ? baselineSim : await simulate(ctx, best.plan);
+		best === baseline ? baselineSim : await run(ctx, best.plan);
 
 	return {
 		plan: {
