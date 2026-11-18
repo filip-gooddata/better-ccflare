@@ -423,3 +423,94 @@ describe("validateForecastResponse rejects", () => {
 		}
 	});
 });
+
+describe("stopChance and likelyStop (specification revision 9)", () => {
+	const HOUR = 3_600_000;
+	const base = generateFullResponse();
+	const errorsOn = (value: unknown, field: string) =>
+		validateForecastResponse(value).filter((e) => e.includes(field));
+	/** A response whose block carries the two fields, stopNow null. */
+	function withFields(
+		stopChance: unknown,
+		likelyStop: unknown,
+		key: "day" | "week" = "day",
+	): Loose {
+		const r = clone(base);
+		r[key].stopChance = stopChance;
+		r[key].likelyStop = likelyStop;
+		return r;
+	}
+	/** The same with a running stop in the day block. */
+	function running(stopChance: unknown, likelyStop: unknown): Loose {
+		const r = withFields(stopChance, likelyStop);
+		r.day.stopNow = { start: r.computedAt - HOUR, end: r.computedAt + HOUR };
+		return r;
+	}
+	const inside = () => ({ start: base.computedAt + 2 * HOUR, minutes: 45 });
+
+	test("accepts the fields absent, null, or consistent", () => {
+		expect(validateForecastResponse(base)).toEqual([]);
+		expect(validateForecastResponse(withFields(null, null))).toEqual([]);
+		expect(validateForecastResponse(withFields(0, null))).toEqual([]);
+		expect(validateForecastResponse(withFields(0.49, null))).toEqual([]);
+		expect(validateForecastResponse(withFields(0.52, inside()))).toEqual([]);
+		expect(validateForecastResponse(withFields(1, inside(), "week"))).toEqual(
+			[],
+		);
+		const r = withFields(0.8, inside());
+		r.day.likelyStop.start = r.day.times[r.day.times.length - 1];
+		expect(validateForecastResponse(r)).toEqual([]);
+	});
+
+	test("accepts 1 and a null likelyStop during stopNow", () => {
+		expect(errorsOn(running(1, null), "day.stopChance")).toEqual([]);
+		expect(errorsOn(running(1, null), "day.likelyStop")).toEqual([]);
+	});
+
+	test("rejects stopChance outside 0 to 1, not a number, or past two decimals", () => {
+		for (const bad of [-0.01, 1.01, 2, "0.5", Number.NaN, 0.333])
+			expect(errorsOn(withFields(bad, null), "day.stopChance").length).toBe(1);
+	});
+
+	test("rejects a stopChance other than 1 during stopNow; null stays allowed", () => {
+		expect(errorsOn(running(0.8, null), "day.stopChance").length).toBe(1);
+		expect(errorsOn(running(0, null), "day.stopChance").length).toBe(1);
+		expect(errorsOn(running(null, null), "day.stopChance")).toEqual([]);
+	});
+
+	test("rejects likelyStop below one half, without stopChance, or during stopNow", () => {
+		expect(errorsOn(withFields(0.49, inside()), "day.likelyStop").length).toBe(
+			1,
+		);
+		expect(errorsOn(withFields(null, inside()), "day.likelyStop").length).toBe(
+			1,
+		);
+		expect(errorsOn(running(1, inside()), "day.likelyStop").length).toBe(1);
+	});
+
+	test("rejects a missing likelyStop at one half or above", () => {
+		expect(errorsOn(withFields(0.5, null), "day.likelyStop").length).toBe(1);
+		const r = withFields(0.7, null);
+		delete r.day.likelyStop;
+		expect(errorsOn(r, "day.likelyStop").length).toBe(1);
+	});
+
+	test("rejects a start outside the block's span from computedAt", () => {
+		const atNow = withFields(0.6, { start: base.computedAt, minutes: 30 });
+		expect(errorsOn(atNow, "day.likelyStop").length).toBe(1);
+		const r = withFields(0.6, inside());
+		r.day.likelyStop.start = r.day.times[r.day.times.length - 1] + 1;
+		expect(errorsOn(r, "day.likelyStop").length).toBe(1);
+	});
+
+	test("rejects minutes that are not a positive whole number, and malformed shapes", () => {
+		for (const minutes of [0, -5, 1.5, "30", null]) {
+			const r = withFields(0.6, { ...inside(), minutes });
+			expect(errorsOn(r, "day.likelyStop").length).toBe(1);
+		}
+		for (const shape of ["soon", 5, [], { start: base.computedAt + HOUR }])
+			expect(
+				errorsOn(withFields(0.6, shape), "day.likelyStop").length,
+			).toBeGreaterThan(0);
+	});
+});
