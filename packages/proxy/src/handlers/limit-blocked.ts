@@ -133,7 +133,7 @@ function limitsInForce(
 		}
 	}
 
-	if (model && family) {
+	if (model) {
 		const familyLimit = familyLimitInForce(
 			account,
 			model,
@@ -149,7 +149,7 @@ function limitsInForce(
 function familyLimitInForce(
 	account: Account,
 	model: string,
-	family: string,
+	family: string | null,
 	capacityRoutingEnabled: boolean,
 	now: number,
 ): AccountLimit | null {
@@ -158,6 +158,9 @@ function familyLimitInForce(
 	// model", which turns mapping off).
 	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
 	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
+	// A client alias with no family of its own still counts when the account
+	// maps it to a family.
+	if (!upstreamFamily) return null;
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };
@@ -177,7 +180,7 @@ function familyLimitInForce(
 			resetAt: telemetry.resetAt,
 		};
 	}
-	if (!capacityRoutingEnabled) return null;
+	if (!capacityRoutingEnabled || !family) return null;
 
 	const exhaustedRows = usage
 		? extractModelFamilyWindows(

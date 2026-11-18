@@ -1425,6 +1425,28 @@ export async function selectAccountsForRequest(
 			notePoolDeferrals(available);
 			return applyXaiCacheAffinity(available, meta);
 		}
+
+		// A client model with no family of its own (an alias) can still be
+		// mapped to one: drop accounts whose family block or full family
+		// telemetry covers the model they would send. There is no request
+		// family to name in a model_family_exhausted response, so an emptied
+		// list takes the all-limited rule or the ordinary empty result.
+		const now = Date.now();
+		const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
+		const available = orderedAccounts.filter(
+			(account) =>
+				!isAccountCapacityExcluded(account, model, now, capacityRoutingEnabled)
+					.excluded,
+		);
+		if (available.length < orderedAccounts.length) {
+			if (available.length === 0) {
+				const allLimited = await allLimitedSelection();
+				if (allLimited) return allLimited;
+				return [];
+			}
+			notePoolDeferrals(available);
+			return applyXaiCacheAffinity(available, meta);
+		}
 	}
 
 	notePoolDeferrals(orderedAccounts);

@@ -427,6 +427,25 @@ describe("collectLimitBlockedAccounts", () => {
 		}
 	});
 
+	it("lists the full family a familyless client alias is mapped to", () => {
+		const accounts = [
+			makeAccount("a", {
+				model_mappings: JSON.stringify({ "custom-alias": ["claude-fable-5"] }),
+			}),
+		];
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const blocked = collectLimitBlockedAccounts(
+			accounts,
+			makeCtx({ accounts, strategy: availabilityStrategy() }),
+			makeMeta(),
+			"custom-alias",
+			NOW,
+		);
+		expect(limitsOf(blocked, "a")).toEqual([
+			{ kind: "family", family: "fable", resetAt: NOW + 10 * HOUR },
+		]);
+	});
+
 	it("does not list another family's full row when the request is not mapped to it", () => {
 		const a = makeAccount("a");
 		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
@@ -574,6 +593,70 @@ describe("selectAccountsForRequest: a full limit is never a candidate", () => {
 			const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
 			expect(selected.map((x) => x.id)).toEqual(["b"]);
 		}
+	});
+
+	it("excludes an account that maps a familyless client alias to a full family", async () => {
+		const a = makeAccount("a", {
+			model_mappings: JSON.stringify({ "custom-alias": ["claude-fable-5"] }),
+		});
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			const ctx = makeCtx({
+				accounts: [a, b],
+				strategy: availabilityStrategy(),
+				capacityRouting,
+			});
+			const selected = await selectAccountsForRequest(
+				makeMeta(),
+				ctx,
+				"custom-alias",
+			);
+			expect(selected.map((x) => x.id)).toEqual(["b"]);
+		}
+	});
+
+	it("skips a combo slot whose account sends the slot model as a full family, capacity routing off", async () => {
+		const a = makeAccount("a", opusToFable);
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const slot = (id: string, account: string, priority: number) => ({
+			id,
+			combo_id: "combo-1",
+			account_id: account,
+			model: MODEL,
+			priority,
+			enabled: true,
+		});
+		const combo = {
+			id: "combo-1",
+			name: "Combo",
+			description: null,
+			enabled: true,
+			created_at: NOW,
+			updated_at: NOW,
+			slots: [slot("slot-a", "a", 0), slot("slot-b", "b", 1)],
+		} as ComboWithSlots;
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+			activeCombo: combo,
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("keeps routing a familyless client alias that no account maps to a full family", async () => {
+		const a = makeAccount("a");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const ctx = makeCtx({ accounts: [a], strategy: availabilityStrategy() });
+		const selected = await selectAccountsForRequest(
+			makeMeta(),
+			ctx,
+			"custom-alias",
+		);
+		expect(selected.map((x) => x.id)).toEqual(["a"]);
 	});
 
 	it("keeps an account with only a reactive family mark while capacity routing is off", async () => {
