@@ -3,6 +3,9 @@ import { PACE_BANDS } from "./bands";
 import {
 	buildCalendar,
 	DAY_TYPES,
+	groupNames,
+	isPresentGroup,
+	normalizeGroup,
 	type PaceCalendar,
 	PRESENT_GROUP,
 } from "./calendar";
@@ -47,6 +50,12 @@ const MIN_TRAIN = 10;
 interface Fold {
 	week: number;
 	P: SpanSums;
+}
+
+/** A fold of the out-of-fold served loss: held-out week, the days its test targets span, baseline without them. */
+interface ScoreFold extends Fold {
+	lo: number;
+	hi: number;
 }
 
 /** Per band and fold: targets and the train/test flags of the band's rows. */
@@ -143,7 +152,16 @@ export const meanSd = (d: number[]) => {
 	return { mu, sd };
 };
 
-export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
+export function fitPaceModel(
+	series: PaceSeries,
+	now: EpochMs,
+	partition: ArrayLike<number> = PRESENT_GROUP,
+): PaceFitState {
+	const present = isPresentGroup(partition);
+	const group: ArrayLike<number> = present
+		? PRESENT_GROUP
+		: normalizeGroup(partition);
+	const names: string[] = present ? [...DAY_TYPES] : groupNames(group);
 	const grammar = paceGrammar();
 	const m = grammar.length;
 	const floor = floorOf(m);
@@ -152,7 +170,7 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 		0,
 		Math.min(n, Math.floor((now - series.start) / BUCKET_MS)),
 	);
-	const cal = buildCalendar(series.start, cut, series.timeZone);
+	const cal = buildCalendar(series.start, cut, series.timeZone, group);
 	const ctx = new GrammarContext(cal);
 	const cutDay = cut > 0 ? (cal.dayIdx[cut - 1] as number) : 0;
 	const PU = prefix(series.units, cut);
@@ -164,14 +182,14 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 			cal,
 			series.units,
 			series.censored,
-			PRESENT_GROUP,
-			3,
+			group,
+			names.length,
 			trainDay,
 		);
 	const sums = (prof: Float64Array[]): SpanSums => ({
 		PU,
 		PC,
-		PB: baselinePrefix(cal, prof, PRESENT_GROUP, cut),
+		PB: baselinePrefix(cal, prof, group, cut),
 	});
 
 	const weeks: number[] = [];
@@ -190,15 +208,50 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 	}));
 	const finalProfile = profile((d) => d < cutDay);
 	const finalSums = sums(finalProfile);
+	// Scoring folds of the out-of-fold served loss: the held-out week's targets
+	// reach up to a week past it, so the baseline and the refitted cells train
+	// without every local day from the week's first to the last day any of its
+	// test rows' targets touch (E4's selection folds above are unchanged).
+	const support = new Map<number, [number, number]>();
+	for (const R of rows)
+		for (let q = 0; q < R.n; q++) {
+			const wk = R.week[q] as number;
+			const lo = R.day[q] as number;
+			const hi = cal.dayIdx[(R.b[q] as number) - 1] as number;
+			const s = support.get(wk);
+			if (!s) support.set(wk, [lo, hi]);
+			else support.set(wk, [Math.min(s[0], lo), Math.max(s[1], hi)]);
+		}
+	const scoreFolds: ScoreFold[] = weeks.map((wk) => {
+		const [lo, hi] = support.get(wk) as [number, number];
+		return {
+			week: wk,
+			lo,
+			hi,
+			P: sums(profile((d) => (d < lo || d > hi) && d < cutDay)),
+		};
+	});
 
 	const bands: PaceBandFit[] = [];
 	const belowFloor: PaceFitState["belowFloor"] = [];
 	let cellsEstablished = 0;
+	const oofByUnit = new Map<number, number>();
 	for (const R of rows) {
-		const res = fitBand(cal, ctx, grammar, R, folds, finalSums, floor);
+		const res = fitBand(
+			cal,
+			ctx,
+			grammar,
+			R,
+			folds,
+			finalSums,
+			floor,
+			names,
+			scoreFolds,
+		);
 		bands.push(res.fit);
 		cellsEstablished += res.fit.cells.length;
 		belowFloor.push(...res.below);
+		for (const [u, l] of res.oof) oofByUnit.set(u, (oofByUnit.get(u) ?? 0) + l);
 	}
 
 	const days = cal.days.filter(
@@ -218,7 +271,7 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 		features: bands.map((b) => b.feature),
 	});
 	const baseline = {} as PaceFitState["baseline"];
-	DAY_TYPES.forEach((t, g) => {
+	names.forEach((t, g) => {
 		baseline[t] = Array.from(finalProfile[g] as Float64Array);
 	});
 	return {
@@ -228,7 +281,7 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 		candidates: m,
 		floor,
 		cellsEstablished,
-		cellsTotal: PACE_BANDS.length * DAY_TYPES.length * 24,
+		cellsTotal: PACE_BANDS.length * names.length * 24,
 		belowFloor,
 		baseline,
 		bands,
@@ -237,6 +290,11 @@ export function fitPaceModel(series: PaceSeries, now: EpochMs): PaceFitState {
 			feature: b.feature?.id ?? null,
 		})),
 		dayTypeComparison,
+		oof: (() => {
+			const units = [...oofByUnit.keys()].sort((a, b) => a - b);
+			return { units, loss: units.map((u) => oofByUnit.get(u) as number) };
+		})(),
+		...(present ? {} : { dayTypes: { names, group: Array.from(group) } }),
 	};
 }
 
@@ -258,7 +316,13 @@ function fitBand(
 	folds: Fold[],
 	finalSums: SpanSums,
 	floor: number,
-): { fit: PaceBandFit; below: PaceFitState["belowFloor"] } {
+	names: string[],
+	scoreFolds: ScoreFold[],
+): {
+	fit: PaceBandFit;
+	below: PaceFitState["belowFloor"];
+	oof: Map<number, number>;
+} {
 	const id = (PACE_BANDS[R.band] as { id: string }).id;
 	const inWeek = (d: number, wk: number) =>
 		(cal.days[d] as { week: number }).week === wk;
@@ -515,7 +579,7 @@ function fitBand(
 			if (!tr.length) continue;
 			const fit = fitRidge(finalY, finalX, tr, tw, lambda);
 			cells.push({
-				dayType: DAY_TYPES[Math.floor(key / 24)] as PaceCellFit["dayType"],
+				dayType: names[Math.floor(key / 24)] as string,
 				hour: key % 24,
 				lambda,
 				r2,
@@ -554,6 +618,96 @@ function fitBand(
 					hour: c.hour,
 				});
 	}
+	// Out-of-fold loss of the SERVED band, as applyPace serves it: a test row's
+	// prediction is the multiplier exponent coef * (clip(x) - mean) / sd (no
+	// intercept) of the cell (target group, origin hour) refitted on the fold's
+	// training rows at the cell's lambda (scoring folds: baseline and training
+	// rows clear of every day the held-out week's targets touch); the plain line (0) when the band has no
+	// feature, the cell is not served, the feature is missing or the fold is too
+	// small. Summed per ISO week (the held-out fold).
+	const oof = new Map<number, number>();
+	const served = new Map<number, number>();
+	if (feature)
+		for (const c of cells)
+			served.set(names.indexOf(c.dayType) * 24 + c.hour, c.lambda);
+	const cellRows = new Map<number, CellRows>();
+	if (served.size)
+		for (let q = 0; q < R.n; q++)
+			for (const key of served.keys()) {
+				const w = kernelW(R.minute[q] as number, key % 24);
+				if (w <= 0 || (R.cls[q] as number) !== Math.floor(key / 24)) continue;
+				let c = cellRows.get(key);
+				if (!c) {
+					c = { ks: [], w: [] };
+					cellRows.set(key, c);
+				}
+				c.ks.push(q);
+				c.w.push(w);
+			}
+	for (const f of scoreFolds) {
+		// targets and feature against this fold's baseline; training rows touch no day of [lo, hi]
+		const y = new Float64Array(R.n);
+		const train = new Uint8Array(R.n);
+		const test = F.test[
+			folds.findIndex((g) => g.week === f.week)
+		] as Uint8Array;
+		for (let q = 0; q < R.n; q++) {
+			const a = R.a[q] as number;
+			const b = R.b[q] as number;
+			y[q] = lr(f.P, a, b);
+			const from = Math.min(R.day[q] as number, cal.dayIdx[a] as number);
+			const to = cal.dayIdx[b - 1] as number;
+			train[q] = to < f.lo || from > f.hi ? 1 : 0;
+		}
+		const x = feature ? column(feature, f.P) : null;
+		const fits = new Map<number, Ridge | null>();
+		const fitOf = (key: number): Ridge | null => {
+			if (fits.has(key)) return fits.get(key) as Ridge | null;
+			const cr = cellRows.get(key);
+			let r: Ridge | null = null;
+			if (cr && x) {
+				const tr: number[] = [];
+				const tw: number[] = [];
+				cr.ks.forEach((k, i) => {
+					if (
+						train[k] &&
+						!Number.isNaN(y[k] as number) &&
+						!Number.isNaN(x[k] as number)
+					) {
+						tr.push(k);
+						tw.push(cr.w[i] as number);
+					}
+				});
+				if (tr.length >= MIN_TRAIN)
+					r = fitRidge(y, [x], tr, tw, served.get(key) as number);
+			}
+			fits.set(key, r);
+			return r;
+		};
+		const u = -1 - f.week;
+		for (let q = 0; q < R.n; q++) {
+			if (!test[q]) continue;
+			const yv = y[q] as number;
+			if (Number.isNaN(yv)) continue;
+			let yhat = 0;
+			if (x && !Number.isNaN(x[q] as number)) {
+				const key =
+					(R.cls[q] as number) * 24 +
+					(Math.round((R.minute[q] as number) / 60) % 24);
+				const r = served.has(key) ? fitOf(key) : null;
+				if (r) {
+					const xc = Math.min(
+						r.hi[0] as number,
+						Math.max(r.lo[0] as number, x[q] as number),
+					);
+					yhat =
+						((r.coef[0] as number) * (xc - (r.mean[0] as number))) /
+						(r.sd[0] as number);
+				}
+			}
+			oof.set(u, (oof.get(u) ?? 0) + (yv - yhat) ** 2);
+		}
+	}
 	return {
 		fit: {
 			band: id,
@@ -563,5 +717,6 @@ function fitBand(
 			cells: feature ? cells : [],
 		},
 		below,
+		oof,
 	};
 }
