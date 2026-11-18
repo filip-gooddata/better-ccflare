@@ -13,12 +13,15 @@ import {
 	DEFAULT_WORK_START_SHARE_PCT,
 	dayTypeOf,
 	historyAvailable,
+	MIN_ACTIVE_DAYS,
 	MIN_POOL_DAYS,
 	poolFor,
 	WORK_START_RECENT_DAYS,
 	workStartMinute,
 } from "../days";
 import type { DayTable, DayType, RecordedDay } from "../model";
+import { floorOf } from "../pace/fit";
+import { paceGrammar } from "../pace/grammar";
 
 const TZ = "Europe/Prague";
 const PACE: PaceContext = {
@@ -300,9 +303,86 @@ describe("historyAvailable", () => {
 	test("monday with 1 monday but enough workdays: yes", () => {
 		expect(
 			historyAvailable(
-				table(["monday", "workday", "workday", "workday", "workday"], "monday"),
+				active(
+					table(["monday", ...Array<DayType>(9).fill("workday")], "monday"),
+					10,
+				),
 			),
 		).toBe(true);
+	});
+});
+
+/** Gives the first `n` days of `t` demand (total 1); the rest stay recorded with total 0. */
+function active(t: DayTable, n: number): DayTable {
+	t.days.forEach((d, i) => {
+		if (i < n) {
+			d.total = 1;
+			(d.units as Float64Array)[100] = 1;
+		}
+	});
+	return t;
+}
+
+describe("historyAvailable: active-day gate (F2 row 3)", () => {
+	const workdays = (n: number) => Array<DayType>(n).fill("workday");
+
+	test("the floor is floorOf(grammar size): 10 today", () => {
+		expect(MIN_ACTIVE_DAYS).toBe(floorOf(paceGrammar().length));
+		expect(MIN_ACTIVE_DAYS).toBe(10);
+	});
+
+	test("9 active days: no forecast; 10: forecast", () => {
+		expect(historyAvailable(active(table(workdays(9), "workday"), 9))).toBe(
+			false,
+		);
+		expect(historyAvailable(active(table(workdays(10), "workday"), 10))).toBe(
+			true,
+		);
+	});
+
+	test("recorded days without demand do not count", () => {
+		expect(historyAvailable(active(table(workdays(20), "workday"), 9))).toBe(
+			false,
+		);
+		expect(historyAvailable(table(workdays(20), "workday"))).toBe(false);
+	});
+
+	test("the per-pool 3-day part holds only while the pool serves hard3", () => {
+		// a Saturday with 10 active workdays and no weekend day recorded
+		const t = active(table(workdays(10), "weekend"), 10);
+		expect(historyAvailable(t)).toBe(false);
+		expect(historyAvailable(t, "hard3")).toBe(false);
+		expect(historyAvailable(t, 2)).toBe(true);
+		expect(historyAvailable(t, 0)).toBe(true);
+		expect(historyAvailable(t, Number.POSITIVE_INFINITY)).toBe(true);
+		// numeric tau: the active-day part still applies
+		expect(historyAvailable(active(table(workdays(9), "weekend"), 9), 2)).toBe(
+			false,
+		);
+	});
+});
+
+describe("buildDayTable demand overrides (F2 rows 4, 5)", () => {
+	const todayStart = localDayStart(NOW, TZ);
+	const from = addLocalDays(todayStart, -28, TZ);
+	const h = history(from, todayStart, () => 0.01);
+
+	test("absent overrides: the settings' lookback and half-life", () => {
+		const a = buildDayTable(input({ history: h, historyFrom: from }));
+		const b = buildDayTable(input({ history: h, historyFrom: from }), {
+			lookbackDays: 28,
+			halfLifeDays: 14,
+		});
+		expect(b).toEqual(a);
+	});
+
+	test("lookback override shortens the table; half-life Infinity weighs every day 1", () => {
+		const t = buildDayTable(input({ history: h, historyFrom: from }), {
+			lookbackDays: 7,
+			halfLifeDays: Number.POSITIVE_INFINITY,
+		});
+		expect(t.days.length).toBe(7);
+		expect(t.days.every((d) => d.weight === 1)).toBe(true);
 	});
 });
 
@@ -387,5 +467,21 @@ describe("workStartMinute", () => {
 		expect(
 			workStartMinute(table(["weekend", "workday"], "workday"), TZ),
 		).toBeNull();
+	});
+});
+
+describe("workStartMinute sample (F2 row 16)", () => {
+	test("the sample bounds how many recent work days the median takes", () => {
+		const t = table(["workday", "workday", "workday"], "workday");
+		[10, 20, 30].forEach((b, i) => {
+			const d = t.days[i] as RecordedDay;
+			(d.units as Float64Array)[b] = 1;
+			d.total = 1;
+		});
+		const at = (b: number) => localParts(b * BUCKET_MS, "UTC").minuteOfDay;
+		expect(workStartMinute(t, "UTC")).toBe(at(20));
+		expect(workStartMinute(t, "UTC", 5, WORK_START_RECENT_DAYS)).toBe(at(20));
+		expect(workStartMinute(t, "UTC", 5, 1)).toBe(at(30));
+		expect(workStartMinute(t, "UTC", 5, 2)).toBe(at(25));
 	});
 });

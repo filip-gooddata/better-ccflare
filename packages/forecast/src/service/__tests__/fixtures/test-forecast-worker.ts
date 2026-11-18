@@ -1,3 +1,4 @@
+import { presentDemand } from "../../../engine/learn";
 import type {
 	ForecastWorkerReply,
 	ForecastWorkerRequest,
@@ -6,7 +7,8 @@ import type {
 /**
  * A stand-in for forecast-worker.ts. The refit's timeZone picks the behaviour:
  * "busy:<ms>" spins the CPU for <ms> then fits, "throw" fails the job,
- * "hang" spins forever, anything else fits at once.
+ * "hang" spins forever, anything else fits at once. The
+ * learned demand echoes the request's settings as present values.
  */
 declare const self: Worker;
 
@@ -30,18 +32,26 @@ self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
 			id,
 			ok: true,
 			result: {
-				fittedAt: payload.now,
-				days: payload.units.length,
-				weeks: payload.censored.length,
-				candidates: 101,
-				floor: 10,
-				cellsEstablished: 0,
-				cellsTotal: 0,
-				belowFloor: [],
-				baseline: { workday: [], monday: [], weekend: [] },
-				bands: [],
-				selected: [],
-				dayTypeComparison: [],
+				pace: {
+					fittedAt: payload.now,
+					days: payload.units.length,
+					weeks: payload.censored.length,
+					candidates: 101,
+					floor: 10,
+					cellsEstablished: 0,
+					cellsTotal: 0,
+					belowFloor: [],
+					baseline: { workday: [], monday: [], weekend: [] },
+					bands: [],
+					selected: [],
+					dayTypeComparison: [],
+				},
+				learned: presentDemand({
+					historyLookbackDays: payload.historyLookbackDays,
+					historyHalfLifeDays: payload.historyHalfLifeDays,
+					workStartSharePct: payload.workStartSharePct,
+					timeShiftMin: payload.timeShiftMin,
+				}),
 			},
 		};
 	} catch (error) {

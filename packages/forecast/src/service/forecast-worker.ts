@@ -1,4 +1,4 @@
-import { fitPaceModel } from "../engine/pace";
+import { learnDemand, makePartitionFitter } from "../engine/learn";
 import type {
 	ForecastJobName,
 	ForecastWorkerJobs,
@@ -18,8 +18,12 @@ const handlers: {
 		payload: ForecastWorkerJobs[J]["payload"],
 	) => ForecastWorkerJobs[J]["result"];
 } = {
-	refit: ({ start, units, censored, timeZone, now }) =>
-		fitPaceModel({ start, units, censored, timeZone }, now),
+	refit: ({ start, units, censored, timeZone, now, ...settings }) => {
+		const series = { start, units, censored, timeZone };
+		const fitWithPartition = makePartitionFitter(series, now);
+		const learned = learnDemand({ ...settings, series, now, fitWithPartition });
+		return { pace: fitWithPartition(learned.partition), learned };
+	},
 };
 
 self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {

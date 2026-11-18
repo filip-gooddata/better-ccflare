@@ -6,6 +6,7 @@ import { resolveForecastSettings } from "@better-ccflare/config";
 import { DatabaseOperations } from "@better-ccflare/database";
 import specFull from "../../contract/__tests__/fixtures/spec-example-full.json";
 import { validateForecastResponse } from "../../contract/validate";
+import { type LearnedDemand, presentDemand } from "../../engine/learn";
 import type {
 	PaceFitState,
 	PaceSeries,
@@ -60,10 +61,12 @@ import type {
 	SessionTrackerLike,
 } from "../../types";
 import { bucketStart } from "../../units";
+import { formatF2LearnLine } from "../f2-learn-log";
 import {
 	PACE_REFIT_TIMEOUT_MS,
 	type PaceRefitOutcome,
 	type PaceRefitRunner,
+	type RefitDemandSettings,
 } from "../pace-refit-runner";
 import {
 	createForecastService,
@@ -2263,11 +2266,27 @@ function fitState(fittedAt: EpochMs, over: Partial<PaceFitState> = {}) {
 	return state;
 }
 
+/** A learned demand that differs from the present one, so tests can tell them apart. */
+function learnedAt(over: Partial<LearnedDemand> = {}): LearnedDemand {
+	return {
+		...presentDemand({
+			historyLookbackDays: 84,
+			historyHalfLifeDays: 14,
+			workStartSharePct: 5,
+			timeShiftMin: 30,
+		}),
+		poolTau: 4,
+		ms: 7,
+		...over,
+	};
+}
+
 /** Each run waits until the test finishes it. */
 class FakeRefitRunner implements PaceRefitRunner {
 	calls: {
 		series: PaceSeries;
 		now: EpochMs;
+		demand: RefitDemandSettings;
 		timeoutMs: number;
 		signal?: AbortSignal;
 	}[] = [];
@@ -2275,9 +2294,10 @@ class FakeRefitRunner implements PaceRefitRunner {
 	run(
 		series: PaceSeries,
 		now: EpochMs,
+		demand: RefitDemandSettings,
 		opts: { timeoutMs: number; signal?: AbortSignal },
 	): Promise<PaceRefitOutcome> {
-		this.calls.push({ series, now, ...opts });
+		this.calls.push({ series, now, demand, ...opts });
 		return new Promise((resolve) => {
 			this.waiting.push(resolve);
 			opts.signal?.addEventListener("abort", () =>
@@ -2317,7 +2337,9 @@ function refitHarness(
 	});
 	const refitLines = () =>
 		h.infos.filter((m) => m.startsWith("forecast e4 refit"));
-	return { ...h, runner, seriesInputs, refitLines };
+	const learnLines = () =>
+		h.infos.filter((m) => m.startsWith("forecast f2 learn"));
+	return { ...h, runner, seriesInputs, refitLines, learnLines };
 }
 
 const paceOff = {
@@ -2338,7 +2360,12 @@ describe("forecast service: E4 refit in the worker", () => {
 		expect(h.runner.calls[0]?.timeoutMs).toBe(PACE_REFIT_TIMEOUT_MS);
 
 		const s1 = fitState(T0);
-		await h.runner.finish({ status: "ok", state: s1, ms: 4000 });
+		await h.runner.finish({
+			status: "ok",
+			state: s1,
+			learned: learnedAt(),
+			ms: 4000,
+		});
 		await h.time.advance(FORECAST_MIN_SPACING_MS);
 		await h.service.runOnce();
 		expect(h.engine.inputs[1]?.demandModel).toBe(s1);
@@ -2363,13 +2390,23 @@ describe("forecast service: E4 refit in the worker", () => {
 		const h = refitHarness();
 		await h.service.runOnce();
 		await flush();
-		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: learnedAt(),
+			ms: 1,
+		});
 		await h.time.advance(59 * MIN);
 		expect(h.runner.calls).toHaveLength(1);
 		await h.time.advance(MIN);
 		expect(h.runner.calls).toHaveLength(2);
 		expect(h.runner.calls[1]?.now).toBe(T0 + 60 * MIN);
-		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: learnedAt(),
+			ms: 1,
+		});
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls).toHaveLength(3);
 		expect(h.runner.calls[2]?.now).toBe(T0 + 120 * MIN);
@@ -2385,7 +2422,12 @@ describe("forecast service: E4 refit in the worker", () => {
 		await flush();
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls).toHaveLength(1);
-		await h.runner.finish({ status: "ok", state: fitState(T0), ms: 1 });
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: learnedAt(),
+			ms: 1,
+		});
 		await h.time.advance(60 * MIN);
 		expect(h.runner.calls).toHaveLength(2);
 	});
@@ -2395,7 +2437,12 @@ describe("forecast service: E4 refit in the worker", () => {
 		await h.service.runOnce();
 		await flush();
 		const s1 = fitState(T0);
-		await h.runner.finish({ status: "ok", state: s1, ms: 1 });
+		await h.runner.finish({
+			status: "ok",
+			state: s1,
+			learned: learnedAt(),
+			ms: 1,
+		});
 		await h.time.advance(60 * MIN);
 		await h.runner.finish({ status: "timeout", ms: PACE_REFIT_TIMEOUT_MS });
 		await h.service.runOnce();
@@ -2458,6 +2505,128 @@ describe("forecast service: E4 refit in the worker", () => {
 		await h.time.advance(120 * MIN);
 		expect(h.runner.calls).toHaveLength(1);
 		expect(h.refitLines()).toHaveLength(0);
+	});
+});
+
+describe("forecast service: F2 learned demand from the refit job", () => {
+	const demandOf = (st: ForecastSettings): RefitDemandSettings => ({
+		workDays: PACE.workDays,
+		historyLookbackDays: st.historyLookbackDays,
+		historyHalfLifeDays: st.historyHalfLifeDays,
+		workStartSharePct: st.workStartSharePct,
+		timeShiftMin: st.timeShiftMin,
+	});
+	const presentOf = (st: ForecastSettings) => presentDemand(st);
+
+	it("sends the demand settings with the refit request", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		expect(h.runner.calls[0]?.demand).toEqual(demandOf(h.settings.current));
+	});
+
+	it("serves presentDemand(settings) before the first successful refit, then the learned demand", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		expect(h.engine.inputs[0]?.learnedDemand).toEqual(
+			presentOf(h.settings.current),
+		);
+		const l1 = learnedAt();
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l1,
+			ms: 4000,
+		});
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs[1]?.learnedDemand).toBe(l1);
+	});
+
+	it("a successful refit logs the e4 line, then the f2 line with the job's wall time", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const l1 = learnedAt();
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l1,
+			ms: 4000,
+		});
+		const e4 = h.infos.findIndex((m) => m.startsWith("forecast e4 refit"));
+		expect(e4).toBeGreaterThanOrEqual(0);
+		expect(h.infos[e4 + 1]).toBe(formatF2LearnLine(l1, 4000));
+		expect(h.learnLines()).toHaveLength(1);
+	});
+
+	it("a failed refit keeps the last good learned demand and logs no f2 line", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const l1 = learnedAt();
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l1,
+			ms: 1,
+		});
+		await h.time.advance(60 * MIN);
+		await h.runner.finish({ status: "timeout", ms: PACE_REFIT_TIMEOUT_MS });
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l1);
+		await h.time.advance(60 * MIN);
+		await h.runner.finish({ status: "error", reason: "fit-error", ms: 2 });
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l1);
+		expect(h.learnLines()).toHaveLength(1);
+		expect(h.refitLines()).toHaveLength(3);
+	});
+
+	it("after a demand setting changes, serves presentDemand(new settings) until the next successful refit", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const l1 = learnedAt();
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l1,
+			ms: 1,
+		});
+		h.settings.current = { ...h.settings.current, historyHalfLifeDays: 7 };
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toEqual(
+			presentOf(h.settings.current),
+		);
+		// the pace state is not affected by the demand settings
+		expect(h.engine.inputs.at(-1)?.demandModel).not.toBeNull();
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls[1]?.demand).toEqual(demandOf(h.settings.current));
+		const l2 = learnedAt({ halfLifeDays: 7 });
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l2,
+			ms: 1,
+		});
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l2);
+		// changing back to the settings it was learned under serves it again; another field change does not
+		const shift = h.settings.current.timeShiftMin;
+		h.settings.current = { ...h.settings.current, timeShiftMin: shift + 30 };
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toEqual(
+			presentOf(h.settings.current),
+		);
+		h.settings.current = { ...h.settings.current, timeShiftMin: shift };
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l2);
 	});
 });
 

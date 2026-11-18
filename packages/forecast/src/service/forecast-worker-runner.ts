@@ -1,3 +1,4 @@
+import type { LearnedDemand } from "../engine/learn/types";
 import type { PaceFitState } from "../engine/pace/types";
 import type { EpochMs } from "../types";
 
@@ -7,7 +8,11 @@ import type { EpochMs } from "../types";
  * are plain data. A new job adds an entry here and a handler in forecast-worker.ts.
  */
 export interface ForecastWorkerJobs {
-	/** E4 refit: the pooled series (buffers transferred) and the instant it is fitted at. */
+	/**
+	 * E4 refit and the F2 demand learners in one job: the pooled series (buffers
+	 * transferred), the instant it is fitted at, and the settings the learners
+	 * start from. `pace` is the fit of the served partition.
+	 */
 	refit: {
 		payload: {
 			start: EpochMs;
@@ -15,8 +20,13 @@ export interface ForecastWorkerJobs {
 			censored: Uint8Array;
 			timeZone: string;
 			now: EpochMs;
+			workDays: number;
+			historyLookbackDays: number;
+			historyHalfLifeDays: number;
+			workStartSharePct: number;
+			timeShiftMin: number;
 		};
-		result: PaceFitState;
+		result: { pace: PaceFitState; learned: LearnedDemand };
 	};
 }
 

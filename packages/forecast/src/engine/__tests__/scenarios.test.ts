@@ -16,6 +16,7 @@ import type {
 import { BUCKET_MS } from "../../types";
 import { buildDayTable, poolFor } from "../days";
 import { computeHorizon } from "../horizon";
+import { type LearnedDemand, presentDemand } from "../learn";
 import type { DayTable, RecordedDay } from "../model";
 import { type PaceNow, paceMultiplierAt, plainPace } from "../pace";
 import {
@@ -888,5 +889,105 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 				4,
 			);
 		}
+	});
+});
+
+describe("buildScenarios served demand (F2)", () => {
+	function setup(over: Partial<ForecastSettings> = {}) {
+		const input = makeInput(NOW, { simulatedDays: 30, ...over });
+		const table = buildDayTable(input);
+		const horizon = computeHorizon(NOW, input.accounts, TZ);
+		return { input, table, horizon };
+	}
+	const present = (s: ForecastSettings): LearnedDemand => presentDemand(s);
+
+	test("learnedDemand = presentDemand(settings) is the same output as no learnedDemand", async () => {
+		const { input, table, horizon } = setup();
+		const a = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const b = await buildScenarios(
+			{ ...input, learnedDemand: present(input.settings) },
+			table,
+			horizon,
+			{},
+			PLAIN,
+		);
+		expect(b).toEqual(a);
+	});
+
+	test("row 20: the served jitter bound replaces timeShiftMin", async () => {
+		const { input, table, horizon } = setup({ timeShiftMin: 0 });
+		const zero = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const shifted = setup({ timeShiftMin: 30 });
+		const served = await buildScenarios(
+			{
+				...shifted.input,
+				learnedDemand: {
+					...present(shifted.input.settings),
+					jitterMin: 0,
+				},
+			},
+			shifted.table,
+			shifted.horizon,
+			{},
+			PLAIN,
+		);
+		expect(served).toEqual(zero);
+	});
+
+	test("row 18: bandwidth multiplied by 2^(k/2)", async () => {
+		const { input, table, horizon } = setup();
+		const a = await buildScenarios(input, table, horizon, {}, PLAIN);
+		const b = await buildScenarios(
+			{
+				...input,
+				learnedDemand: { ...present(input.settings), bandwidthK: 2 },
+			},
+			table,
+			horizon,
+			{},
+			PLAIN,
+		);
+		const keys = Object.keys(a.diagnostics.bandwidths);
+		expect(keys.length).toBeGreaterThan(0);
+		for (const k of keys)
+			expect(b.diagnostics.bandwidths[k]).toBeCloseTo(
+				2 * (a.diagnostics.bandwidths[k] as number),
+				12,
+			);
+	});
+
+	test("row 2: numeric tau draws w·own + (1-w)·all; tau 0 keeps own, Infinity pools all", async () => {
+		const { input, horizon } = setup();
+		const weekdaysOnly = {
+			...input,
+			history: input.history.filter(
+				(b) => localParts(b.start, TZ).isoWeekday <= 5,
+			),
+		};
+		const t = buildDayTable(weekdaysOnly);
+		const satStart = addLocalDays(localDayStart(NOW, TZ), 2, TZ);
+		expect(localDayKey(satStart, TZ)).toBe("2026-11-14");
+		const satSum = async (poolTau: LearnedDemand["poolTau"]) => {
+			const sc = await buildScenarios(
+				{
+					...weekdaysOnly,
+					learnedDemand: { ...present(input.settings), poolTau },
+				},
+				t,
+				horizon,
+				{},
+				PLAIN,
+			);
+			const from = (satStart - sc.start) / BUCKET_MS;
+			const to = (addLocalDays(satStart, 1, TZ) - sc.start) / BUCKET_MS;
+			let sum = 0;
+			for (const u of sc.units)
+				for (let j = from; j < to; j++) sum += u[j] as number;
+			return sum;
+		};
+		expect(await satSum("hard3")).toBe(0);
+		expect(await satSum(0)).toBe(0);
+		expect(await satSum(Number.POSITIVE_INFINITY)).toBeGreaterThan(0);
+		expect(await satSum(4)).toBeGreaterThan(0);
 	});
 });
