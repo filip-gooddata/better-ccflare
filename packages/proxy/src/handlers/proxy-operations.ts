@@ -2099,8 +2099,11 @@ export async function proxyWithAccount(
 					}),
 					recoveredBodyText,
 				);
+				if (fullBeforeSend(gateModel)) {
+					cancelDiscardedResponseBody(rawResponse);
+					return null;
+				}
 				cancelDiscardedResponseBody(rawResponse);
-				if (fullBeforeSend(gateModel)) return null;
 				rawResponse = await forwardUpstream(outgoing.request);
 			}
 		}
@@ -2157,13 +2160,14 @@ export async function proxyWithAccount(
 				}
 
 				// Make the retry request (or unwrap a synthetic provider response)
-				cancelDiscardedResponseBody(rawResponse);
 				if (
 					!isSyntheticProviderResponse(retryTransformedRequest) &&
 					fullBeforeSend(gateModel)
 				) {
+					cancelDiscardedResponseBody(rawResponse);
 					return null;
 				}
+				cancelDiscardedResponseBody(rawResponse);
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
 					: await forwardUpstream(retryTransformedRequest);
@@ -2208,13 +2212,14 @@ export async function proxyWithAccount(
 					// A URL-based rebuild drops the signal — carry it over.
 					signal: req.signal,
 				});
-				cancelDiscardedResponseBody(rawResponse);
 				if (
 					!isSyntheticProviderResponse(retryRequest) &&
 					fullBeforeSend(gateModel)
 				) {
+					cancelDiscardedResponseBody(rawResponse);
 					return null;
 				}
+				cancelDiscardedResponseBody(rawResponse);
 				rawResponse = isSyntheticProviderResponse(retryRequest)
 					? materializeSyntheticResponse(retryRequest)
 					: await forwardUpstream(retryRequest);

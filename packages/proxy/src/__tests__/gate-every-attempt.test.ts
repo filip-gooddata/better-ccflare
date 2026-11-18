@@ -19,10 +19,13 @@ import { handleProxy } from "../proxy";
 import * as usageCollectorModule from "../usage-collector";
 
 /**
- * Every path that could reach a FULL account (five-hour or weekly at 100 %
- * with a future reset and no extra usage, or the request model family full)
- * answers with the local 429 instead of forwarding: forced id, auto-refresh
- * probe, combo slot, sticky session, pre-warm.
+ * The gate right before every upstream send: an account that is full by then
+ * (five-hour, weekly, or the outgoing model's family at 100 %) is not sent to,
+ * whether it filled up after selection or a fallback model's family is full;
+ * when nothing else serves, the local 429 answers. A stream already being
+ * served is never cut. A combo whose every slot is full answers with the local
+ * 429 even with session fallback disabled. Helpers copied from
+ * full-account-local-429.test.ts.
  */
 
 const HOUR = 3_600_000;
