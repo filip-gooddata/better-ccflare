@@ -25,6 +25,7 @@ import {
 	isProviderExcludedBy as isProviderExcluded,
 	requestExcludedProviders,
 } from "./account-selector";
+import { holdsOverageBench } from "./header-mark-out";
 import {
 	buildLocalLimitResponse,
 	getCachedLimitRefusal,
@@ -330,8 +331,10 @@ export async function selectAllLimitedTarget(
 
 /**
  * The local 429 answer for `account` when it is at a full limit for this
- * request: its five-hour or weekly window, or the request model's family.
- * A cooldown alone does not count. Null when no full limit is in force.
+ * request: its five-hour or weekly window, the request model's family, or an
+ * `overage_in_use` bench still ahead of its reset (the account was served
+ * from extra usage, so its limits are spent). Any other cooldown alone does
+ * not count. Null when no full limit is in force.
  */
 export function fullLimitAnswer(
 	account: Account,
@@ -340,13 +343,14 @@ export function fullLimitAnswer(
 	now: number = Date.now(),
 ): LocalLimitAnswer | null {
 	const family = model ? getModelFamily(model) : null;
+	const overageBench = holdsOverageBench(account, now);
 	const limits = limitsInForce(
 		account,
 		model,
 		family,
 		isCapacityRoutingEnabled(ctx),
 		now,
-	).filter((limit) => limit.kind !== "cooldown");
+	).filter((limit) => overageBench || limit.kind !== "cooldown");
 	if (limits.length === 0) return null;
 	return localLimitAnswerFor({ account, limits });
 }
