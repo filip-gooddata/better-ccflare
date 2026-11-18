@@ -1,11 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { measureYield } from "./fixtures-sim";
+import { measureYield, threadCpuMs } from "./fixtures-sim";
 
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+/** Busy-loop until this thread has used `ms` of CPU time, however long that takes. */
 function spin(ms: number): void {
-	const end = performance.now() + ms;
-	while (performance.now() < end) {}
+	const end = threadCpuMs() + ms;
+	while (threadCpuMs() < end) {}
 }
 
 describe("measureYield", () => {

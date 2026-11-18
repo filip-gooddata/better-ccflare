@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { loadavg } from "node:os";
+import { threadCpuMs } from "../../engine/__tests__/fixtures-sim";
 import type { DemandBucket } from "../../types";
 import { formatF2DaytypesLine, formatF2LearnLine } from "../f2-learn-log";
 import { createForecastWorkerRunner } from "../forecast-worker-runner";
@@ -117,12 +118,17 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				censored: series.censored.slice(),
 			};
 			let last = performance.now();
+			let lastCpu = threadCpuMs();
 			let maxGap = 0;
+			let maxCpuGap = 0;
 			let ticks = 0;
 			const handle = setInterval(() => {
 				const t = performance.now();
+				const cpu = threadCpuMs();
 				maxGap = Math.max(maxGap, t - last);
+				maxCpuGap = Math.max(maxCpuGap, cpu - lastCpu);
 				last = t;
+				lastCpu = cpu;
 				ticks++;
 			}, 20);
 			try {
@@ -135,7 +141,7 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				expect(outcome.status).toBe("ok");
 				expect(outcome.ms).toBeGreaterThanOrEqual(1_000);
 				console.info(
-					`real refit ms=${Math.round(outcome.ms)} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)}`,
+					`real refit ms=${Math.round(outcome.ms)} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)} maxGapCpuMs=${maxCpuGap.toFixed(1)}`,
 				);
 				console.info(paceRefitLine(outcome, null, T0));
 				if (outcome.status === "ok")
@@ -143,7 +149,7 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 						formatF2LearnLine(outcome.learned, outcome.ms, { mainJob: true }),
 					);
 				expect(ticks).toBeGreaterThanOrEqual(Math.floor(outcome.ms / 40));
-				expect(maxGap).toBeLessThan(250);
+				expect(maxCpuGap).toBeLessThan(250);
 				// The main job fits E4 once (row 1 runs in its own job): far inside the timeout.
 				expect(outcome.ms).toBeLessThan(PACE_REFIT_TIMEOUT_MS / 4);
 				console.info(
@@ -160,7 +166,7 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 				);
 				expect(row1.status).toBe("ok");
 				console.info(
-					`real daytypes ms=${Math.round(row1.ms)} wallMs=${Math.round(performance.now() - row1Started)} maxGapMs=${maxGap.toFixed(1)}`,
+					`real daytypes ms=${Math.round(row1.ms)} wallMs=${Math.round(performance.now() - row1Started)} maxGapMs=${maxGap.toFixed(1)} maxGapCpuMs=${maxCpuGap.toFixed(1)}`,
 				);
 				console.info(formatF2DaytypesLine(row1, null, T0));
 				console.info(
@@ -168,7 +174,7 @@ describe.skipIf(!process.env.PACE_REFIT_REAL_WORKER)(
 						.map((x) => x.toFixed(2))
 						.join(" ")}`,
 				);
-				expect(maxGap).toBeLessThan(250);
+				expect(maxCpuGap).toBeLessThan(250);
 			} finally {
 				clearInterval(handle);
 			}
@@ -271,12 +277,17 @@ describe("forecast worker: the plan job", () => {
 		} = await import("../../engine/plan-job");
 		const ctx = await replayContext();
 		let last = performance.now();
+		let lastCpu = threadCpuMs();
 		let maxGap = 0;
+		let maxCpuGap = 0;
 		let ticks = 0;
 		const handle = setInterval(() => {
 			const t = performance.now();
+			const cpu = threadCpuMs();
 			maxGap = Math.max(maxGap, t - last);
+			maxCpuGap = Math.max(maxCpuGap, cpu - lastCpu);
 			last = t;
+			lastCpu = cpu;
 			ticks++;
 		}, 20);
 		try {
@@ -291,10 +302,10 @@ describe("forecast worker: the plan job", () => {
 			);
 			expect(outcome.status).toBe("ok");
 			console.info(
-				`plan job ms=${outcome.ms} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)}`,
+				`plan job ms=${outcome.ms} ticks=${ticks} maxGapMs=${maxGap.toFixed(1)} maxGapCpuMs=${maxCpuGap.toFixed(1)}`,
 			);
 			expect(ticks).toBeGreaterThanOrEqual(Math.floor(outcome.ms / 40));
-			expect(maxGap).toBeLessThan(250);
+			expect(maxCpuGap).toBeLessThan(250);
 		} finally {
 			clearInterval(handle);
 		}

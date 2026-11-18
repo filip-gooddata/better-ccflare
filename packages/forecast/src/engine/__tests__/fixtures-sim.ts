@@ -205,7 +205,7 @@ export function indexAt(times: EpochMs[], at: EpochMs): number {
 }
 
 /** CPU time (user + system) this thread has used, in milliseconds. */
-function threadCpuMs(): number {
+export function threadCpuMs(): number {
 	const { user, system } = process.threadCpuUsage();
 	return (user + system) / 1000;
 }

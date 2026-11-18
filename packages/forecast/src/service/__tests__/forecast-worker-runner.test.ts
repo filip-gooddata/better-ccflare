@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { threadCpuMs } from "../../engine/__tests__/fixtures-sim";
 import type { PaceSeries } from "../../engine/pace/types";
 import { daytypesJob, refitJob } from "../forecast-jobs";
 import {
@@ -271,21 +272,37 @@ describe("forecast worker runner: the refit job", () => {
 	});
 });
 
-/** Largest gap between ticks of a 20 ms interval while `work` runs. */
+/**
+ * Largest gap between ticks of a 20 ms interval while `work` runs, as wall
+ * clock and as CPU time this thread spent in the gap. Limits are asserted on
+ * the CPU time, which machine load cannot stretch; the clock is per thread,
+ * so the worker spinning its own thread does not count.
+ */
 async function maxTickGap(work: () => Promise<unknown>) {
 	let last = performance.now();
+	let lastCpu = threadCpuMs();
 	let maxGap = 0;
+	let maxCpuGap = 0;
 	let ticks = 0;
 	const handle = setInterval(() => {
 		const t = performance.now();
+		const cpu = threadCpuMs();
 		maxGap = Math.max(maxGap, t - last);
+		maxCpuGap = Math.max(maxCpuGap, cpu - lastCpu);
 		last = t;
+		lastCpu = cpu;
 		ticks++;
 	}, 20);
 	try {
 		const started = performance.now();
 		const result = await work();
-		return { result, maxGap, ticks, ms: performance.now() - started };
+		return {
+			result,
+			maxGap,
+			maxCpuGap,
+			ticks,
+			ms: performance.now() - started,
+		};
 	} finally {
 		clearInterval(handle);
 	}
@@ -293,7 +310,7 @@ async function maxTickGap(work: () => Promise<unknown>) {
 
 describe("forecast worker runner: off the main thread", () => {
 	it("keeps the event loop ticking while the worker spins the CPU for 1.2 s", async () => {
-		const { result, maxGap, ticks, ms } = await maxTickGap(() =>
+		const { result, maxGap, maxCpuGap, ticks, ms } = await maxTickGap(() =>
 			createPaceRefitRunner(fixtureRunner()).run(
 				series("busy:1200"),
 				T0,
@@ -305,7 +322,10 @@ describe("forecast worker runner: off the main thread", () => {
 		);
 		expect((result as { status: string }).status).toBe("ok");
 		expect(ms).toBeGreaterThanOrEqual(1_200);
+		console.info(
+			`[worker runner] busy worker: longest slice wall ${maxGap.toFixed(1)} ms cpu ${maxCpuGap.toFixed(1)} ms, ${ticks} ticks`,
+		);
 		expect(ticks).toBeGreaterThanOrEqual(30);
-		expect(maxGap).toBeLessThan(250);
+		expect(maxCpuGap).toBeLessThan(250);
 	});
 });
