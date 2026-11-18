@@ -134,7 +134,7 @@ function accountOf(input: unknown, init?: RequestInit): string {
 }
 
 /** Copied from all-limited-forward.test.ts installUpstream. */
-function installUpstream(handler: (account: string) => Response) {
+function _installUpstream(handler: (account: string) => Response) {
 	const calls: string[] = [];
 	globalThis.fetch = mock(async (input: unknown, init?: RequestInit) => {
 		const account = accountOf(input, init);
@@ -300,7 +300,7 @@ afterEach(() => {
 	mock.restore();
 });
 
-function comboOf(accountIds: string[]): ComboWithSlots {
+function _comboOf(accountIds: string[]): ComboWithSlots {
 	return {
 		id: "combo-1",
 		name: "Test Combo",
@@ -640,7 +640,10 @@ describe("every retry site is gated", () => {
 	});
 
 	it("codex continuation retry: not sent once the account is full", async () => {
-		spyOn(providersModule, "recoverCodexMessagesContinuation").mockImplementation(
+		spyOn(
+			providersModule,
+			"recoverCodexMessagesContinuation",
+		).mockImplementation(
 			(async (_provider: unknown, _response: Response, request: Request) =>
 				request) as never,
 		);
