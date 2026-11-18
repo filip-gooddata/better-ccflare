@@ -422,6 +422,10 @@ export class AccountRepository extends BaseRepository<Account> {
 			// guard but covers the cross-request DB race that guard can't see. A
 			// plain WHERE predicate (not GREATEST/MAX) so the same SQL runs
 			// unchanged on both SQLite and PostgreSQL.
+			// An overage bench already keeps the later deadline in its
+			// assignment and must still label a longer cooldown, so it skips
+			// the expiry guard.
+			const overage = reason === "overage_in_use";
 			const changes = await this.runWithChanges(
 				`UPDATE accounts
            SET ${cooldown.sql},
@@ -429,13 +433,14 @@ export class AccountRepository extends BaseRepository<Account> {
                rate_limit_status       = NULL,
                rate_limit_reset        = NULL,
                rate_limit_reset_at     = NULL
-         WHERE id = ?
-           AND (rate_limited_until IS NULL OR rate_limited_until <= ?${
-							// An overage bench already keeps the later deadline in its
-							// assignment; it still has to label a longer cooldown.
-							reason === "overage_in_use" ? " OR 1 = 1" : ""
-						})`,
-				[...cooldown.params, Date.now(), accountId, until],
+         WHERE id = ?${
+						overage
+							? ""
+							: "\n           AND (rate_limited_until IS NULL OR rate_limited_until <= ?)"
+					}`,
+				overage
+					? [...cooldown.params, Date.now(), accountId]
+					: [...cooldown.params, Date.now(), accountId, until],
 			);
 			applied = changes > 0;
 			if (!applied) {
