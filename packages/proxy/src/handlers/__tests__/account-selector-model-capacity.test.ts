@@ -575,7 +575,7 @@ describe("selectAccountsForRequest — extra usage (integration)", () => {
 		} as never;
 	}
 
-	it("keeps an account routable when the extra-usage switch is on and overage is available (extra_usage.is_enabled=true)", async () => {
+	it("excludes a full family even with the setting on and overage available (extra_usage.is_enabled=true)", async () => {
 		setUseExtraUsage(true);
 		const acc = makeAccount({ id: "acc-overage-available" });
 		usageCache.set(
@@ -587,7 +587,7 @@ describe("selectAccountsForRequest — extra usage (integration)", () => {
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result.map((a) => a.id)).toEqual(["acc-overage-available"]);
+		expect(result).toHaveLength(0);
 	});
 
 	it("excludes an account whose overage is reported enabled while the extra-usage switch is off", async () => {

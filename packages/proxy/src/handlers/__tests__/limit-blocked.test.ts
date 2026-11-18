@@ -285,7 +285,7 @@ describe("collectLimitBlockedAccounts", () => {
 		expect(collect([a], {}, makeMeta(), NOW + 6 * HOUR)).toEqual([]);
 	});
 
-	it("leaves out an account that extra usage keeps usable", () => {
+	it("lists a full five-hour window even with the setting on and extra usage left", () => {
 		setUseExtraUsage(true);
 		const a = makeAccount("a");
 		usageCache.set(
@@ -295,10 +295,27 @@ describe("collectLimitBlockedAccounts", () => {
 				spend: { enabled: true, percent: 20 },
 			}),
 		);
-		expect(collect([a])).toEqual([]);
+		expect(limitsOf(collect([a]), "a")).toEqual([
+			{ kind: "five_hour", resetAt: NOW + HOUR },
+		]);
 	});
 
-	it("still lists the account when extra usage exists but the switch is off", () => {
+	it("lists a full weekly window even with the setting on and extra usage left", () => {
+		setUseExtraUsage(true);
+		const a = makeAccount("a");
+		usageCache.set(
+			"a",
+			usage({
+				sevenDay: win(100, NOW + 3 * 24 * HOUR),
+				spend: { enabled: true, percent: 20 },
+			}),
+		);
+		expect(limitsOf(collect([a]), "a")).toEqual([
+			{ kind: "weekly", resetAt: NOW + 3 * 24 * HOUR },
+		]);
+	});
+
+	it("lists the account when extra usage exists and the setting is off", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -378,7 +395,7 @@ describe("collectLimitBlockedAccounts", () => {
 		]);
 	});
 
-	it("keeps the family with the extra-usage switch on and extra usage left", () => {
+	it("lists the full family even with the setting on and extra usage left", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -388,7 +405,9 @@ describe("collectLimitBlockedAccounts", () => {
 			}),
 		);
 		setUseExtraUsage(true);
-		expect(collect([a], { capacityRouting: true })).toEqual([]);
+		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
+		]);
 	});
 
 	it("gives a reactive family mark an unknown reset", () => {
@@ -489,16 +508,9 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 
 	it("does not fire while any account is selectable", async () => {
 		const pick = recordingPick();
-		setUseExtraUsage(true);
 		const a = makeAccount("a");
 		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
-		usageCache.set(
-			"a",
-			usage({
-				fiveHour: win(100, NOW + HOUR),
-				spend: { enabled: true, percent: 10 },
-			}),
-		);
+		usageCache.set("a", usage({ fiveHour: win(50, NOW + HOUR) }));
 		const ctx = makeCtx({
 			accounts: [a, b],
 			strategy: availabilityStrategy(pick.fn),

@@ -1,8 +1,5 @@
-import { getModelFamily, isUseExtraUsageEnabled } from "@better-ccflare/core";
-import {
-	type AnyUsageData,
-	hasExtraUsageCapacity,
-} from "@better-ccflare/providers";
+import { getModelFamily } from "@better-ccflare/core";
+import type { AnyUsageData } from "@better-ccflare/providers";
 import { collectWindows } from "./usage-throttling";
 
 export interface ModelExhaustionResult {
@@ -21,6 +18,9 @@ export type OverageStatus = "available" | "unavailable" | "unknown";
  * resolves to an actual boolean, the status is "unknown" — not assumed
  * disabled — since a missing/contradictory signal says nothing about the
  * account's real billing state.
+ *
+ * For logging and display only: no routing gate reads it. "available"
+ * overage never makes a full limit usable (see isAccountExhaustedForModel).
  */
 export function resolveOverageStatus(
 	usageData: AnyUsageData | null | undefined,
@@ -77,13 +77,11 @@ function countRawScopedFamilyRows(
  * given model's family is fully exhausted: EVERY weekly_scoped row for that
  * family is at percent >= 100 with a reset still in the future (a single
  * non-exhausted row — e.g. a distinct surface — means the family still has
- * usable capacity), AND extra usage may not carry the request past the cap.
- * Paid overage is not capacity: it keeps the family available only when the
- * process-wide "use extra usage" switch is on AND the account has extra usage
- * left (hasExtraUsageCapacity: enabled and under its spend limit) — the same
- * rule the account-level five-hour/weekly gating uses. An overage merely
- * reported as enabled, with the switch off or the spend limit reached, does
- * not keep the family available.
+ * usable capacity). Paid overage is never capacity: a full family is
+ * exhausted whatever the overage, extra-usage or spend signals and the
+ * (ignored) "use extra usage" setting say — the same rule the account-level
+ * five-hour/weekly gating uses. resolveOverageStatus reads those signals for
+ * logging only.
  *
  * Fails open (returns {exhausted:false}) whenever the family can't be
  * confidently attributed: unknown request-model family, a scoped row whose
@@ -118,13 +116,6 @@ export function isAccountExhaustedForModel(
 		(window) => window.utilization >= 100 && window.resetAtMs > now,
 	);
 	if (exhaustedRows.length !== familyRows.length) {
-		return { exhausted: false, resetAt: null };
-	}
-
-	if (
-		isUseExtraUsageEnabled() &&
-		hasExtraUsageCapacity(usageData, "anthropic")
-	) {
 		return { exhausted: false, resetAt: null };
 	}
 

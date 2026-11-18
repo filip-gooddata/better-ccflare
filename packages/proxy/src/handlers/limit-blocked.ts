@@ -1,7 +1,6 @@
 import {
 	getModelFamily,
 	isUsageExhausted,
-	isUseExtraUsageEnabled,
 	mapModelName,
 	splitModelRouting,
 } from "@better-ccflare/core";
@@ -10,7 +9,6 @@ import {
 	extractModelFamilyWindows,
 	extractWeeklyWindow,
 	getRepresentativeUsageSnapshotForProvider,
-	hasExtraUsageCapacity,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -45,15 +43,15 @@ import type { ProxyContext } from "./proxy-types";
  * Each limit mirrors the filter that removes the account today:
  * - `cooldown`: a future `rate_limited_until` (the strategies' isAccountAvailable).
  * - `five_hour` / `weekly`: the usage-cap prefilter in getOrderedAccounts,
- *   checked on BOTH windows rather than only the representative one, with the
- *   same extra-usage exception (the "use extra usage" switch AND provider
- *   capacity). A provider without those two windows falls back to the
- *   representative snapshot the prefilter uses, reported as `weekly`.
+ *   checked on BOTH windows rather than only the representative one. A full
+ *   window is always recorded: extra usage, spend and the (ignored) "use extra
+ *   usage" setting never make it usable. A provider without those two windows
+ *   falls back to the representative snapshot the prefilter uses, reported as
+ *   `weekly`.
  * - `family`: the model-family filter in selectAccountsForRequest. A standing
  *   family block counts in every mode, with the block's own end as its reset.
  *   Telemetry and the reactive 429 mark count only when capacity routing is
- *   on, with the same extra-usage exception as above
- *   (isAccountExhaustedForModel). A telemetry reset is the LATEST exhausted
+ *   on (isAccountExhaustedForModel; extra usage plays no part there either). A telemetry reset is the LATEST exhausted
  *   family row, since the account serves the family again only once every
  *   row has reset. A reactive 429 mark carries only a TTL guess, not a reset,
  *   so it counts as unknown (null) unless exhausted telemetry rows give the
@@ -105,15 +103,13 @@ function limitsInForce(
 	const provider = account.provider ?? "anthropic";
 	const usage = usageCache.get(account.id);
 	if (usage) {
-		const extraUsage =
-			isUseExtraUsageEnabled() && hasExtraUsageCapacity(usage, provider);
 		const windowLimit = (
 			kind: "five_hour" | "weekly",
 			window: StrategyUsageWindow | null,
 		): void => {
 			if (
 				window &&
-				isUsageExhausted(window.utilization, window.resetsAt, now, extraUsage)
+				isUsageExhausted(window.utilization, window.resetsAt, now)
 			) {
 				limits.push({ kind, resetAt: window.resetsAt });
 			}
@@ -128,12 +124,7 @@ function limitsInForce(
 			);
 			if (
 				snapshot &&
-				isUsageExhausted(
-					snapshot.utilization,
-					snapshot.resetMs,
-					now,
-					snapshot.extraUsageAvailable,
-				)
+				isUsageExhausted(snapshot.utilization, snapshot.resetMs, now)
 			) {
 				limits.push({ kind: "weekly", resetAt: snapshot.resetMs ?? null });
 			}

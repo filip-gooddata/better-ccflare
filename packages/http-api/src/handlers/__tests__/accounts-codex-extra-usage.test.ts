@@ -13,12 +13,11 @@ import type { AccountResponse } from "@better-ccflare/types";
 import { createAccountsListHandler } from "../accounts";
 
 /**
- * GET /api/accounts must show a Codex account the way routing treats it. With
- * "Use Extra Usage" on, a spent weekly window with credits left is served, so
- * the account reads `extra_usage`, not `usage_exhausted`, and is not shown as
- * throttled. The Codex display path normalizes usage before labelling it, and
- * that normalization must keep the credits it was handed — from the cache and
- * from a stored payload alike.
+ * GET /api/accounts must show a Codex account the way routing treats it. A
+ * spent weekly window is final: credits left, or the (ignored) "use extra
+ * usage" setting, never make it usable, so the account reads
+ * `usage_exhausted` and is shown as throttled when throttling is on — from
+ * the cache and from a stored payload alike.
  */
 
 const ACCOUNT_ID = "codex-acct";
@@ -95,22 +94,22 @@ describe("GET /api/accounts — Codex account on extra usage", () => {
 		expect(account.rateLimitStatus).toStartWith("usage_exhausted");
 	});
 
-	it("labels the same cached account extra_usage once the switch is on", async () => {
+	it("labels the same cached account usage_exhausted with the setting on", async () => {
 		cacheSpentWeeklyWithCredits();
 		setUseExtraUsage(true);
 		const account = await readAccount(configWith(false));
-		expect(account.rateLimitStatus).toStartWith("extra_usage");
+		expect(account.rateLimitStatus).toStartWith("usage_exhausted");
 	});
 
-	it("does not show the account as throttled when throttling is on and credits serve it", async () => {
+	it("shows the account as throttled when throttling is on, credits and setting notwithstanding", async () => {
 		cacheSpentWeeklyWithCredits();
 		setUseExtraUsage(true);
 		const account = await readAccount(configWith(true));
-		expect(account.usageThrottledUntil).toBeNull();
-		expect(account.usageThrottledWindows).toEqual([]);
+		expect(account.usageThrottledUntil).not.toBeNull();
+		expect(account.usageThrottledWindows).toEqual(["seven_day"]);
 	});
 
-	it("keeps credits recovered from a stored payload for the label too", async () => {
+	it("labels a stored-payload account with credits usage_exhausted too", async () => {
 		const timestamp = Date.now() - 30_000;
 		const requestId = `req-${timestamp}`;
 		await adapter.run(
@@ -143,6 +142,6 @@ describe("GET /api/accounts — Codex account on extra usage", () => {
 		setUseExtraUsage(true);
 
 		const account = await readAccount(configWith(false));
-		expect(account.rateLimitStatus).toStartWith("extra_usage");
+		expect(account.rateLimitStatus).toStartWith("usage_exhausted");
 	});
 });

@@ -1,8 +1,7 @@
 /**
- * "Use extra usage" must read the same on every operator-facing surface as it
- * does in account selection: an account serving past a spent window on extra
- * usage is routable, is not counted as usage_exhausted, and is labelled as
- * running on extra usage rather than as exhausted or OK.
+ * Every operator-facing surface reads a full window the way account selection
+ * does: final. Extra usage never makes an account routable, never takes it out
+ * of usage_exhausted, and is never shown as a label of its own.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -40,31 +39,29 @@ describe("computeRateLimitStatusDisplay — extra usage", () => {
 		usageResetMs: RESET,
 	};
 
-	it("labels a spent window served on extra usage, with the window's reset", () => {
+	it("labels a spent window usage_exhausted even if a caller claims extra usage", () => {
 		expect(
 			computeRateLimitStatusDisplay(
-				{ ...base, usageExtraUsageAvailable: true },
-				NOW,
-			),
-		).toBe("extra_usage (60m)");
-	});
-
-	it("keeps usage_exhausted when extra usage is not available", () => {
-		expect(computeRateLimitStatusDisplay(base, NOW)).toBe(
-			"usage_exhausted (60m)",
-		);
-		expect(
-			computeRateLimitStatusDisplay(
-				{ ...base, usageExtraUsageAvailable: false },
+				{ ...base, usageExtraUsageAvailable: true } as never,
 				NOW,
 			),
 		).toBe("usage_exhausted (60m)");
 	});
 
-	it("never claims extra usage for a window that still has headroom", () => {
+	it("labels a spent window usage_exhausted with its reset", () => {
+		expect(computeRateLimitStatusDisplay(base, NOW)).toBe(
+			"usage_exhausted (60m)",
+		);
+	});
+
+	it("never shows extra usage for a window that still has headroom", () => {
 		expect(
 			computeRateLimitStatusDisplay(
-				{ ...base, usageUtilization: 40, usageExtraUsageAvailable: true },
+				{
+					...base,
+					usageUtilization: 40,
+					usageExtraUsageAvailable: true,
+				} as never,
 				NOW,
 			),
 		).toBe("OK");
@@ -72,7 +69,7 @@ describe("computeRateLimitStatusDisplay — extra usage", () => {
 });
 
 describe("computePoolStatus — extra usage", () => {
-	it("counts an account on extra usage as routable and not as usage_exhausted", () => {
+	it("counts a spent account as usage_exhausted even if a snapshot claims extra usage", () => {
 		const accounts = [
 			{ id: "on-credits", name: "on-credits", provider: "codex" },
 			{ id: "spent", name: "spent", provider: "codex" },
@@ -80,14 +77,19 @@ describe("computePoolStatus — extra usage", () => {
 			(a) => ({ paused: false, rate_limited_until: null, ...a }) as Account,
 		);
 
-		const status = computePoolStatus(accounts, NOW, (account) => ({
-			utilization: 100,
-			resetMs: RESET,
-			extraUsageAvailable: account.id === "on-credits" ? true : undefined,
-		}));
+		const status = computePoolStatus(
+			accounts,
+			NOW,
+			(account) =>
+				({
+					utilization: 100,
+					resetMs: RESET,
+					extraUsageAvailable: account.id === "on-credits" ? true : undefined,
+				}) as never,
+		);
 
-		expect(status.routable).toBe(1);
-		expect(status.usage_exhausted).toBe(1);
+		expect(status.routable).toBe(0);
+		expect(status.usage_exhausted).toBe(2);
 	});
 });
 

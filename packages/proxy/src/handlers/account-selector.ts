@@ -613,12 +613,7 @@ export async function getOrderedAccounts(
 					const usage = usageSnapshot(account);
 					return (
 						usage === null ||
-						!isUsageExhausted(
-							usage.utilization,
-							usage.resetMs,
-							now,
-							usage.extraUsageAvailable,
-						)
+						!isUsageExhausted(usage.utilization, usage.resetMs, now)
 					);
 				});
 		// `all` stays the raw, unfiltered DB read (not `candidates`) — the

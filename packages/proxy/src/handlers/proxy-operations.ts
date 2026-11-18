@@ -4208,12 +4208,7 @@ export function createPoolExhaustedResponse(
 		const usage = usageSnapshots?.get(account.id);
 		const usageExhausted =
 			usage !== undefined &&
-			isUsageExhausted(
-				usage.utilization,
-				usage.resetMs,
-				now,
-				usage.extraUsageAvailable,
-			);
+			isUsageExhausted(usage.utilization, usage.resetMs, now);
 
 		const reason: PoolExhaustionAccountReason = isVisionUnsupported
 			? // The account is healthy; it simply could not read the image. It was
@@ -4270,12 +4265,7 @@ export function createPoolExhaustedResponse(
 		const usage = usageSnapshots?.get(account.id);
 		if (
 			usage &&
-			isUsageExhausted(
-				usage.utilization,
-				usage.resetMs,
-				now,
-				usage.extraUsageAvailable,
-			) &&
+			isUsageExhausted(usage.utilization, usage.resetMs, now) &&
 			usage.resetMs &&
 			usage.resetMs > now
 		) {

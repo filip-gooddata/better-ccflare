@@ -2,7 +2,6 @@ import {
 	type AccountUsageSnapshot,
 	CLAUDE_CLI_VERSION,
 	getModelFamily,
-	isUseExtraUsageEnabled,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -676,6 +675,10 @@ function utilizationForProvider(
  *   `extra_usage_exhausted` (issue #293), not something to predict from
  *   telemetry.
  *
+ * The opposite never holds: a five_hour or seven_day window at 100% is final.
+ * Extra usage left in the overage pool does not make a spent plan window
+ * usable; the router never serves a request from extra usage.
+ *
  * Use {@link getRankingUtilizationForProvider} for load-balancing order, where
  * a spent overage pool legitimately makes an account the less attractive pick.
  */
@@ -910,23 +913,19 @@ function plainUsageSnapshot(
 ): AccountUsageSnapshot | null {
 	const utilization = getRepresentativeUtilizationForProvider(data, provider);
 	if (utilization === null) return null;
-	const snapshot: AccountUsageSnapshot = {
+	// No extra-usage flag rides along: a full window is final, whatever the
+	// provider's billed capacity beyond the plan.
+	return {
 		utilization,
 		resetMs: getRepresentativeUsageResetMs(data, provider),
 	};
-	// Policy and fact together: the operator allows extra usage AND the
-	// provider says there is some. The window itself is reported unchanged —
-	// only whether it shuts the account out differs.
-	if (isUseExtraUsageEnabled() && hasExtraUsageCapacity(data, provider)) {
-		snapshot.extraUsageAvailable = true;
-	}
-	return snapshot;
 }
 
 /**
  * Whether the provider reports billed capacity that keeps serving after the
- * plan window is spent. A fact about the account only; whether to use it is
- * the "use extra usage" setting's call (see plainUsageSnapshot).
+ * plan window is spent. A display fact about the account only: no routing
+ * gate reads it, because a full plan window is final and the router never
+ * serves a request from extra usage (the "use extra usage" setting is ignored).
  *
  * - codex: purchased credits or an unlimited allowance (`credits`).
  * - anthropic: overage that is enabled and not yet used up. The 2026 `spend`
