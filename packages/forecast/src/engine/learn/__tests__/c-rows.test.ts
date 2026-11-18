@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BUCKET_MS } from "../../../types";
+import { BUCKET_MS, TIME_SHIFT_MIN_MAX } from "../../../types";
 import { recencyWeight } from "../../calibration";
 import type { RecordedDay } from "../../model";
 import type { PaceSeries } from "../../pace/types";
@@ -234,6 +234,10 @@ describe("row 20 jitter: grid and preference", () => {
 		expect(jitterGrid(0)).toEqual([0, 10, 20, 40, 80, 120]);
 		expect(jitterGrid(120)).toEqual([0, 10, 20, 40, 80, 120]);
 		expect(jitterGrid(7)).toEqual([0, 7, 10, 20, 40, 80, 120]);
+		// the cap is the timeShiftMin setting maximum, not its own literal (R3-7)
+		expect(TIME_SHIFT_MIN_MAX).toBe(120);
+		expect(jitterGrid(30).at(-1)).toBe(TIME_SHIFT_MIN_MAX);
+		expect(jitterGrid(TIME_SHIFT_MIN_MAX)).toEqual([0, 10, 20, 40, 80, 120]);
 		expect(jitterPreference(7, 3)).toEqual([5, 3, 1, 0, 2, 4, 6]);
 		expect(jitterPreference(6, 0)).toEqual([0, 1, 2, 3, 4, 5]);
 		expect(jitterPreference(6, 5)).toEqual([5, 4, 3, 2, 1, 0]);

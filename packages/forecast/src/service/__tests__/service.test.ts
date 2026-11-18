@@ -2645,6 +2645,50 @@ describe("forecast service: F2 learned demand from the refit job", () => {
 		expect(h.refitLines()).toHaveLength(3);
 	});
 
+	it("serves presentDemand(settings) while pace conditioning is off, the learned demand again once on (R3-5)", async () => {
+		const h = refitHarness();
+		await h.service.runOnce();
+		await flush();
+		const l1 = learnedAt();
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l1,
+			ms: 1,
+		});
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l1);
+		h.settings.current = { ...h.settings.current, ...paceOff };
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toEqual(
+			presentOf(h.settings.current),
+		);
+		await h.time.advance(60 * MIN);
+		await h.service.runOnce();
+		expect(h.runner.calls).toHaveLength(1);
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toEqual(
+			presentOf(h.settings.current),
+		);
+		h.settings.current = { ...h.settings.current, ...paceOn };
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l1);
+		await h.time.advance(60 * MIN);
+		expect(h.runner.calls).toHaveLength(2);
+		const l2 = learnedAt({ halfLifeDays: 7 });
+		await h.runner.finish({
+			status: "ok",
+			state: fitState(T0),
+			learned: l2,
+			ms: 1,
+		});
+		await h.time.advance(FORECAST_MIN_SPACING_MS);
+		await h.service.runOnce();
+		expect(h.engine.inputs.at(-1)?.learnedDemand).toBe(l2);
+	});
+
 	it("after a demand setting changes, serves presentDemand(new settings) until the next successful refit", async () => {
 		const h = refitHarness();
 		await h.service.runOnce();

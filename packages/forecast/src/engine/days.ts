@@ -23,6 +23,13 @@ export const MIN_ACTIVE_DAYS = floorOf(paceGrammar().length);
 export const MIN_POOL_DAYS = 3;
 /** Work start = median over this many most recent recorded work days with demand: two working weeks, recent enough to follow a changed routine. */
 export const WORK_START_RECENT_DAYS = 10;
+/** Upper bound of every demand-side lookback; the owner ruling: "84 days, the owner's setting, is the upper bound". Calibration keeps the raw setting. */
+export const DEMAND_LOOKBACK_MAX_DAYS = 84;
+
+/** The demand-side lookback a `historyLookbackDays` setting serves: the setting, at most DEMAND_LOOKBACK_MAX_DAYS. */
+export function demandLookbackDays(setting: number): number {
+	return Math.min(setting, DEMAND_LOOKBACK_MAX_DAYS);
+}
 /** Work start = the minute by which this percent of a work day's demand is used, unless settings say otherwise (design amendment A3). */
 export const DEFAULT_WORK_START_SHARE_PCT = 5;
 /** Relative slack of the work-start share test, so float rounding in the running sum cannot move it a bucket later. */

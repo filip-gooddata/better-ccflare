@@ -1,13 +1,13 @@
 import { localParts } from "../../../time";
-import { BUCKET_MS } from "../../../types";
+import { BUCKET_MS, TIME_SHIFT_MIN_MAX } from "../../../types";
 import type { LearnDay } from "../daily";
 import type { LearnInput, RowScores } from "../types";
 import { distancePreference, scenarioPools } from "./c-scenario";
 
 const SLOT_MINUTES = BUCKET_MS / 60_000;
 const SLOTS = 1440 / SLOT_MINUTES;
-/** Largest jitter bound the setting allows (forecast-settings.ts `timeShiftMin` range 0..120). */
-const MAX_JITTER_MIN = 120;
+/** Largest jitter bound the setting allows: the `timeShiftMin` maximum. */
+const MAX_JITTER_MIN = TIME_SHIFT_MIN_MAX;
 /** 0, then the bucket times 2^k up to the maximum, which is always included. */
 const BASE_GRID = [0, 10, 20, 40, 80, MAX_JITTER_MIN];
 

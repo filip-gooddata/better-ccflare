@@ -223,6 +223,8 @@ export function createForecastService(
 		workDays: number,
 	): LearnedDemand => {
 		const demand = refitDemandOf(settings, workDays);
+		// pace off: no refit runs, so a stored learned demand would freeze (R3-5)
+		if (!settings.paceConditioning) return presentDemand(demand);
 		if (learnedState && learnedState.key === demandKey(demand))
 			return learnedState.learned;
 		return presentDemand(demand);

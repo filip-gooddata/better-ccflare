@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { BUCKET_MS } from "../../../types";
+import { DEMAND_LOOKBACK_MAX_DAYS } from "../../days";
 import type { PaceSeries } from "../../pace/types";
+import { presentDemand } from "..";
 import type { LearnDay } from "../daily";
 import { learnDays, lowoFolds } from "../daily";
 import {
@@ -13,6 +15,7 @@ import {
 	mixtureWeights,
 } from "../rows/demand-crps";
 import { halflifeCandidates, scoreHalflife } from "../rows/halflife";
+import { scoreJitter } from "../rows/jitter";
 import { lookbackCandidates, scoreLookback } from "../rows/lookback";
 import { POOL_CANDIDATES, scorePool } from "../rows/pool";
 import type { LearnInput } from "../types";
@@ -264,10 +267,27 @@ describe("scorers on a series", () => {
 		expect(s.row).toBe("halflife");
 		expect(s.candidates).toEqual([3.5, 7, 14, 28, 56, Infinity]);
 		expect(s.presentIndex).toBe(2);
-		expect(s.preference).toEqual([4, 2, 0, 1, 3, 5]);
+		expect(s.preference).toEqual([5, 4, 0, 3, 2, 1]);
 		expect(s.units).toEqual(unitsWant);
 		for (const l of s.loss)
 			for (const x of l) expect(Number.isFinite(x)).toBe(true);
+	});
+	test("row 5 preference: present, then the longer half-life first (R3-6)", () => {
+		const s = scoreHalflife({ ...input, historyHalfLifeDays: 10 });
+		expect(s.candidates).toEqual([3.5, 7, 10, 14, 28, 56, Infinity]);
+		expect(s.preference).toEqual([6, 5, 0, 4, 3, 2, 1]);
+		const inf = scoreHalflife({ ...input, historyHalfLifeDays: Infinity });
+		expect(inf.preference).toEqual([5, 4, 3, 2, 1, 0]);
+	});
+	test("row 4: a setting above 84 searches and serves at most 84 (R3-1)", () => {
+		for (const setting of [120, 365]) {
+			const s = scoreLookback({ ...input, historyLookbackDays: setting });
+			expect(s.candidates).toEqual([28, 42, 56, 70, 84]);
+			expect(s.presentIndex).toBe(4);
+		}
+		const s60 = scoreLookback({ ...input, historyLookbackDays: 60 });
+		expect(s60.candidates).toEqual([28, 42, 56, 60]);
+		expect(s60.presentIndex).toBe(3);
 	});
 	test("too short a series: no units, present only scored nothing", () => {
 		const short = {
@@ -287,4 +307,66 @@ describe("scorers on a series", () => {
 			expect(s.loss.every((l) => l.length === 0)).toBe(true);
 		}
 	});
+});
+
+describe("demand lookback cap (R3-1)", () => {
+	test("the bound is 84 days; presentDemand caps the setting, keeps a shorter one", () => {
+		expect(DEMAND_LOOKBACK_MAX_DAYS).toBe(84);
+		const base = {
+			historyLookbackDays: 84,
+			historyHalfLifeDays: 14,
+			workStartSharePct: 5,
+			timeShiftMin: 30,
+		};
+		expect(
+			presentDemand({ ...base, historyLookbackDays: 365 }).lookbackDays,
+		).toBe(84);
+		expect(
+			presentDemand({ ...base, historyLookbackDays: 120 }).lookbackDays,
+		).toBe(84);
+		expect(
+			presentDemand({ ...base, historyLookbackDays: 60 }).lookbackDays,
+		).toBe(60);
+	});
+
+	test("on a 130-day series, every demand row scores a setting of 365 or 120 as 84", () => {
+		const start = Date.UTC(2026, 6, 6);
+		const now = start + 130 * 86_400_000 + 3_600_000;
+		const n = 130 * 288;
+		const long: PaceSeries = {
+			start,
+			units: new Float64Array(n),
+			censored: new Uint8Array(n),
+			timeZone: "UTC",
+		};
+		for (let i = 0; i < n; i += 29) long.units[i] = (i % 13) + 1;
+		const at84: LearnInput = {
+			series: long,
+			now,
+			workDays: 5,
+			historyLookbackDays: 84,
+			historyHalfLifeDays: 14,
+			workStartSharePct: 5,
+			timeShiftMin: 30,
+			fitWithPartition: () => {
+				throw new Error("not used");
+			},
+		};
+		// the series reaches past 84 days: a raw 120-day lookback scores differently
+		const days = learnDays(long, now, 5);
+		const raw = (lookbackDays: number) =>
+			demandLosses(
+				days,
+				[{ pool: "hard3", lookbackDays, halfLifeDays: 14 }],
+				"lowo",
+			).loss[0];
+		expect(raw(120)).not.toEqual(raw(84));
+		for (const setting of [120, 365]) {
+			const over = { ...at84, historyLookbackDays: setting };
+			expect(scorePool(over)).toEqual(scorePool(at84));
+			expect(scoreLookback(over)).toEqual(scoreLookback(at84));
+			expect(scoreHalflife(over)).toEqual(scoreHalflife(at84));
+			expect(scoreJitter(over)).toEqual(scoreJitter(at84));
+		}
+	}, 60_000);
 });

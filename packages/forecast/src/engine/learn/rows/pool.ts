@@ -1,3 +1,4 @@
+import { demandLookbackDays } from "../../days";
 import { learnDays } from "../daily";
 import type { LearnInput, PoolTau, RowScores } from "../types";
 import { demandLosses, gridPreference } from "./demand-crps";
@@ -27,7 +28,7 @@ export function scorePool(input: LearnInput): RowScores<PoolTau> {
 		days,
 		POOL_CANDIDATES.map((pool) => ({
 			pool,
-			lookbackDays: input.historyLookbackDays,
+			lookbackDays: demandLookbackDays(input.historyLookbackDays),
 			halfLifeDays: input.historyHalfLifeDays,
 		})),
 		"lowo",

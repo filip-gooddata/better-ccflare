@@ -4,6 +4,8 @@
  * sums), horizon, scenarios (smoothed bootstrap), planner (receding-horizon search),
  * response. Yields to the event loop between stages; the stages yield inside.
  */
+
+import { localDayStart } from "../time";
 import type {
 	AccountId,
 	AccountLimits,
@@ -29,6 +31,7 @@ import {
 import {
 	activeDays,
 	buildDayTable,
+	demandLookbackDays,
 	historyAvailable,
 	MIN_ACTIVE_DAYS,
 	MIN_POOL_DAYS,
@@ -50,7 +53,7 @@ import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
 import { planForecast } from "./planner";
 import { buildResponse, unavailableResponse } from "./response";
-import { buildScenarios, resolveNoiseMode } from "./scenarios";
+import { buildScenarios, datePool, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
 
 const HOUR_MS = 3_600_000;
@@ -110,26 +113,25 @@ export function currentPace(
 
 /**
  * The scenario day table under F2 rows 4 and 5: the served lookback (never
- * above the setting) and half-life. At the settings' values it is the gate's
- * own table; availability, work start and calibration keep the settings.
+ * above the setting nor DEMAND_LOOKBACK_MAX_DAYS, also without learned demand)
+ * and half-life. At the settings' values it is the gate's own table;
+ * availability, work start and calibration keep the settings.
  */
 function scenarioDayTable(
 	input: ForecastInput,
 	table: DayTable,
 	learned: LearnedDemand | null,
 ): DayTable {
-	if (!learned) return table;
 	const { historyLookbackDays, historyHalfLifeDays } = input.settings;
-	const lookbackDays = Math.min(learned.lookbackDays, historyLookbackDays);
+	const cap = demandLookbackDays(historyLookbackDays);
+	const lookbackDays = Math.min(learned?.lookbackDays ?? cap, cap);
+	const halfLifeDays = learned?.halfLifeDays ?? historyHalfLifeDays;
 	if (
 		lookbackDays === historyLookbackDays &&
-		learned.halfLifeDays === historyHalfLifeDays
+		halfLifeDays === historyHalfLifeDays
 	)
 		return table;
-	return buildDayTable(input, {
-		lookbackDays,
-		halfLifeDays: learned.halfLifeDays,
-	});
+	return buildDayTable(input, { lookbackDays, halfLifeDays });
 }
 
 /** The demand model's summary for the log line; null without one. */
@@ -183,9 +185,10 @@ async function prepare(
 	await yieldToEventLoop();
 
 	const pace = currentPace(input);
+	const scenarioTable = scenarioDayTable(input, table, learned);
 	const scenarios = await buildScenarios(
 		input,
-		scenarioDayTable(input, table, learned),
+		scenarioTable,
 		horizon,
 		options,
 		pace,
@@ -197,7 +200,13 @@ async function prepare(
 		learned ? learned.workStartSharePct : input.settings.workStartSharePct,
 		learned ? learned.workStartSample : WORK_START_RECENT_DAYS,
 	);
-	const pool = poolFor(table, table.today.type);
+	// today's served draw pool, as the scenarios draw it (R3-8)
+	const pool = datePool(
+		scenarioTable,
+		localDayStart(input.now, timeZone),
+		input.pace,
+		learned ?? {},
+	);
 	return {
 		input,
 		now: input.now,
@@ -212,7 +221,7 @@ async function prepare(
 			pace: scenarios.diagnostics.pace,
 			paceModel: paceModelDetail(input),
 			pool: {
-				name: poolName(table),
+				name: poolName(scenarioTable),
 				days: pool.length,
 				medianUnits: weightedQuantile(pool, 0.5),
 				p90Units: weightedQuantile(pool, 0.9),
