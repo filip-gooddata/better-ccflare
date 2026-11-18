@@ -668,11 +668,21 @@ async function handleProxyRequestHolding(
 
 	/**
 	 * The local 429 for the sends the attempt gate (proxyWithAccount) skipped
-	 * because their account was full by then, ranked by the all-limited rule;
-	 * null when it skipped none.
+	 * because their account was full by then, ranked by the all-limited rule
+	 * together with the `attempted` accounts that are now limit-blocked (a
+	 * cooldown their refusal or error set ends before a skipped account's
+	 * reset); null when it skipped none.
 	 */
-	const gatedLocalAnswer = (): LocalLimitAnswer | null =>
-		rankFullLimitAnswers(getGatedAttempts(requestMeta), ctx, requestMeta);
+	const gatedLocalAnswer = (
+		attempted: Account[],
+	): Promise<LocalLimitAnswer | null> =>
+		rankFullLimitAnswers(
+			getGatedAttempts(requestMeta),
+			ctx,
+			requestMeta,
+			Date.now(),
+			{ accounts: attempted, model: effectiveModel ?? undefined },
+		);
 
 	const { available: accounts, throttled: throttledAccounts } =
 		applyUsageThrottling(selectedAccounts);
@@ -1464,7 +1474,7 @@ async function handleProxyRequestHolding(
 			if (everyEligibleRouteIsBlind()) return await visionRefusal();
 			// A slot skipped because its account filled up after selection is
 			// a limit, not a broken combo: its local 429 answers.
-			const comboGatedAnswer = gatedLocalAnswer();
+			const comboGatedAnswer = await gatedLocalAnswer(accounts);
 			if (comboGatedAnswer) {
 				cacheBodyStore.discardStaged(requestMeta.id);
 				return answerLocally(comboGatedAnswer);
@@ -1773,7 +1783,7 @@ async function handleProxyRequestHolding(
 	// (it filled up after selection, or a fallback model's family is full),
 	// and nothing else served the request: answer with the local 429 of the
 	// account usable first, as an empty selection would. Nothing is forwarded.
-	const gatedAnswer = gatedLocalAnswer();
+	const gatedAnswer = await gatedLocalAnswer(allAttemptedAccounts);
 	if (gatedAnswer) {
 		cacheBodyStore.discardStaged(requestMeta.id);
 		return answerLocally(gatedAnswer);

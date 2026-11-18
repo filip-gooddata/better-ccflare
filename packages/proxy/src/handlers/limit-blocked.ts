@@ -158,11 +158,15 @@ function familyLimitInForce(
 	family: string | null,
 	capacityRoutingEnabled: boolean,
 	now: number,
+	mapToUpstream = true,
 ): AccountLimit | null {
 	// Blocks are recorded for the family upstream refused: the family of the
 	// model this account actually sends (mapModelName honors "force account
-	// model", which turns mapping off).
-	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
+	// model", which turns mapping off). A model already sent verbatim
+	// (mapToUpstream false) is that model.
+	const upstreamModel = splitModelRouting(
+		mapToUpstream ? mapModelName(model, account) : model,
+	).model;
 	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
 	// A client alias with no family of its own still counts when the account
 	// maps it to a family.
@@ -333,25 +337,43 @@ export async function selectAllLimitedTarget(
  * request: its five-hour or weekly window, the request model's family, or an
  * `overage_in_use` bench still ahead of its reset (the account was served
  * from extra usage, so its limits are spent). Any other cooldown alone does
- * not count. Null when no full limit is in force.
+ * not count. Null when no full limit is in force. With `upstreamModel`, `model`
+ * is the model sent upstream verbatim: its own family counts, not the family
+ * this account's mappings would turn it into.
  */
 export function fullLimitAnswer(
 	account: Account,
 	ctx: ProxyContext,
 	model: string | undefined,
 	now: number = Date.now(),
+	options: { upstreamModel?: boolean } = {},
 ): LocalLimitAnswer | null {
 	const family = model ? getModelFamily(model) : null;
 	const overageBench = holdsOverageBench(account, now);
+	const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
 	const limits = limitsInForce(
 		account,
-		model,
+		options.upstreamModel ? undefined : model,
 		family,
-		isCapacityRoutingEnabled(ctx),
+		capacityRoutingEnabled,
 		now,
-	).filter((limit) => overageBench || limit.kind !== "cooldown");
-	if (limits.length === 0) return null;
-	return localLimitAnswerFor({ account, limits });
+	);
+	if (options.upstreamModel && model) {
+		const familyLimit = familyLimitInForce(
+			account,
+			model,
+			family,
+			capacityRoutingEnabled,
+			now,
+			false,
+		);
+		if (familyLimit) limits.push(familyLimit);
+	}
+	const full = limits.filter(
+		(limit) => overageBench || limit.kind !== "cooldown",
+	);
+	if (full.length === 0) return null;
+	return localLimitAnswerFor({ account, limits: full });
 }
 
 const localLimitAnswers = new WeakMap<RequestMeta, LocalLimitAnswer>();

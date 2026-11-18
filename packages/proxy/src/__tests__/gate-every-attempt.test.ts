@@ -262,6 +262,24 @@ async function expectLocal429(received: Response | Error, resetAt: number) {
 	expect(body.error.type).toBe("rate_limit_error");
 }
 
+/** The local 429 describing a cooldown only (no unified reset): status,
+ * retry-after under `maxSeconds`, x-should-retry, rate_limit_error body. */
+async function expectCooldown429(
+	received: Response | Error,
+	maxSeconds: number,
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	const retryAfter = Number(response.headers.get("retry-after"));
+	expect(retryAfter).toBeGreaterThan(0);
+	expect(retryAfter).toBeLessThan(maxSeconds);
+	expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBeNull();
+	expect(response.headers.get("x-should-retry")).toBe("true");
+	const body = (await response.json()) as { error: { type: string } };
+	expect(body.error.type).toBe("rate_limit_error");
+}
+
 beforeEach(() => {
 	setSystemTime(new Date(NOW));
 	clearVisionCapability();
@@ -391,7 +409,8 @@ describe("gate before every upstream attempt", () => {
 		const response = await send(ctx);
 
 		expect(calls.map((c) => c.account)).not.toContain("b");
-		await expectLocal429(response, reset);
+		// a's transient-error cooldown ends before b's reset: it is described.
+		await expectCooldown429(response, (reset - NOW) / 1000);
 	});
 
 	it("a combo slot that turned full after selection is skipped, with session fallback disabled: local 429, not 503", async () => {
@@ -411,7 +430,8 @@ describe("gate before every upstream attempt", () => {
 		const response = await send(ctx);
 
 		expect(calls.map((c) => c.account)).not.toContain("slot-b");
-		await expectLocal429(response, reset);
+		// slot-a's transient-error cooldown ends before slot-b's reset.
+		await expectCooldown429(response, (reset - NOW) / 1000);
 	});
 
 	it("a stream already being served is not cut when its account turns full mid-stream", async () => {
