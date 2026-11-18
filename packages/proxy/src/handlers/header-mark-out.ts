@@ -24,6 +24,26 @@ export const HEADER_REFRESH_MIN_INTERVAL_MS = 30_000;
 const lastRefreshAt = new Map<string, number>();
 /** The latest usage entry each account got from headers, not from a read. */
 const headerWritten = new Map<string, UsageData>();
+/** What the cache held before the first of those header writes. */
+const readingsBeforeMark = new Map<string, UsageData | null>();
+
+function holdsHeaderMark(accountId: string): boolean {
+	const current = usageCache.get(accountId);
+	return current !== null && current === headerWritten.get(accountId);
+}
+
+/**
+ * The usage readings to judge a refusal by: what the cache held before the
+ * header mark when it still holds that mark, else the cache as is. The 429
+ * family classifier must see the account's own readings, not the mark this
+ * same response just wrote; selection keeps reading the mark.
+ */
+export function readingsBeforeHeaderMark(accountId: string): UsageData | null {
+	if (holdsHeaderMark(accountId)) {
+		return readingsBeforeMark.get(accountId) ?? null;
+	}
+	return (usageCache.get(accountId) as UsageData | null) ?? null;
+}
 
 interface WindowHeaders {
 	utilization: number | null;
@@ -108,9 +128,9 @@ function familyOfClaim(parsed: UnifiedLimitHeaders): string | null {
  * family block's business. This runs before the 429 classifiers, which read
  * the same cache to tell a family refusal from an account one, so an overall
  * rejection without a claim marks nothing either while the readings show a
- * family row spent (the classifier may call that refusal family-scoped) or
- * there are no readings at all (it reports the refusal unclassified). Any
- * other unclaimed rejection the classifier benches account-wide anyway.
+ * family row spent: the classifier may call that refusal family-scoped. Any
+ * other unclaimed rejection the classifier benches account-wide anyway, so
+ * the mark only makes that exclusion immediate.
  */
 function bindingWindow(
 	parsed: UnifiedLimitHeaders,
@@ -121,23 +141,10 @@ function bindingWindow(
 	if (claim === "five_hour") return "five_hour";
 	if (claim === "seven_day") return "seven_day";
 	if (familyOfClaim(parsed) !== null) return null;
-	if (
-		!parsed.overageInUse &&
-		(!hasReadings(previous) || hasSpentFamilyRow(previous, now))
-	) {
-		return null;
-	}
+	if (!parsed.overageInUse && hasSpentFamilyRow(previous, now)) return null;
 	const five = parsed.fiveHour.utilization ?? -1;
 	const seven = parsed.sevenDay.utilization ?? -1;
 	return seven > five ? "seven_day" : "five_hour";
-}
-
-function hasReadings(usage: UsageData): boolean {
-	return (
-		usage.five_hour != null ||
-		usage.seven_day != null ||
-		(Array.isArray(usage.limits) && usage.limits.length > 0)
-	);
 }
 
 function hasSpentFamilyRow(usage: UsageData, now: number): boolean {
@@ -174,6 +181,12 @@ function writeUsageFromHeaders(
 	parsed: UnifiedLimitHeaders,
 	windowOut: boolean,
 ): void {
+	if (!holdsHeaderMark(accountId)) {
+		readingsBeforeMark.set(
+			accountId,
+			(usageCache.get(accountId) as UsageData | null) ?? null,
+		);
+	}
 	const previous = (usageCache.get(accountId) ?? {}) as UsageData;
 	const next: UsageData = { ...previous };
 	const forced = windowOut ? null : bindingWindow(parsed, previous, Date.now());
@@ -217,10 +230,7 @@ function refreshUsageSoon(accountId: string, now: number): void {
 	usageCache
 		.refreshNow(accountId)
 		.then(() => {
-			const current = usageCache.get(accountId);
-			if (current === null || current !== headerWritten.get(accountId)) {
-				return;
-			}
+			if (!holdsHeaderMark(accountId)) return;
 			return usageCache.refreshNow(accountId);
 		})
 		.catch((error: unknown) => logRefreshFailure(accountId, error));
@@ -304,4 +314,5 @@ export function applyOverageCooldown(
 export function resetHeaderMarkOutForTests(): void {
 	lastRefreshAt.clear();
 	headerWritten.clear();
+	readingsBeforeMark.clear();
 }

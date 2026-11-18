@@ -22,6 +22,7 @@ import {
 import { selectAccountsForRequest } from "../account-selector";
 import {
 	observeLimitHeaders,
+	readingsBeforeHeaderMark,
 	resetHeaderMarkOutForTests,
 } from "../header-mark-out";
 import { collectLimitBlockedAccounts } from "../limit-blocked";
@@ -436,6 +437,33 @@ describe("observeLimitHeaders", () => {
 			makeAccount("a"),
 		);
 		expect(limitKinds(ctx, "a")).toEqual(["five_hour"]);
+	});
+
+	it("an unclaimed rejection with no readings at all still marks the account at once", () => {
+		const { ctx } = makeCtx();
+		for (const status of [200, 429]) {
+			usageCache.clear();
+			observeLimitHeaders(
+				respond(allowedHeaders({ [`${P}status`]: "rejected" }), status),
+				makeAccount("a"),
+			);
+			expect(limitKinds(ctx, "a")).toEqual(["five_hour"]);
+			expect(readingsBeforeHeaderMark("a")).toBeNull();
+		}
+	});
+
+	it("gives the refusal classifier the readings from before the mark until a real read lands", () => {
+		seedUsage("a");
+		const original = usageCache.get("a");
+		const tipped = () =>
+			respond(allowedHeaders({ [`${P}5h-utilization`]: "1.0" }));
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		observeLimitHeaders(tipped(), makeAccount("a"));
+		expect(cached("a").five_hour.utilization).toBe(100);
+		expect(readingsBeforeHeaderMark("a")).toBe(original as never);
+
+		seedUsage("a");
+		expect(readingsBeforeHeaderMark("a")).toBe(usageCache.get("a") as never);
 	});
 
 	it("an unclaimed rejection leaves a spent family row to the family classifier", () => {
