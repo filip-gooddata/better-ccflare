@@ -94,6 +94,7 @@ function resolveForwardToClient(ctx: ProxyContext) {
 }
 
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import { limitRefusalResetMs, rememberLimitRefusal } from "./limit-response";
 
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
@@ -1514,19 +1515,44 @@ export async function proxyWithAccount(
 ): Promise<Response | null> {
 	/**
 	 * Fail over from an upstream limit refusal: hand it to `onLimitRefusal`
-	 * when the all-limited rule can use it. Returns false when it was not
-	 * held (no receiver, another strategy, or an unreadable body); the caller
-	 * then drains it.
+	 * when the all-limited rule can use it, and remember a 429 with a future
+	 * unified reset as this account's last real refusal (rememberLimitRefusal)
+	 * on every request, held or not, so a later local 429 can replay it. A
+	 * refusal that is only remembered has its body read here (a body over the
+	 * buffer bound is cancelled, not cached). Returns false when the body was
+	 * neither held nor read (no receiver or another strategy and nothing to
+	 * remember, or an unreadable body); the caller then drains it.
 	 */
 	const holdLimitRefusal = async (rawResponse: Response): Promise<boolean> => {
-		if (!onLimitRefusal || !ctx.strategy.selectWhenAllLimited) return false;
+		const hold =
+			onLimitRefusal && ctx.strategy.selectWhenAllLimited
+				? onLimitRefusal
+				: null;
+		const resetMs =
+			rawResponse.status === 429
+				? limitRefusalResetMs(rawResponse.headers)
+				: null;
+		const remember = resetMs !== null && resetMs > Date.now();
+		if (!hold && !remember) return false;
 		let body: HeldLimitRefusal["body"];
 		try {
 			body = await readHeldBody(rawResponse.body, MAX_TERMINAL_REJECTION_BYTES);
 		} catch {
 			return false;
 		}
-		onLimitRefusal({
+		if (remember && !(body instanceof ReadableStream)) {
+			rememberLimitRefusal(account.id, {
+				status: rawResponse.status,
+				statusText: rawResponse.statusText,
+				headers: rawResponse.headers,
+				body,
+			});
+		}
+		if (!hold) {
+			if (body instanceof ReadableStream) body.cancel().catch(() => {});
+			return true;
+		}
+		hold({
 			account,
 			status: rawResponse.status,
 			statusText: rawResponse.statusText,

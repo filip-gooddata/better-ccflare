@@ -343,7 +343,7 @@ for (const capacityRouting of [false, true]) {
 			});
 		}
 
-		it("keeps the local model_family_exhausted for a strategy without the all-limited rule", async () => {
+		it("keeps the local family 429 for a strategy without the all-limited rule", async () => {
 			const a = makeAccount("a");
 			blockFamily("a", "fable", NOW + 20 * HOUR, "header");
 			const calls = installUpstream((account) => limit429(NOW + HOUR, account));
@@ -354,10 +354,15 @@ for (const capacityRouting of [false, true]) {
 			expect(calls).toEqual([]);
 			expect(response.status).toBe(429);
 			const body = (await response.json()) as {
-				error: { code: string; message: string };
+				error: { type: string; code?: string };
 			};
-			expect(body.error.code).toBe("model_family_exhausted");
-			expect(body.error.message).toContain("Upstream refused the fable");
+			expect(body.error.type).toBe("rate_limit_error");
+			expect(body.error.code).toBeUndefined();
+			expect(
+				response.headers.get(
+					"anthropic-ratelimit-unified-representative-claim",
+				),
+			).toBe("seven_day_fable");
 		});
 
 		it("still serves another family from a blocked account", async () => {

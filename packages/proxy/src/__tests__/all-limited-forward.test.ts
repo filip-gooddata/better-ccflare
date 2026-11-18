@@ -497,7 +497,7 @@ describe("other strategies keep today's local errors", () => {
 		expect(body.error.type).toBe("pool_exhausted");
 	});
 
-	it("keeps the local 429 model_family_exhausted", async () => {
+	it("keeps the local family 429", async () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -510,8 +510,14 @@ describe("other strategies keep today's local errors", () => {
 
 		expect(calls).toEqual([]);
 		expect(response.status).toBe(429);
-		const body = (await response.json()) as { error: { code: string } };
-		expect(body.error.code).toBe("model_family_exhausted");
+		const body = (await response.json()) as {
+			error: { type: string; code?: string };
+		};
+		expect(body.error.type).toBe("rate_limit_error");
+		expect(body.error.code).toBeUndefined();
+		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
 	});
 
 	it("still turns an upstream 429 on the last candidate into the local error", async () => {

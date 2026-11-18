@@ -8,6 +8,10 @@ import {
 	getRepresentativeUsageSnapshotForProvider,
 } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import {
+	localLimitInputForAccount,
+	localLimitResponseForAccount,
+} from "./limit-response";
 
 const RETRY_AFTER_SECONDS = 60;
 
@@ -370,7 +374,20 @@ export function getAccountUsageThrottleUntil(
 	});
 }
 
+/**
+ * The local answer when usage throttling holds back every candidate. When
+ * each throttled account is held because one of its limits is full (a
+ * window at >= 100 % whose reset is ahead), the request is refused for the
+ * same reason upstream would refuse it, so the answer is the Anthropic-shaped
+ * limit 429 (limit-response.ts) for the account whose limit resets soonest:
+ * its `retry-after` is the earliest time any of them can serve again, and
+ * Claude Code shows the limit instead of retrying an overload. Otherwise at
+ * least one account is only paced below its limit and will serve again
+ * shortly: the 529 overload with a fixed short Retry-After stays.
+ */
 export function createUsageThrottledResponse(accounts: Account[]): Response {
+	const full = fullLimitAccountResettingSoonest(accounts);
+	if (full) return localLimitResponseForAccount(full);
 	const names = accounts.map((account) => account.name).join(", ");
 	return new Response(
 		JSON.stringify({
@@ -388,4 +405,35 @@ export function createUsageThrottledResponse(accounts: Account[]): Response {
 			},
 		},
 	);
+}
+
+/**
+ * The account whose full limit resets soonest, when every account in
+ * `accounts` has a full limit (localLimitInputForAccount binds a window at
+ * >= 100 % with its reset ahead); null when any account lacks cached usage or
+ * is throttled below its limits, or the list is empty.
+ */
+export function fullLimitAccountResettingSoonest(
+	accounts: Account[],
+	now: number = Date.now(),
+): Account | null {
+	let best: { account: Account; resetMs: number } | null = null;
+	for (const account of accounts) {
+		const input = localLimitInputForAccount(account.id, {
+			now,
+			provider: account.provider,
+		});
+		if (!input || input.resetMs === null || input.resetMs <= now) return null;
+		const window =
+			input.binding.kind === "five_hour"
+				? input.fiveHour
+				: input.binding.kind === "seven_day"
+					? input.sevenDay
+					: null;
+		if (!window || window.utilization < 100) return null;
+		if (!best || input.resetMs < best.resetMs) {
+			best = { account, resetMs: input.resetMs };
+		}
+	}
+	return best?.account ?? null;
 }

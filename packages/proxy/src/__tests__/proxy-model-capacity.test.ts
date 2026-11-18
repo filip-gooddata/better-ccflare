@@ -119,18 +119,19 @@ describe("handleProxy model-scoped capacity routing", () => {
 			expect(response.status).toBe(429);
 			const body = (await response.json()) as {
 				type: string;
-				error: {
-					type: string;
-					code: string;
-					family: string;
-					resetAt: number | null;
-				};
+				error: { type: string; message: string };
 			};
 			expect(body.type).toBe("error");
 			expect(body.error.type).toBe("rate_limit_error");
-			expect(body.error.code).toBe("model_family_exhausted");
-			expect(body.error.family).toBe("sonnet");
-			expect(body.error.resetAt).toBe(new Date(resetAt).getTime());
+			expect(Object.keys(body.error).sort()).toEqual(["message", "type"]);
+			expect(
+				response.headers.get(
+					"anthropic-ratelimit-unified-representative-claim",
+				),
+			).toBe("seven_day_sonnet");
+			expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+				String(Math.floor(new Date(resetAt).getTime() / 1000)),
+			);
 		} finally {
 			Date.now = realDateNow;
 		}
@@ -340,7 +341,10 @@ describe("handleProxy Step-10 combo-fallback control flow (v3 Fix3)", () => {
 			error?: { type?: string; code?: string };
 		};
 		expect(body.error?.type).toBe("rate_limit_error");
-		expect(body.error?.code).toBe("model_family_exhausted");
+		expect(body.error?.code).toBeUndefined();
+		expect(response?.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
 	});
 
 	it("clears comboName so Step-10's own capacity-filtered selection is not itself treated as a fresh combo lookup (no stale combo state after fallthrough)", async () => {
