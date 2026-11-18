@@ -86,7 +86,10 @@ function usage(parts: {
 			kind: "weekly_scoped",
 			percent: row.percent,
 			resets_at: iso(row.resetAt),
-			scope: { model: { id: null, display_name: row.displayName ?? "Opus" }, surface: null },
+			scope: {
+				model: { id: null, display_name: row.displayName ?? "Opus" },
+				surface: null,
+			},
 		}));
 	}
 	return data as never;
@@ -219,7 +222,7 @@ const bypassProbe = (id: string) => ({
 	"x-better-ccflare-bypass-session": "true",
 });
 /** The headers AutoRefreshScheduler.sendDummyMessage sends (auto-refresh-scheduler.ts). */
-const internalProbe = (id: string) => ({
+const _internalProbe = (id: string) => ({
 	...bypassProbe(id),
 	"x-better-ccflare-auto-refresh": "true",
 	"x-better-ccflare-internal-probe-secret": PROBE_SECRET,
