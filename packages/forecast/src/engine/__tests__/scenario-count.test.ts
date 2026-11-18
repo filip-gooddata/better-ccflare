@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import type { ForecastInput } from "../../types";
 import { prepareEngineContext } from "../engine";
-import type { EngineContext, Scenarios, SimulationResult } from "../model";
+import type {
+	EngineContext,
+	Scenarios,
+	SimTrace,
+	SimulationResult,
+} from "../model";
+import { levelOf } from "../percentile";
 import { scorePlan, TIER_TOLERANCE_POINTS } from "../planner";
+import { createRng } from "../rng";
 import {
 	chooseScenarioCount,
 	climbCostMs,
@@ -59,6 +66,12 @@ describe("scenario ladder and target", () => {
 		expect(SCENARIO_LADDER_TOP).toBe(1600);
 		expect(scenarioLadder()).toEqual([100, 200, 400, 800, 1600]);
 		expect(scenarioLadder(20, 80)).toEqual([20, 40, 80]);
+	});
+
+	test("a ladder that cannot double up to its top is refused", () => {
+		expect(() => scenarioLadder(0, 80)).toThrow();
+		expect(() => scenarioLadder(1, 80)).toThrow();
+		expect(() => scenarioLadder(2.5, 80)).toThrow();
 	});
 
 	test("the SE target is half the tier tolerance", () => {
@@ -183,6 +196,61 @@ describe("half-split SE", () => {
 	);
 });
 
+describe("half-split SE, numerically", () => {
+	test(
+		"is RMS(S_A - S_B) / 2 with S = min(day p10, week p10) per half",
+		async () => {
+			const ctx = await replayContext(20);
+			const base = await simulate(ctx, onDemandPlan(ctx));
+			const len = base.axis.times.length;
+			// constant lines and no unserved demand: each day's low is its line value exactly
+			const dayLow = [10, 20, 30, 40, 50, 60, 70, 80];
+			const weekLow = [85, 15, 75, 25, 65, 35, 55, 45];
+			const traces: SimTrace[] = dayLow.map((d, s) => ({
+				day: new Float32Array(len).fill(d),
+				week: new Float32Array(len).fill(weekLow[s] as number),
+				unserved: new Float32Array(len),
+				outs: [],
+				opens: [],
+				fableOutAt: [],
+			}));
+			const result: SimulationResult = { ...base, traces };
+			const splits = 5;
+			const got = halfSplitSe(ctx, result, "pin", splits);
+
+			// the heavy line is p90 of demand: quota left at p10 (planner HEAVY_LEVEL)
+			const p10 = (v: number[]) => levelOf(v, 90);
+			const rng = createRng("pin");
+			const order = dayLow.map((_, i) => i);
+			let sum = 0;
+			let sumDay = 0;
+			let sumWeek = 0;
+			for (let r = 0; r < splits; r++) {
+				for (let i = order.length - 1; i > 0; i--) {
+					const j = rng.int(i + 1);
+					[order[i], order[j]] = [order[j] as number, order[i] as number];
+				}
+				const a = order.slice(0, 4);
+				const b = order.slice(4);
+				const day = (h: number[]) => p10(h.map((i) => dayLow[i] as number));
+				const week = (h: number[]) => p10(h.map((i) => weekLow[i] as number));
+				const S = (h: number[]) => Math.min(day(h), week(h));
+				sum += (S(a) - S(b)) ** 2;
+				sumDay += (day(a) - day(b)) ** 2;
+				sumWeek += (week(a) - week(b)) ** 2;
+			}
+			expect(got.se).toBeCloseTo(Math.sqrt(sum / splits) / 2, 9);
+			expect(got.seDay).toBeCloseTo(Math.sqrt(sumDay / splits) / 2, 9);
+			expect(got.seWeek).toBeCloseTo(Math.sqrt(sumWeek / splits) / 2, 9);
+			expect(got.se).toBeGreaterThan(0);
+			expect(got.dayLowPoints).toBe(p10(dayLow));
+			expect(got.weekLowPoints).toBe(p10(weekLow));
+			expect(got.lowPoint).toBe(Math.min(p10(dayLow), p10(weekLow)));
+		},
+		TIMEOUT_MS,
+	);
+});
+
 describe("climb cost", () => {
 	test("covers the extension, the baseline and the candidate search at the next rung", () => {
 		expect(
@@ -211,6 +279,7 @@ describe("chooseScenarioCount", () => {
 			});
 			expect(out.n).toBe(20);
 			expect(out.stopReason).toBe("target-met");
+			expect(out.targetPoints).toBe(Number.POSITIVE_INFINITY);
 			expect(out.rungs.map((r) => r.n)).toEqual([20]);
 			expect(out.ctx.scenarios.units).toHaveLength(20);
 			expect(out.baseline.traces).toHaveLength(20);
@@ -272,6 +341,36 @@ describe("chooseScenarioCount", () => {
 			expect(out.stopReason).toBe("budget");
 			expect(out.rungs.map((r) => r.n)).toEqual([20, 40]);
 			expect(out.ctx.scenarios.units).toHaveLength(40);
+		},
+		TIMEOUT_MS,
+	);
+
+	test(
+		"the candidate search estimate alone can stop the climb",
+		async () => {
+			const ctx = await replayContext(20);
+			const source = rangeOf(ctx);
+			// every clock read advances 1 ms: build, simulation and SE each measure 1 ms per rung,
+			// and the deadline check after rung 20 reads 6 (16 - 6 = 10 ms left).
+			// climb to 40 costs 20 x (1/20 + 1/20) + 1 x 40/20 + searchPlans x 40 x 1/20.
+			const run = (searchPlans: number) => {
+				let t = 0;
+				return chooseScenarioCount(ctx, source, {
+					deadline: 16,
+					now: () => t++,
+					start: 20,
+					top: 80,
+					targetPoints: 0,
+					searchPlans,
+				});
+			};
+			const cheap = await run(0); // 4 ms <= 10: climbs to 40, then 6 ms > 3 left
+			const dear = await run(10); // 24 ms > 10: stays at 20
+			expect(cheap.n).toBe(40);
+			expect(cheap.stopReason).toBe("budget");
+			expect(dear.n).toBe(20);
+			expect(dear.stopReason).toBe("budget");
+			expect(dear.targetPoints).toBe(0);
 		},
 		TIMEOUT_MS,
 	);

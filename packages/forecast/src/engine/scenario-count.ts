@@ -47,6 +47,10 @@ export function scenarioLadder(
 	start = SCENARIO_LADDER_START,
 	top = SCENARIO_LADDER_TOP,
 ): number[] {
+	if (!Number.isInteger(start) || start < 2 || !Number.isInteger(top))
+		throw new Error(
+			`scenario ladder needs integer rungs from 2 up, got ${start}..${top}`,
+		);
 	const rungs: number[] = [];
 	for (let n = start; n <= top; n *= 2) rungs.push(n);
 	return rungs;
@@ -175,12 +179,18 @@ export interface ScenarioCountRung {
 	seWeek: number;
 }
 
+/**
+ * target-met: the last rung's SE is below the target. budget: the next rung was not affordable,
+ * target unmet. ladder-top: the top rung was reached with the target unmet.
+ */
 export type ScenarioCountStop = "target-met" | "budget" | "ladder-top";
 
 export interface ScenarioCount {
 	n: number;
 	rungs: ScenarioCountRung[];
 	stopReason: ScenarioCountStop;
+	/** The SE target the rungs were measured against, points. */
+	targetPoints: number;
 	/** ctx with exactly n scenario days, frozen for the candidate search. */
 	ctx: EngineContext;
 	/** The on-demand plan simulated over those n days. */
@@ -190,7 +200,10 @@ export interface ScenarioCount {
 }
 
 export interface ScenarioCountOptions {
-	/** Monotonic deadline, same clock as `now`. */
+	/**
+	 * Monotonic deadline, same clock as `now`. It gates further climbs only; the caller owns the
+	 * overall search deadline and any reserve it keeps beyond climbCostMs.
+	 */
 	deadline: number;
 	now?: () => number;
 	start?: number;
@@ -206,8 +219,8 @@ export interface ScenarioCountOptions {
 
 /**
  * Chooses N: builds and simulates the first rung, then climbs while the SE of S is at or above
- * the target, the ladder has a next rung, and the remaining time covers climbCostMs. The first
- * rung is always built, even past the deadline. ctx.scenarios is replaced by the source's days.
+ * the target, the ladder has a next rung, and the remaining time before the deadline covers
+ * climbCostMs. The first rung is always built, even past the deadline (minimum rung). ctx.scenarios is replaced by the source's days.
  */
 export async function chooseScenarioCount(
 	ctx: EngineContext,
@@ -284,6 +297,7 @@ export async function chooseScenarioCount(
 		n: built,
 		rungs,
 		stopReason,
+		targetPoints: target,
 		ctx: { ...ctx, scenarios },
 		baseline,
 		timing: {
