@@ -14,6 +14,9 @@ export type EpochMs = number;
 
 /** Width of one demand bucket. */
 export const BUCKET_MS = 5 * 60_000;
+
+/** Largest `timeShiftMin` setting (minutes); the settings range and the F2 jitter grid both end here. */
+export const TIME_SHIFT_MIN_MAX = 120;
 export const FIVE_HOUR_MS = 5 * 3_600_000;
 export const WEEK_MS = 7 * 86_400_000;
 /** Version of the HTTP contract in docs/forecast-endpoint.md. */

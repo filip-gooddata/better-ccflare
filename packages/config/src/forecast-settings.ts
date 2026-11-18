@@ -3,6 +3,7 @@ import {
 	DEFAULT_FAN_LEVELS,
 	FIXED_PERCENTILES,
 	type ForecastSettings,
+	TIME_SHIFT_MIN_MAX,
 } from "@better-ccflare/forecast";
 
 /** Config-file keys of the forecast settings (snake_case, like `session_pace_*`). */
@@ -47,7 +48,7 @@ interface NumberSpec {
 export const FORECAST_NUMBER_SETTINGS: readonly NumberSpec[] = [
 	n("prewarmMaxPerDay", "PREWARM_MAX_PER_DAY", 4, 0, 24, true),
 	n("simulatedDays", "SIMULATED_DAYS", 400, 50, 2000, true),
-	n("timeShiftMin", "TIME_SHIFT_MIN", 30, 0, 120, false),
+	n("timeShiftMin", "TIME_SHIFT_MIN", 30, 0, TIME_SHIFT_MIN_MAX, false),
 	n("minStopPoints", "MIN_STOP_POINTS", 1, 0, 100, false),
 	n("moveMinGainPoints", "MOVE_MIN_GAIN_POINTS", 2, 0, 100, false),
 	n("openMinGainPoints", "OPEN_MIN_GAIN_POINTS", 1, 0, 100, false),

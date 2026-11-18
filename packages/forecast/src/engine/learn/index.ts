@@ -1,4 +1,4 @@
-import { WORK_START_RECENT_DAYS } from "../days";
+import { demandLookbackDays, WORK_START_RECENT_DAYS } from "../days";
 import { PRESENT_PARTITION } from "./partition";
 import { scoreBandwidth } from "./rows/bandwidth";
 import { scoreDaytypes } from "./rows/daytypes";
@@ -34,7 +34,7 @@ export function presentDemand(settings: DemandSettings): LearnedDemand {
 		choices: [],
 		partition: PRESENT_PARTITION,
 		poolTau: "hard3",
-		lookbackDays: settings.historyLookbackDays,
+		lookbackDays: demandLookbackDays(settings.historyLookbackDays),
 		halfLifeDays: settings.historyHalfLifeDays,
 		workStartSharePct: settings.workStartSharePct,
 		workStartSample: WORK_START_RECENT_DAYS,

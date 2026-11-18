@@ -1,3 +1,4 @@
+import { demandLookbackDays } from "../../days";
 import { learnDays } from "../daily";
 import type { LearnInput, RowScores } from "../types";
 import { demandLosses, gridPreference } from "./demand-crps";
@@ -5,7 +6,7 @@ import { demandLosses, gridPreference } from "./demand-crps";
 const STEP = 14;
 const FIRST = 28;
 
-/** Row 4 grid: 14k from 28 up to the setting, plus the setting; never above it. */
+/** Row 4 grid: 14k from 28 up to the (capped) setting, plus the setting; never above it. */
 export function lookbackCandidates(setting: number): number[] {
 	const out: number[] = [];
 	for (let w = FIRST; w < setting; w += STEP) out.push(w);
@@ -18,7 +19,7 @@ export function lookbackCandidates(setting: number): number[] {
  * hard3 pool of training days within |distance| <= W, at the half-life setting.
  */
 export function scoreLookback(input: LearnInput): RowScores<number> {
-	const setting = input.historyLookbackDays;
+	const setting = demandLookbackDays(input.historyLookbackDays);
 	const candidates = lookbackCandidates(setting);
 	const present = candidates.length - 1;
 	const days = learnDays(input.series, input.now, input.workDays);

@@ -1,5 +1,5 @@
 import { recencyWeight } from "../../calibration";
-import { poolFor } from "../../days";
+import { demandLookbackDays, poolFor } from "../../days";
 import type { DayType, RecordedDay } from "../../model";
 import { type LearnDay, learnDays, lowoFolds } from "../daily";
 import type { LearnInput } from "../types";
@@ -28,14 +28,17 @@ function typeOf(d: LearnDay, workDays: number): DayType {
 /**
  * Scenario pools of rows 18 and 20 at the present values of the other rows: for each
  * uncensored held-out day, the training days of its leave-one-ISO-week-out fold inside
- * the lookback (distance at most `historyLookbackDays`), weighted
+ * the lookback (distance at most `historyLookbackDays`, capped at 84), weighted
  * 0.5^(distance / historyHalfLifeDays) as `days.ts` weights by age, pooled by the
  * held-out day's type through `poolFor` (monday and workday together below 3 days),
  * and every training day when that pool is empty (the `scenarios.ts` fallback).
  */
 export function scenarioPools(input: LearnInput): ScenarioPools {
 	const days = learnDays(input.series, input.now, input.workDays);
-	const lookback = Math.max(0, Math.floor(input.historyLookbackDays));
+	const lookback = Math.max(
+		0,
+		Math.floor(demandLookbackDays(input.historyLookbackDays)),
+	);
 	const held: HeldOutPool[] = [];
 	for (const fold of lowoFolds(days)) {
 		for (const h of fold.heldOut) {
