@@ -346,6 +346,35 @@ describe("chooseScenarioCount", () => {
 	);
 
 	test(
+		"with a finite target, stops at the smallest rung whose SE is below it",
+		async () => {
+			const ctx = await replayContext(20);
+			const ladder = { start: 20, top: 160 };
+			const all = await chooseScenarioCount(ctx, rangeOf(ctx), {
+				deadline: Number.POSITIVE_INFINITY,
+				...ladder,
+				targetPoints: 0,
+			});
+			const ses = all.rungs.map((r) => r.se);
+			// a target just above the lowest SE past the first rung, below the first rung's SE
+			const target = Math.min(...ses.slice(1)) + 1e-9;
+			expect(target).toBeLessThan(ses[0] as number);
+			const expected = all.rungs.find((r) => r.se < target)?.n;
+			expect(expected).toBeGreaterThan(20);
+
+			const out = await chooseScenarioCount(ctx, rangeOf(ctx), {
+				deadline: Number.POSITIVE_INFINITY,
+				...ladder,
+				targetPoints: target,
+			});
+			expect(out.n).toBe(expected as number);
+			expect(out.stopReason).toBe("target-met");
+			expect(out.rungs).toEqual(all.rungs.filter((r) => r.n <= out.n));
+		},
+		TIMEOUT_MS,
+	);
+
+	test(
 		"the candidate search estimate alone can stop the climb",
 		async () => {
 			const ctx = await replayContext(20);
