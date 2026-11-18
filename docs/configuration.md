@@ -129,7 +129,6 @@ The interruption forecast is served at `GET /api/forecast` (see [Get Forecast](#
 | `openMinGainPoints` | `FORECAST_OPEN_MIN_GAIN_POINTS` | `forecast_open_min_gain_points` | `1` | 0–100 |
 | `historyHalfLifeDays` | `FORECAST_HISTORY_HALF_LIFE_DAYS` | `forecast_history_half_life_days` | `14` | 1–365 |
 | `historyLookbackDays` | `FORECAST_HISTORY_LOOKBACK_DAYS` | `forecast_history_lookback_days` | `84` | integer 7–365 |
-| `recentTauMin` | `FORECAST_RECENT_TAU_MIN` | `forecast_recent_tau_min` | `45` | 1–720 |
 | `sessionTurnoverMin` | `FORECAST_SESSION_TURNOVER_MIN` | `forecast_session_turnover_min` | `60` | 1–1440 |
 | `workStartSharePct` | `FORECAST_WORK_START_SHARE_PCT` | `forecast_work_start_share_pct` | `5` | 1–50 |
 | `paceConditioning` | `FORECAST_PACE_CONDITIONING` | `forecast_pace_conditioning` | `true` | boolean |

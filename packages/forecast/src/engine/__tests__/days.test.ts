@@ -48,7 +48,6 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		openMinGainPoints: 1,
 		historyHalfLifeDays: 14,
 		historyLookbackDays: 28,
-		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,

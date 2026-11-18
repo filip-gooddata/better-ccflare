@@ -51,7 +51,6 @@ function settings(over: Partial<ForecastSettings> = {}): ForecastSettings {
 		openMinGainPoints: 1,
 		historyHalfLifeDays: 14,
 		historyLookbackDays: 28,
-		recentTauMin: 60,
 		sessionTurnoverMin: 60,
 		workStartSharePct: 5,
 		paceConditioning: true,
@@ -230,7 +229,6 @@ describe("buildScenarios", () => {
 	test("noise off: every later-date simulated day is one recorded day of its pool, bucket for bucket", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 60,
-			recentTauMin: 0.001,
 		});
 		const sc = await buildScenarios(
 			input,
@@ -277,7 +275,6 @@ describe("buildScenarios", () => {
 		// τ = 60: a last-hour blend, were one left, would move today's first hours
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 40,
-			recentTauMin: 60,
 		});
 		const off = await buildScenarios(
 			input,
@@ -320,7 +317,6 @@ describe("buildScenarios", () => {
 	test("a burst in the last hour of history leaves the plain lines unchanged: no fixed 60-minute recent window", async () => {
 		const { input, horizon } = setup(NOW, {
 			simulatedDays: 20,
-			recentTauMin: 60,
 		});
 		const burst: ForecastInput = {
 			...input,
@@ -441,7 +437,6 @@ describe("buildScenarios", () => {
 	test("noise on draws the same days as noise off (same random stream), scaled", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 30,
-			recentTauMin: 0.001,
 			timeShiftMin: 0,
 		});
 		const off = await buildScenarios(
@@ -478,7 +473,6 @@ describe("buildScenarios", () => {
 	test("deterministic for one local day; another local day draws differently", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 40,
-			recentTauMin: 0.001,
 		});
 		const a = await buildScenarios(
 			input,
@@ -499,7 +493,6 @@ describe("buildScenarios", () => {
 		// same day, an hour later: the same draws for later dates
 		const later = setup(NOW + 3_600_000, {
 			simulatedDays: 40,
-			recentTauMin: 0.001,
 		});
 		const c = await buildScenarios(
 			later.input,
@@ -532,7 +525,7 @@ describe("buildScenarios", () => {
 	});
 
 	test("a longer horizon leaves the draws of the shared dates unchanged", async () => {
-		const input = makeInput(NOW, { simulatedDays: 30, recentTauMin: 0.001 });
+		const input = makeInput(NOW, { simulatedDays: 30 });
 		const table = buildDayTable(input);
 		const short = computeHorizon(NOW, [account(NOW + 2 * DAY)], TZ);
 		const long = computeHorizon(NOW, [account(NOW + 7 * DAY)], TZ);
@@ -548,7 +541,6 @@ describe("buildScenarios", () => {
 	test("a date whose pool is empty draws from all recorded days", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 20,
-			recentTauMin: 0.001,
 		});
 		const noWeekends: DayTable = {
 			...table,
@@ -580,7 +572,7 @@ describe("buildScenarios", () => {
 	});
 
 	test("weekends without buckets are recorded zero days: the fallback does not fire", async () => {
-		const input = makeInput(NOW, { simulatedDays: 20, recentTauMin: 0.001 });
+		const input = makeInput(NOW, { simulatedDays: 20 });
 		const weekdaysOnly: ForecastInput = {
 			...input,
 			history: input.history.filter(
@@ -611,7 +603,6 @@ describe("buildScenarios", () => {
 	test("time noise shifts the recorded day by whole buckets within ±timeShiftMin", async () => {
 		const { input, table, horizon } = setup(NOW, {
 			simulatedDays: 60,
-			recentTauMin: 0.001,
 			timeShiftMin: 30,
 		});
 		// equal totals: zero scale bandwidth, so only the time shift acts
@@ -665,7 +656,6 @@ describe("buildScenarios", () => {
 		const now = Date.UTC(2026, 2, 27, 9, 0);
 		const { input, table, horizon } = setup(now, {
 			simulatedDays: 20,
-			recentTauMin: 0.001,
 		});
 		const sc = await buildScenarios(
 			input,
@@ -794,7 +784,7 @@ describe("scale noise: shrunk smoothed bootstrap (Silverman and Young 1987)", ()
 	async function futureDateLogTotals(
 		noiseMode: "shrunk" | "unshrunk" | "off",
 	): Promise<{ logs: number[]; pool: RecordedDay[] }> {
-		const input = makeInput(NOW, { recentTauMin: 0.001 });
+		const input = makeInput(NOW);
 		const table = buildDayTable(input);
 		const horizon = computeHorizon(NOW, input.accounts, TZ);
 		const todayStart = localDayStart(NOW, TZ);

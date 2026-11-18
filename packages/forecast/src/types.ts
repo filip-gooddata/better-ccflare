@@ -185,8 +185,6 @@ export interface ForecastSettings {
 	/** Recency weighting of recorded days. */
 	historyHalfLifeDays: number;
 	historyLookbackDays: number;
-	/** Time constant of the blend from the last hour's rate into the recorded day. */
-	recentTauMin: number;
 	/** Time constant with which demand detaches from the sessions that carry it now. */
 	sessionTurnoverMin: number;
 	/** Work start: the local minute by which this percent of a work day's demand has been used (median over recent work days). */
