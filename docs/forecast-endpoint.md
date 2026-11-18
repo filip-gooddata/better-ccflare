@@ -1,11 +1,11 @@
-> This is a copy of spec revision 8 of the forecast endpoint contract, the source of truth for the
+> This is a copy of spec revision 9 of the forecast endpoint contract, the source of truth for the
 > `GET /api/forecast` response. The validator in `packages/forecast/src/contract/validate.ts` enforces it.
 > The settings are described in [configuration.md](configuration.md#forecast-settings).
 > How the proxy computes, serves and routes by the forecast: [routing-architecture.md](routing-architecture.md#interruption-forecast).
 
 # Forecast endpoint of the proxy
 
-Contract version 1 · spec revision 8 · 2026-11-16 · written by the proxy forecast session (its only writer).
+Contract version 1 · spec revision 9 · 2026-11-18 · written by the proxy forecast session (its only writer).
 
 Status: specification written before the implementation. It answers `forecast-ui-data-needs.md` Draft 4. Any field
 change bumps the spec revision, is listed in the change log at the end, and is announced to the supervisor. A
@@ -158,10 +158,12 @@ The routing planner plans against `heavy` (p90). That is unchanged by the extra 
 | `day.stopNow` | `{ start, end }` or `null` (section 5). |
 | `day.pastStops` | List of `{ start, end }`, today's ended stops. |
 | `day.shortfall` | `null`, or `{ stop, points, lastAccount, perAccount }` for one stop: `stopNow` if there is one, else the first `typical` stop. `stop` = that stop's `{ start, end }`. `points` = the demand expected inside it that cannot be served (median over the simulated days; for `stopNow`, counted from `computedAt`). `lastAccount` = the account that runs out last before the stop (for `stopNow`: the one that did). `perAccount` = `{ "<id>": points }`, the spill rule: `lastAccount` gets as much as fits its fill (its used share at `computedAt`: 100 minus the lower of its 5-hour quota left and its weekly quota left in 5-hour points, as in section 3; 0 when no 5-hour window is open and the weekly limit does not lower the value; a running cooldown does not enter the fill), the rest goes to the other accounts in reverse order of running out, each capped the same way; anything still left over is added to `lastAccount`, so the parts always sum to `points`. |
+| `day.stopChance` | Optional. The share of the simulated days, from 0 to 1 in two decimals, on which the stop rule of section 5 lists at least one stop between `computedAt` and the block's end. Each day's own line is read on its own, with `minStopPoints` applied. It answers "will I be stopped at some point in this span", not "what is the most likely state at this moment": the typical line and its stops answer the second question, so a block can show no typical stop while `stopChance` is above 0.5. It is 1 while `stopNow` is set. Absent or null means the server does not report it. |
+| `day.likelyStop` | Optional. `{ start, minutes }` when `stopChance` is at least 0.5 and no stop is running, else `null`. `start` = the median start of the first stop on the days that stop; `minutes` = the median length of that first stop, in whole minutes and at least 1, a stop that reaches the block's end counting only up to that end. The two medians are taken separately. It describes the typical stop on the days that do stop. It can differ from the typical line's own stops, which say what is most likely at each moment, and it usually starts earlier than they do. Clients show its timing whenever it is non-null; during `stopNow` they show `stopNow` instead. |
 | `week.past` | As `day.past` for the pooled weekly quota left, from Monday 00:00 local, at most one entry per 30 minutes plus jumps. |
 | `week.times` | `computedAt`, then every full hour, to the later of Friday 24:00 local and the last weekly reset of a counted account (at most 7 days ahead), plus exact jumps and zero points. |
 | `week.light`, `week.typical`, `week.heavy`, `week.fan` | As for `day`, for the weekly quantity. |
-| `week.stops`, `week.stopNow`, `week.pastStops`, `week.shortfall` | As for `day`, for the weekly limits, in points of a weekly limit. `end` = the first weekly reset that brings quota back. |
+| `week.stops`, `week.stopNow`, `week.pastStops`, `week.shortfall`, `week.stopChance`, `week.likelyStop` | As for `day`, for the weekly limits, in points of a weekly limit. `end` = the first weekly reset that brings quota back. |
 | `fable` | `{ "<id>": { "outAt": time or null } }` per counted account: when its weekly Fable sub-limit reaches 100 % on the typical projection (the median over the simulated days, rounded down to the hour), or `null` when at least half of the simulated days reach its reset first. Display only; routing keeps the 90 % Fable guard. |
 
 | `prewarm` | Optional. Diagnostics of the window pre-warm, for the pre-warm test and for operators; the UI ignores it. `{ enabled, planned: [{ accountId, openAt }], last: [{ accountId, kind, scheduledAt, firedAt, exitCode, windowOpened, resetsAt }] }`. `enabled` = setting `forecast.prewarm`. `planned` = the window openings in the current plan, each with its planned time: made by a pre-warm request when `enabled` is true, and by routing the first new demand to that account from that time when `enabled` is false. `last` = the most recent pre-warm requests, newest first (at most 20): `kind` is `"plan"` or `"test"`, `windowOpened` is `true`/`false` once a later usage reading has shown whether the 5-hour window opened, `null` before that; `resetsAt` is that window's reset. Present whenever the forecast is switched on, also when `available` is false. |
@@ -292,6 +294,12 @@ for the record.
 7. **Level lines are not single days** (section 4): spread-out rises where a window's opening time depends on demand.
 
 ## Change log
+
+- Revision 9, 2026-11-18 (ships in pace.12): two optional fields added in `day` and `week`, nothing removed,
+  renamed or retyped. `stopChance`: the chance of being stopped at some point in the block's span, over the
+  simulated days. `likelyStop`: when that chance is at least 0.5, the median start and length of the first stop
+  on the days that stop. Both answer a different question from the typical line, which shows the most likely
+  state at each moment. `contractVersion` stays 1.
 
 - Revision 8, 2026-11-16 (ships in pace.11): values only; no field added, removed, renamed or retyped. The
   default history window is 84 days instead of 56 (`historyLookbackDays`): section 3 now says the calibrations
