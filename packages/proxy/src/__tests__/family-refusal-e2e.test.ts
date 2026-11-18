@@ -18,13 +18,13 @@ import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, LoadBalancingStrategy } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import { clearLimitRefusalCache } from "../handlers/limit-response";
 import {
 	blockFamily,
 	clearFamilyBlocks,
 	clearFamilyExhaustionCache,
 	getFamilyBlock,
 } from "../handlers/model-capacity";
-import { clearLimitRefusalCache } from "../handlers/limit-response";
 import { resetRateLimitProbeGatesForTests } from "../handlers/rate-limit-cooldown";
 import { clearVisionCapability } from "../handlers/vision-capability";
 import { handleProxy } from "../proxy";
@@ -375,23 +375,6 @@ async function send(ctx: ProxyContext, request: Request) {
 	} catch (error) {
 		return error as Error;
 	}
-}
-
-/** Status, every upstream header and the body bytes reach the client unchanged. */
-async function expectUpstreamRefusal(
-	received: Response | Error,
-	expected: Refusal,
-) {
-	expect(received).toBeInstanceOf(Response);
-	const response = received as Response;
-	expect(response.status).toBe(expected.status);
-	for (const [name, value] of Object.entries(expected.headers)) {
-		if (HOP_BY_HOP.has(name)) continue;
-		expect([name, response.headers.get(name)]).toEqual([name, value]);
-	}
-	const text = await response.text();
-	expect(text).toBe(expected.body);
-	expect(text).not.toContain("model_family_exhausted");
 }
 
 const retryAfterFor = (resetAt: number) =>
