@@ -916,6 +916,8 @@ curl -X POST http://localhost:8080/api/config/force-account-model \
 
 The stored `use_extra_usage` value. **It no longer does anything**: a full five-hour, weekly or model-family limit is final, whatever extra usage or spend says. Still accepted and stored so old clients keep working; `ignored` is always `true`. `CCFLARE_USE_EXTRA_USAGE` can only seed the stored value once — see [Use Extra Usage](configuration.md#use-extra-usage) in configuration.md.
 
+The forced-account request header `x-better-ccflare-account-id` cannot get around this. It no longer bypasses a full five-hour, weekly or model-family limit: ordinary traffic forced to a full account falls back to normal selection, then gets the local 429 when nothing remains, and an auto-refresh probe forced to it gets that account's local 429. An account benched because a response carried `overage-in-use: true` is treated the same way. See [Forced account and probes at a full limit](routing-architecture.md#session-pace-sessionpacestrategy).
+
 **Response:**
 ```json
 { "enabled": false, "source": "default", "ignored": true, "note": "use_extra_usage no longer does anything: ..." }
