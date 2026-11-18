@@ -360,9 +360,9 @@ export function openingGrid(ctx: EngineContext): EpochMs[] {
 	return quarterHourGrid(ctx.now, ctx.horizon.fineEnd, ctx.timeZone);
 }
 
+/** A simulated plan and its score. The simulation itself (about 9 MB for 400 days) is not kept. */
 interface Evaluated {
 	plan: SimPlan;
-	result: SimulationResult;
 	score: PlanScore;
 }
 
@@ -409,14 +409,18 @@ export async function planForecast(
 		cutByDeadline = true;
 		return false;
 	};
+	// Scores only: the search simulates hundreds of plans, and keeping every simulation would hold
+	// gigabytes. The baseline's simulation is kept; the chosen plan's is simulated again at the end.
 	const cache = new Map<string, Evaluated>();
+	let baselineResult: SimulationResult | null = null;
 	const evaluate = async (plan: SimPlan): Promise<Evaluated> => {
 		const key = planKey(plan);
 		const known = cache.get(key);
 		if (known) return known;
 		if (cache.size > 0) await yieldToEventLoop();
 		const result = await simulate(ctx, plan);
-		const evaluated = { plan, result, score: scorePlan(ctx, result, plan) };
+		baselineResult ??= result;
+		const evaluated = { plan, score: scorePlan(ctx, result, plan) };
 		cache.set(key, evaluated);
 		return evaluated;
 	};
@@ -598,6 +602,11 @@ export async function planForecast(
 	const openAt: Record<string, EpochMs | null> = {};
 	for (const j of closed)
 		openAt[ctx.accounts[j].accountId] = best.plan.openAt[j] ?? null;
+	if (baselineResult === null) throw new Error("baseline not simulated");
+	const baselineSim: SimulationResult = baselineResult;
+	// The simulation is deterministic for one context, so the chosen plan's is the one it was scored on.
+	const bestResult =
+		best === baseline ? baselineSim : await simulate(ctx, best.plan);
 
 	return {
 		plan: {
@@ -607,9 +616,9 @@ export async function planForecast(
 			moves: move ? [move] : [],
 			workStartMinute: ctx.workStartMinute,
 		},
-		result: best.result,
+		result: bestResult,
 		score: best.score,
-		baseline: { result: baseline.result, score: baseline.score },
+		baseline: { result: baselineSim, score: baseline.score },
 		candidates: cache.size,
 		scored: [...cache.values()].map(({ plan, score }) => ({ plan, score })),
 		search: {
