@@ -15,28 +15,29 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { EpochMs, ForecastBlock, ForecastInput } from "../../types";
-import { createForecastEngine, prepareEngineContext } from "../engine";
+import { createForecastEngine } from "../engine";
 import type { EngineContext, SimulationResult } from "../model";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
 import { onDemandPlan, simulate } from "../simulate";
 import {
+	REPLAY_ENGINE,
+	integratedContext,
 	buildInput,
 	defaultSettings,
 	prague,
 	replayFixture,
 } from "./fixtures-engine";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const MIN = 60_000;
 const FIVE_HOURS = 5 * 60 * MIN;
-// Each test simulates 400 days, some several plans; the default 5 s is short under a loaded full suite.
-const REPLAY_TIMEOUT_MS = 60_000;
+// Each test simulates the rule's N (1600 days here), some several plans and computes.
+const REPLAY_TIMEOUT_MS = FULL_GRID_TIMEOUT_MS;
 
+/** The context compute() plans on: the scenario-count rule's N over the ladder's top rung. */
 async function contextOf(input: ForecastInput): Promise<EngineContext> {
-	const ctx = await prepareEngineContext(input, { noise: true });
-	if (ctx === "insufficient_history")
-		throw new Error("fixture has no forecast");
-	return ctx;
+	return (await integratedContext(input)).ctx;
 }
 
 /** acct-b's first opening on every simulated day. */
@@ -68,33 +69,50 @@ function typicalRises(block: ForecastBlock): { from: EpochMs; to: EpochMs }[] {
 
 const openAtOf = (at: EpochMs | null) => [null, at];
 
+describe("2026-11-12 replay: the scenario count (row 21)", () => {
+	test(
+		"at 07:00 the rule climbs the whole ladder to 1600 days: the SE of S stays above the 0.25 target",
+		async () => {
+			const { count } = await integratedContext(buildInput(replayFixture()));
+			expect(count.n).toBe(1600);
+			expect(count.stopReason).toBe("ladder-top");
+			expect(count.targetPoints).toBe(0.25);
+			expect(count.rungs.map((r) => r.n)).toEqual([100, 200, 400, 800, 1600]);
+			const se = [1.674, 1.29, 1.269, 0.94, 0.623];
+			for (const [i, r] of count.rungs.entries())
+				expect(r.se).toBeCloseTo(se[i] as number, 3);
+		},
+		REPLAY_TIMEOUT_MS,
+	);
+});
+
 describe("2026-11-12 replay through compute()", () => {
 	test(
-		"on demand the idle acct-b opens at 07:00 on every simulated day (amendment 5, E1); S +13.7, no stop",
+		"on demand the idle acct-b opens at 07:00 on every simulated day (amendment 5, E1); S +14.2, no stop",
 		async () => {
 			const ctx = await contextOf(buildInput(replayFixture()));
 			const { baseline } = await planForecast(ctx);
 			const base = buildResponse(ctx, baseline.result).day as ForecastBlock;
 
 			const opens = firstOpensOfB(baseline.result);
-			expect(opens).toHaveLength(400);
+			expect(opens).toHaveLength(1600);
 			for (const at of opens) expect(at).toBe(prague(12, 7));
-			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
-			expect(baseline.score.dayLowPoints).toBeCloseTo(13.67, 1);
-			expect(baseline.score.weekLowPoints).toBeCloseTo(80.3, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(14.16, 1);
+			expect(baseline.score.dayLowPoints).toBeCloseTo(14.16, 1);
+			expect(baseline.score.weekLowPoints).toBeCloseTo(80.2, 1);
 			expect(base.stops.heavy).toEqual([]);
 			expect(base.stops.typical).toEqual([]);
-			expect(Math.min(...base.heavy)).toBeCloseTo(13.7, 1);
-			expect(Math.min(...base.typical)).toBeCloseTo(27.6, 1);
+			expect(Math.min(...base.heavy)).toBeCloseTo(14.2, 1);
+			expect(Math.min(...base.typical)).toBeCloseTo(27.0, 1);
 		},
 		REPLAY_TIMEOUT_MS,
 	);
 
 	test(
-		"pre-warm off: the plan holds acct-b closed until 08:30 (E3), S +76.9 against +13.7 on demand; no stop is left",
+		"pre-warm off: the plan holds acct-b closed until 08:30 (E3), S +76.7 against +14.2 on demand; no stop is left",
 		async () => {
 			const input = buildInput(replayFixture());
-			const result = await createForecastEngine().compute(input);
+			const result = await createForecastEngine(REPLAY_ENGINE).compute(input);
 			if (!result.available) throw new Error(result.reason);
 			const day = result.response.day as ForecastBlock;
 
@@ -113,19 +131,19 @@ describe("2026-11-12 replay through compute()", () => {
 			expect(result.plan.placement).toEqual({
 				tiers: [["acct-a"], ["acct-b"]],
 				rule: "forecast-lookahead",
-				reason: "low-point+63.2",
+				reason: "low-point+62.6",
 			});
 			expect(plan.placement).toEqual(result.plan.placement);
 			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8, 30));
-			expect(score.lowPoint).toBeCloseTo(76.91, 1);
-			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
-			expect(score.lowPoint - baseline.score.lowPoint).toBeCloseTo(63.24, 1);
+			expect(score.lowPoint).toBeCloseTo(76.72, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(14.16, 1);
+			expect(score.lowPoint - baseline.score.lowPoint).toBeCloseTo(62.56, 1);
 			expect(day.stops.heavy).toEqual([]);
 			expect(day.stops.typical).toEqual([]);
-			expect(Math.min(...day.typical)).toBeCloseTo(87.9, 1);
+			expect(Math.min(...day.typical)).toBeCloseTo(87.5, 1);
 
 			// Every opening time searched, the baseline first. Opening at 07:00 is on demand itself; the
-			// old 10:00 opening now scores −3.3 (its heavy stops count below zero).
+			// old 10:00 opening now scores −4.8 (its heavy stops count below zero).
 			expect(scored[0].plan).toEqual(onDemandPlan(ctx));
 			const sOf = (at: EpochMs) =>
 				scored.find(
@@ -133,29 +151,29 @@ describe("2026-11-12 replay through compute()", () => {
 						s.plan.preferred === null &&
 						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
 				)?.score.lowPoint;
-			expect(sOf(prague(12, 7))).toBeCloseTo(13.67, 1);
-			expect(sOf(prague(12, 7, 30))).toBeCloseTo(37.22, 1);
-			expect(sOf(prague(12, 8))).toBeCloseTo(59.82, 1);
+			expect(sOf(prague(12, 7))).toBeCloseTo(14.16, 1);
+			expect(sOf(prague(12, 7, 30))).toBeCloseTo(37.48, 1);
+			expect(sOf(prague(12, 8))).toBeCloseTo(60.62, 1);
 			// the quarter-hour grid and its 5-minute refinement around the peak
-			expect(sOf(prague(12, 8, 15))).toBeCloseTo(71.02, 1);
-			expect(sOf(prague(12, 8, 25))).toBeCloseTo(76.06, 1);
-			expect(sOf(prague(12, 8, 30))).toBeCloseTo(76.91, 1);
-			expect(sOf(prague(12, 8, 35))).toBeCloseTo(76.5, 1);
-			expect(sOf(prague(12, 8, 45))).toBeCloseTo(69.01, 1);
-			expect(sOf(prague(12, 9))).toBeCloseTo(52.5, 1);
-			expect(sOf(prague(12, 10))).toBeCloseTo(-3.49, 1);
+			expect(sOf(prague(12, 8, 15))).toBeCloseTo(71.41, 1);
+			expect(sOf(prague(12, 8, 25))).toBeCloseTo(75.84, 1);
+			expect(sOf(prague(12, 8, 30))).toBeCloseTo(76.72, 1);
+			expect(sOf(prague(12, 8, 35))).toBeCloseTo(76.2, 1);
+			expect(sOf(prague(12, 8, 45))).toBeCloseTo(68.71, 1);
+			expect(sOf(prague(12, 9))).toBeCloseTo(52.6, 1);
+			expect(sOf(prague(12, 10))).toBeCloseTo(-4.77, 1);
 			expect(sOf(prague(12, 11))).toBeCloseTo(-25.2, 1);
 		},
 		REPLAY_TIMEOUT_MS,
 	);
 
 	test(
-		"the gate: with openMinGainPoints above the 63.2 gain the hold is not taken; at 63 it is",
+		"the gate: with openMinGainPoints above the 62.6 gain the hold is not taken; at 62 it is",
 		async () => {
-			const above = await createForecastEngine().compute(
+			const above = await createForecastEngine(REPLAY_ENGINE).compute(
 				buildInput(
 					replayFixture({
-						settings: defaultSettings({ openMinGainPoints: 64 }),
+						settings: defaultSettings({ openMinGainPoints: 63 }),
 					}),
 				),
 			);
@@ -164,22 +182,22 @@ describe("2026-11-12 replay through compute()", () => {
 			const ctx = await contextOf(
 				buildInput(
 					replayFixture({
-						settings: defaultSettings({ openMinGainPoints: 64 }),
+						settings: defaultSettings({ openMinGainPoints: 63 }),
 					}),
 				),
 			);
 			const { score, baseline } = await planForecast(ctx);
 			expect(score.lowPoint).toBe(baseline.score.lowPoint);
 
-			const at63 = await createForecastEngine().compute(
+			const at62 = await createForecastEngine(REPLAY_ENGINE).compute(
 				buildInput(
 					replayFixture({
-						settings: defaultSettings({ openMinGainPoints: 63 }),
+						settings: defaultSettings({ openMinGainPoints: 62 }),
 					}),
 				),
 			);
-			if (!at63.available) throw new Error(at63.reason);
-			expect(at63.plan.openAt).toEqual({ "acct-b": prague(12, 8, 30) });
+			if (!at62.available) throw new Error(at62.reason);
+			expect(at62.plan.openAt).toEqual({ "acct-b": prague(12, 8, 30) });
 		},
 		REPLAY_TIMEOUT_MS,
 	);
@@ -220,8 +238,8 @@ describe("2026-11-12 replay through compute()", () => {
 		"determinism: the same input gives the same result twice",
 		async () => {
 			const input = buildInput(replayFixture());
-			const a = await createForecastEngine().compute(input);
-			const b = await createForecastEngine().compute(input);
+			const a = await createForecastEngine(REPLAY_ENGINE).compute(input);
+			const b = await createForecastEngine(REPLAY_ENGINE).compute(input);
 			expect(JSON.stringify(b)).toBe(JSON.stringify(a));
 			const ctx = await contextOf(input);
 			const plan = onDemandPlan(ctx);
@@ -231,18 +249,18 @@ describe("2026-11-12 replay through compute()", () => {
 	);
 
 	test(
-		"pre-warm on: the same plan as pre-warm off (hold acct-b to 08:30, S +76.9); the extra pre-warm openings do not win",
+		"pre-warm on: the same plan as pre-warm off (hold acct-b to 08:30, S +76.7); the extra pre-warm openings do not win",
 		async () => {
 			const input = buildInput(
 				replayFixture({ settings: defaultSettings({ prewarm: true }) }),
 			);
-			const result = await createForecastEngine().compute(input);
+			const result = await createForecastEngine(REPLAY_ENGINE).compute(input);
 			if (!result.available) throw new Error(result.reason);
 			expect(result.plan.openAt).toEqual({ "acct-b": prague(12, 8, 30) });
 			expect(result.plan.placement).toEqual({
 				tiers: [["acct-a"], ["acct-b"]],
 				rule: "forecast-lookahead",
-				reason: "low-point+63.2",
+				reason: "low-point+62.6",
 			});
 
 			const ctx = await contextOf(input);
@@ -253,8 +271,8 @@ describe("2026-11-12 replay through compute()", () => {
 				candidates,
 				result: sim,
 			} = await planForecast(ctx);
-			expect(score.lowPoint).toBeCloseTo(76.91, 1);
-			expect(baseline.score.lowPoint).toBeCloseTo(13.67, 1);
+			expect(score.lowPoint).toBeCloseTo(76.72, 1);
+			expect(baseline.score.lowPoint).toBeCloseTo(14.16, 1);
 			for (const at of firstOpensOfB(sim)) expect(at).toBe(prague(12, 8, 30));
 			// the same quarter-hour grid as pre-warm off, across the night; more peaks, so more refinement
 			expect(candidates).toBe(147);
@@ -264,8 +282,8 @@ describe("2026-11-12 replay through compute()", () => {
 						s.plan.preferred === null &&
 						JSON.stringify(s.plan.openAt) === JSON.stringify(openAtOf(at)),
 				)?.score.lowPoint;
-			expect(sOf(prague(12, 7, 15))).toBeCloseTo(25.56, 1);
-			expect(sOf(prague(13, 3, 15))).toBeCloseTo(-22.45, 1);
+			expect(sOf(prague(12, 7, 15))).toBeCloseTo(25.8, 1);
+			expect(sOf(prague(13, 3, 15))).toBeCloseTo(-22.64, 1);
 			const day = result.response.day as ForecastBlock;
 			expect(day.stops.heavy).toEqual([]);
 			expect(day.stops.typical).toEqual([]);
@@ -276,7 +294,7 @@ describe("2026-11-12 replay through compute()", () => {
 	test(
 		"the response covers the morning state: acct-a's 11:00 reset is a jump, day ends at midnight",
 		async () => {
-			const result = await createForecastEngine().compute(
+			const result = await createForecastEngine(REPLAY_ENGINE).compute(
 				buildInput(replayFixture()),
 			);
 			if (!result.available) throw new Error(result.reason);
