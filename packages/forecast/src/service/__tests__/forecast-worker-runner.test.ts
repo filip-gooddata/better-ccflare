@@ -4,7 +4,10 @@ import {
 	createForecastWorkerRunner,
 	type ForecastWorkerRunner,
 } from "../forecast-worker-runner";
-import { createPaceRefitRunner } from "../pace-refit-runner";
+import {
+	createPaceRefitRunner,
+	type RefitDemandSettings,
+} from "../pace-refit-runner";
 
 const FIXTURE = new URL("./fixtures/test-forecast-worker.ts", import.meta.url)
 	.href;
@@ -16,6 +19,14 @@ const fixtureRunner = (): ForecastWorkerRunner =>
 		embeddedCode: async () => "",
 	});
 
+const DEMAND: RefitDemandSettings = {
+	workDays: 5,
+	historyLookbackDays: 84,
+	historyHalfLifeDays: 14,
+	workStartSharePct: 5,
+	timeShiftMin: 30,
+};
+
 const series = (timeZone: string, n = 24): PaceSeries => ({
 	start: T0 - n * 300_000,
 	units: new Float64Array(n).fill(1),
@@ -26,13 +37,26 @@ const series = (timeZone: string, n = 24): PaceSeries => ({
 describe("forecast worker runner: the refit job", () => {
 	it("returns the fitted state and transfers the series buffers", async () => {
 		const s = series("Europe/Prague", 48);
-		const outcome = await createPaceRefitRunner(fixtureRunner()).run(s, T0, {
-			timeoutMs: 10_000,
-		});
+		const outcome = await createPaceRefitRunner(fixtureRunner()).run(
+			s,
+			T0,
+			DEMAND,
+			{
+				timeoutMs: 10_000,
+			},
+		);
 		expect(outcome.status).toBe("ok");
 		if (outcome.status !== "ok") return;
 		expect(outcome.state.fittedAt).toBe(T0);
 		expect(outcome.state.days).toBe(48);
+		// the fixture echoes the demand settings it received as served values
+		expect(outcome.learned).toMatchObject({
+			poolTau: "hard3",
+			lookbackDays: 84,
+			halfLifeDays: 14,
+			workStartSharePct: 5,
+			jitterMin: 30,
+		});
 		expect(outcome.ms).toBeGreaterThanOrEqual(0);
 		// transferred, not copied: the caller's buffers are detached
 		expect(s.units.byteLength).toBe(0);
@@ -43,6 +67,7 @@ describe("forecast worker runner: the refit job", () => {
 		const outcome = await createPaceRefitRunner(fixtureRunner()).run(
 			series("throw"),
 			T0,
+			DEMAND,
 			{ timeoutMs: 10_000 },
 		);
 		expect(outcome).toMatchObject({ status: "error", reason: "fit-error" });
@@ -53,6 +78,7 @@ describe("forecast worker runner: the refit job", () => {
 		const outcome = await createPaceRefitRunner(fixtureRunner()).run(
 			series("hang"),
 			T0,
+			DEMAND,
 			{ timeoutMs: 300 },
 		);
 		expect(outcome.status).toBe("timeout");
@@ -61,18 +87,25 @@ describe("forecast worker runner: the refit job", () => {
 
 	it("stops a running job when the signal aborts", async () => {
 		const abort = new AbortController();
-		const run = createPaceRefitRunner(fixtureRunner()).run(series("hang"), T0, {
-			timeoutMs: 60_000,
-			signal: abort.signal,
-		});
+		const run = createPaceRefitRunner(fixtureRunner()).run(
+			series("hang"),
+			T0,
+			DEMAND,
+			{
+				timeoutMs: 60_000,
+				signal: abort.signal,
+			},
+		);
 		setTimeout(() => abort.abort(), 100);
 		expect(await run).toMatchObject({ status: "error", reason: "stopped" });
 	});
 
 	it("starts no second job of the same kind while one runs", async () => {
 		const runner = createPaceRefitRunner(fixtureRunner());
-		const first = runner.run(series("busy:400"), T0, { timeoutMs: 10_000 });
-		const second = await runner.run(series("Europe/Prague"), T0, {
+		const first = runner.run(series("busy:400"), T0, DEMAND, {
+			timeoutMs: 10_000,
+		});
+		const second = await runner.run(series("Europe/Prague"), T0, DEMAND, {
 			timeoutMs: 10_000,
 		});
 		expect(second).toMatchObject({ status: "error", reason: "busy" });
@@ -94,6 +127,7 @@ describe("forecast worker runner: the refit job", () => {
 		const outcome = await createPaceRefitRunner(runner).run(
 			series("hang"),
 			T0,
+			DEMAND,
 			{
 				timeoutMs: 60_000,
 				signal: abort.signal,
@@ -105,7 +139,7 @@ describe("forecast worker runner: the refit job", () => {
 	});
 
 	it("runs embedded code from a blob when the build embedded a worker", async () => {
-		const source = `self.onmessage = (e) => self.postMessage({ id: e.data.id, ok: true, result: { fittedAt: e.data.payload.now, days: -1 } });`;
+		const source = `self.onmessage = (e) => self.postMessage({ id: e.data.id, ok: true, result: { pace: { fittedAt: e.data.payload.now, days: -1 }, learned: { lookbackDays: e.data.payload.historyLookbackDays } } });`;
 		const runner = createForecastWorkerRunner({
 			workerUrl: new URL("./fixtures/no-such-worker.ts", import.meta.url).href,
 			embeddedCode: async () => Buffer.from(source).toString("base64"),
@@ -113,12 +147,42 @@ describe("forecast worker runner: the refit job", () => {
 		const outcome = await createPaceRefitRunner(runner).run(
 			series("Europe/Prague"),
 			T0,
+			DEMAND,
 			{ timeoutMs: 10_000 },
 		);
 		expect(outcome).toMatchObject({
 			status: "ok",
 			state: { fittedAt: T0, days: -1 },
+			learned: { lookbackDays: 84 },
 		});
+	});
+
+	it("the real worker returns the E4 fit and the learned demand of the same job", async () => {
+		const runner = createForecastWorkerRunner({
+			workerUrl: new URL("../forecast-worker.ts", import.meta.url).href,
+			embeddedCode: async () => "",
+		});
+		const outcome = await createPaceRefitRunner(runner).run(
+			series("Europe/Prague", 288 * 3),
+			T0,
+			DEMAND,
+			{ timeoutMs: 60_000 },
+		);
+		expect(outcome.status).toBe("ok");
+		if (outcome.status !== "ok") return;
+		expect(outcome.state.fittedAt).toBe(T0);
+		expect(outcome.state.candidates).toBe(101);
+		expect(outcome.learned).toMatchObject({
+			partition: [1, 0, 0, 0, 0, 2, 2],
+			poolTau: "hard3",
+			lookbackDays: 84,
+			halfLifeDays: 14,
+			workStartSharePct: 5,
+			workStartSample: 10,
+			bandwidthK: 0,
+			jitterMin: 30,
+		});
+		expect(outcome.learned.choices.length).toBe(8);
 	});
 
 	it("reports a missing worker module as worker-error", async () => {
@@ -129,6 +193,7 @@ describe("forecast worker runner: the refit job", () => {
 		const outcome = await createPaceRefitRunner(runner).run(
 			series("Europe/Prague"),
 			T0,
+			DEMAND,
 			{ timeoutMs: 10_000 },
 		);
 		expect(outcome).toMatchObject({ status: "error", reason: "worker-error" });
@@ -158,9 +223,14 @@ async function maxTickGap(work: () => Promise<unknown>) {
 describe("forecast worker runner: off the main thread", () => {
 	it("keeps the event loop ticking while the worker spins the CPU for 1.2 s", async () => {
 		const { result, maxGap, ticks, ms } = await maxTickGap(() =>
-			createPaceRefitRunner(fixtureRunner()).run(series("busy:1200"), T0, {
-				timeoutMs: 10_000,
-			}),
+			createPaceRefitRunner(fixtureRunner()).run(
+				series("busy:1200"),
+				T0,
+				DEMAND,
+				{
+					timeoutMs: 10_000,
+				},
+			),
 		);
 		expect((result as { status: string }).status).toBe("ok");
 		expect(ms).toBeGreaterThanOrEqual(1_200);

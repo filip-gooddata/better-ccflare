@@ -1,3 +1,4 @@
+import type { DemandSettings, LearnedDemand } from "../engine/learn/types";
 import type { PaceFitState, PaceSeries } from "../engine/pace/types";
 import type { EpochMs } from "../types";
 import {
@@ -20,16 +21,24 @@ export type PaceRefitFailure =
 	| "busy"
 	| "input-error";
 
+/** The settings the refit job's demand learners (F2) start from: their present values and the work days. */
+export interface RefitDemandSettings extends DemandSettings {
+	/** As PaceContext.workDays. */
+	workDays: number;
+}
+
 export type PaceRefitOutcome =
-	| { status: "ok"; state: PaceFitState; ms: number }
+	/** `state` (E4) and `learned` (F2) come from the same job. */
+	| { status: "ok"; state: PaceFitState; learned: LearnedDemand; ms: number }
 	| { status: "timeout"; ms: number }
 	| { status: "error"; reason: PaceRefitFailure; ms: number };
 
 export interface PaceRefitRunner {
-	/** Fits `series` in the worker. The series' buffers are transferred: do not use it afterwards. */
+	/** Fits E4 on `series` and learns the demand rows in the worker. The series' buffers are transferred: do not use it afterwards. */
 	run(
 		series: PaceSeries,
 		now: EpochMs,
+		demand: RefitDemandSettings,
 		options: { timeoutMs: number; signal?: AbortSignal },
 	): Promise<PaceRefitOutcome>;
 }
@@ -38,15 +47,38 @@ export function createPaceRefitRunner(
 	worker: ForecastWorkerRunner = createForecastWorkerRunner(),
 ): PaceRefitRunner {
 	return {
-		async run(series, now, { timeoutMs, signal }) {
+		async run(series, now, demand, { timeoutMs, signal }) {
 			const { start, units, censored, timeZone } = series;
+			const {
+				workDays,
+				historyLookbackDays,
+				historyHalfLifeDays,
+				workStartSharePct,
+				timeShiftMin,
+			} = demand;
 			const outcome = await worker.run(
 				"refit",
-				{ start, units, censored, timeZone, now },
+				{
+					start,
+					units,
+					censored,
+					timeZone,
+					now,
+					workDays,
+					historyLookbackDays,
+					historyHalfLifeDays,
+					workStartSharePct,
+					timeShiftMin,
+				},
 				{ timeoutMs, signal, transfer: [units.buffer, censored.buffer] },
 			);
 			if (outcome.status === "ok")
-				return { status: "ok", state: outcome.result, ms: outcome.ms };
+				return {
+					status: "ok",
+					state: outcome.result.pace,
+					learned: outcome.result.learned,
+					ms: outcome.ms,
+				};
 			if (outcome.status === "timeout") return outcome;
 			const reason =
 				outcome.reason === "job-error" ? "fit-error" : outcome.reason;

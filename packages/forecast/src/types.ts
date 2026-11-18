@@ -6,6 +6,7 @@
  * through the orchestrator.
  */
 
+import type { LearnedDemand } from "./engine/learn/types";
 import type { PaceFitState } from "./engine/pace/types";
 
 export type AccountId = string;
@@ -219,6 +220,8 @@ export interface ForecastInput {
 	readings: LimitReading[];
 	sessions: LiveSession[];
 	demandModel?: PaceFitState | null;
+	/** F2 served demand values; absent or null = presentDemand(settings). */
+	learnedDemand?: LearnedDemand | null;
 }
 
 export interface PlacementAdvice {

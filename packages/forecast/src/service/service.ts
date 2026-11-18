@@ -1,3 +1,5 @@
+import { presentDemand } from "../engine/learn";
+import type { LearnedDemand } from "../engine/learn/types";
 import { buildPaceSeries } from "../engine/pace";
 import type {
 	PaceFitState,
@@ -40,6 +42,7 @@ import type {
 	PrewarmStatus,
 	SessionTrackerLike,
 } from "../types";
+import { formatF2LearnLine } from "./f2-learn-log";
 import {
 	backfillLine,
 	createAvailabilityLog,
@@ -51,6 +54,7 @@ import {
 	createPaceRefitRunner,
 	PACE_REFIT_TIMEOUT_MS,
 	type PaceRefitRunner,
+	type RefitDemandSettings,
 } from "./pace-refit-runner";
 
 /** A kept result older than this many usage poll intervals is stale. */
@@ -66,6 +70,29 @@ const DAY_MS = 24 * 60 * 60_000;
 export const PACE_REFIT_CADENCE_MS = PACE_REFIT_CADENCE_MIN * 60_000;
 /** A seven_day reading holds until its reset, so one taken up to 7 days before the window still censors inside it. */
 const READINGS_LEAD_MS = 7 * DAY_MS;
+
+/** The demand settings a refit job's F2 learners start from. */
+export function refitDemandOf(
+	settings: ForecastSettings,
+	workDays: number,
+): RefitDemandSettings {
+	return {
+		workDays,
+		historyLookbackDays: settings.historyLookbackDays,
+		historyHalfLifeDays: settings.historyHalfLifeDays,
+		workStartSharePct: settings.workStartSharePct,
+		timeShiftMin: settings.timeShiftMin,
+	};
+}
+
+const demandKey = (d: RefitDemandSettings): string =>
+	[
+		d.workDays,
+		d.historyLookbackDays,
+		d.historyHalfLifeDays,
+		d.workStartSharePct,
+		d.timeShiftMin,
+	].join("/");
 
 /** History and readings the refit loads: the lookback, clipped to the first stored bucket. */
 export function paceRefitRange(
@@ -179,6 +206,23 @@ export function createForecastService(
 			: deps.paceRefit;
 	/** The last successful fit, swapped in whole; null until the first. */
 	let paceState: PaceFitState | null = null;
+	/** F2: the last successful job's learned demand and the demand settings it was learned under; swapped with paceState. */
+	let learnedState: { learned: LearnedDemand; key: string } | null = null;
+	/**
+	 * The demand the engine serves: the last learned one while the demand
+	 * settings are those it was learned under, else every row at its present
+	 * value for the current settings (before the first successful refit, and
+	 * after a demand setting changes until the next successful refit).
+	 */
+	const servedDemand = (
+		settings: ForecastSettings,
+		workDays: number,
+	): LearnedDemand => {
+		const demand = refitDemandOf(settings, workDays);
+		if (learnedState && learnedState.key === demandKey(demand))
+			return learnedState.learned;
+		return presentDemand(demand);
+	};
 	let refitRunning: Promise<void> | null = null;
 	let refitAbort: AbortController | null = null;
 	let refitHandle: unknown = null;
@@ -363,6 +407,7 @@ export function createForecastService(
 					readings,
 					sessions,
 					demandModel: paceState,
+					learnedDemand: servedDemand(settings, pace.workDays),
 				});
 			} catch (error) {
 				failures.push(`engine=${message(error)}`);
@@ -393,8 +438,10 @@ export function createForecastService(
 		const now = clock.now();
 		const started = performance.now();
 		let series: PaceSeries;
+		let demand: RefitDemandSettings;
 		try {
 			const settings = deps.settings();
+			demand = refitDemandOf(settings, deps.pace().workDays);
 			const { historyFrom, readingsFrom } = paceRefitRange(
 				now,
 				settings.historyLookbackDays,
@@ -429,14 +476,20 @@ export function createForecastService(
 			return;
 		}
 		if (stopped) return;
-		const outcome = await refitWith.runner.run(series, now, {
+		const outcome = await refitWith.runner.run(series, now, demand, {
 			timeoutMs: refitWith.timeoutMs ?? PACE_REFIT_TIMEOUT_MS,
 			signal,
 		});
 		if (stopped) return;
-		// One assignment: a forecast sees the old state or the new one, never a mix.
-		if (outcome.status === "ok") paceState = outcome.state;
+		// One synchronous swap: a forecast sees the old fit and learned demand or the new pair, never a mix.
+		if (outcome.status === "ok") {
+			paceState = outcome.state;
+			learnedState = { learned: outcome.learned, key: demandKey(demand) };
+		}
 		logger.info(paceRefitLine(outcome, paceState, clock.now()));
+		// F2 line only for a job that returned learned demand; a failure keeps the last one silently.
+		if (outcome.status === "ok")
+			logger.info(formatF2LearnLine(outcome.learned, outcome.ms));
 	};
 
 	/** Arms the next refit one cadence from now, then refits unless one runs or the setting is off. */

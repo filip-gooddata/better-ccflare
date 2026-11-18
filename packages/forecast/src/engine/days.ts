@@ -8,10 +8,17 @@ import { addLocalDays, localDayKey, localDayStart, localParts } from "../time";
 import type { EpochMs, ForecastInput, PaceContext } from "../types";
 import { BUCKET_MS } from "../types";
 import { recencyWeight } from "./calibration";
+import type { PoolTau } from "./learn/types";
 import type { DayTable, DayType, RecordedDay, TodaySoFar } from "./model";
+import { floorOf } from "./pace/fit";
+import { paceGrammar } from "./pace/grammar";
 
-/** Fewer recorded days than this in the lookback: no forecast (design 4.2). */
-export const MIN_RECORDED_DAYS = 5;
+/**
+ * Fewer active days (days with demand) than this in the lookback: no forecast
+ * (DESIGN-F2 row 3). The E4 evidence floor of its grammar, floorOf(m), so the
+ * forecast appears once E4 could switch a cell on; 10 today.
+ */
+export const MIN_ACTIVE_DAYS = floorOf(paceGrammar().length);
 /** A day type's pool needs this many days; below it monday and workday pool together (design 4.1). */
 export const MIN_POOL_DAYS = 3;
 /** Work start = median over this many most recent recorded work days with demand: two working weeks, recent enough to follow a changed routine. */
@@ -27,6 +34,13 @@ export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
 	return weekday === 1 ? "monday" : "workday";
 }
 
+/** Served lookback and half-life of the scenario day table (DESIGN-F2 rows 4, 5); absent = the settings. */
+export interface DayTableDemand {
+	lookbackDays: number;
+	/** `Infinity` weighs every day 1. */
+	halfLifeDays: number;
+}
+
 /**
  * Complete local days inside [historyFrom, today 00:00) and the lookback, from the
  * pooled history, plus today's key and day type. Every such calendar day is a recorded day:
@@ -34,11 +48,18 @@ export function dayTypeOf(dayStart: EpochMs, pace: PaceContext): DayType {
  * buckets at all is recorded with total 0 (a weekend without work stays in the
  * weekend pool).
  */
-export function buildDayTable(input: ForecastInput): DayTable {
+export function buildDayTable(
+	input: ForecastInput,
+	demand?: DayTableDemand,
+): DayTable {
 	const { now, pace, settings } = input;
 	const tz = pace.timeZone;
 	const todayStart = localDayStart(now, tz);
-	const lookback = Math.max(0, Math.floor(settings.historyLookbackDays));
+	const lookback = Math.max(
+		0,
+		Math.floor(demand?.lookbackDays ?? settings.historyLookbackDays),
+	);
+	const halfLife = demand?.halfLifeDays ?? settings.historyHalfLifeDays;
 
 	const days: RecordedDay[] = [];
 	const ends: EpochMs[] = [];
@@ -51,7 +72,7 @@ export function buildDayTable(input: ForecastInput): DayTable {
 			key: localDayKey(start, tz),
 			start,
 			type: dayTypeOf(start, pace),
-			weight: recencyWeight(back, settings.historyHalfLifeDays),
+			weight: recencyWeight(back, halfLife),
 			units: new Float64Array(length),
 			fable: new Float64Array(length),
 			total: 0,
@@ -103,16 +124,30 @@ export function poolFor(table: DayTable, type: DayType): RecordedDay[] {
 	return table.days.filter((d) => d.type !== "weekend");
 }
 
-/** The history half of design 4.2. */
-export function historyAvailable(table: DayTable): boolean {
-	return (
-		table.days.length >= MIN_RECORDED_DAYS &&
-		poolFor(table, table.today.type).length >= MIN_POOL_DAYS
-	);
+/** Days of the table with demand (total > 0). */
+export function activeDays(table: DayTable): number {
+	let n = 0;
+	for (const d of table.days) if (d.total > 0) n++;
+	return n;
 }
 
 /**
- * Median, over the most recent WORK_START_RECENT_DAYS recorded work days with
+ * The history half of design 4.2 (DESIGN-F2 row 3): at least MIN_ACTIVE_DAYS
+ * active days, and, while the pool serves the hard 3-day fallback, today's
+ * pool of at least MIN_POOL_DAYS days. A shrinkage pool (numeric tau) draws
+ * from all days when its own is short, so it needs no pool part.
+ */
+export function historyAvailable(
+	table: DayTable,
+	poolTau: PoolTau = "hard3",
+): boolean {
+	if (activeDays(table) < MIN_ACTIVE_DAYS) return false;
+	if (poolTau !== "hard3") return true;
+	return poolFor(table, table.today.type).length >= MIN_POOL_DAYS;
+}
+
+/**
+ * Median, over the most recent `sample` (WORK_START_RECENT_DAYS unless F2 row 16 serves another) recorded work days with
  * demand, of the local clock minute by which `sharePct` percent of that day's
  * demand (units) has been used: the start of the first bucket at which the
  * day's cumulative units reach the share. The share keeps a stray overnight
@@ -124,13 +159,10 @@ export function workStartMinute(
 	table: DayTable,
 	timeZone: string,
 	sharePct: number = DEFAULT_WORK_START_SHARE_PCT,
+	sample: number = WORK_START_RECENT_DAYS,
 ): number | null {
 	const minutes: number[] = [];
-	for (
-		let i = table.days.length - 1;
-		i >= 0 && minutes.length < WORK_START_RECENT_DAYS;
-		i--
-	) {
+	for (let i = table.days.length - 1; i >= 0 && minutes.length < sample; i--) {
 		const d = table.days[i] as RecordedDay;
 		if (d.type === "weekend") continue;
 		const bucket = shareReachedAt(d.units, sharePct);
