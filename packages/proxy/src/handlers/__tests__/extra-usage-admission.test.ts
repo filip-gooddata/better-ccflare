@@ -1,25 +1,36 @@
 /**
- * Admission with "use extra usage": a Codex account whose weekly window is
- * spent but which still has purchased credits is served exactly the way the
- * official Codex CLI would be — the upstream keeps answering until the credits
- * run out, at which point its own 429 benches the account through the normal
- * rate-limit path. With the switch off, nothing changes.
+ * A full limit is final. An account whose five-hour or weekly window is at
+ * 100 % has no capacity, even when the provider still reports billed capacity
+ * beyond the plan (Codex credits, Anthropic extra usage / spend) and even when
+ * the "use extra usage" setting is on: that setting is ignored. Every gate
+ * that reads the usage snapshot — the usage-cap prefilter, the forced-account
+ * availability, combo slots, the pool-exhaustion reasons and recovery
+ * candidates — must treat such an account as exhausted.
  */
-import { afterEach, describe, expect, it, mock } from "bun:test";
-import { setUseExtraUsage } from "@better-ccflare/core";
-import { usageCache } from "@better-ccflare/providers";
-import type { Account, RequestMeta } from "@better-ccflare/types";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { isAccountAvailable, setUseExtraUsage } from "@better-ccflare/core";
+import {
+	getRepresentativeUsageSnapshotForProvider,
+	usageCache,
+} from "@better-ccflare/providers";
+import type {
+	Account,
+	ComboWithSlots,
+	RequestMeta,
+} from "@better-ccflare/types";
 import { selectAccountsForRequest } from "../account-selector";
 import { createPoolExhaustedResponse } from "../proxy-operations";
 import type { ProxyContext } from "../proxy-types";
 
-const ACCOUNT_ID = "codex-on-credits";
+const CODEX_ID = "codex-on-credits";
+const ANTHROPIC_ID = "anthropic-with-spend";
+const SPARE_ID = "anthropic-spare";
 
-function codexAccount(): Account {
+function account(id: string, provider: string): Account {
 	return {
-		id: ACCOUNT_ID,
-		name: "codex",
-		provider: "codex",
+		id,
+		name: id,
+		provider,
 		api_key: null,
 		refresh_token: "rt",
 		access_token: "at",
@@ -46,17 +57,20 @@ function codexAccount(): Account {
 	} as Account;
 }
 
-function meta(): RequestMeta {
+function meta(headers: Record<string, string> = {}): RequestMeta {
 	return {
 		id: "req-1",
 		method: "POST",
 		path: "/v1/messages",
 		timestamp: Date.now(),
-		headers: new Headers(),
+		headers: new Headers(headers),
 	};
 }
 
-function ctxFor(accounts: Account[]) {
+function ctxFor(
+	accounts: Account[],
+	activeCombo: ComboWithSlots | null = null,
+) {
 	const select = mock(
 		(candidates: Account[], _meta: RequestMeta) => candidates,
 	);
@@ -64,7 +78,7 @@ function ctxFor(accounts: Account[]) {
 		strategy: { select },
 		dbOps: {
 			getAllAccounts: mock(async () => accounts),
-			getActiveComboForFamily: mock(async () => null),
+			getActiveComboForFamily: mock(async () => activeCombo),
 		},
 		refreshInFlight: new Map(),
 		asyncWriter: { enqueue: mock(() => {}) },
@@ -73,75 +87,180 @@ function ctxFor(accounts: Account[]) {
 	return { ctx, select };
 }
 
-function seedSpentWeeklyWithCredits() {
-	usageCache.set(ACCOUNT_ID, {
+const WEEKLY_RESET_MS = Date.now() + 3 * 24 * 3_600_000;
+const FIVE_HOUR_RESET_MS = Date.now() + 2 * 3_600_000;
+
+/** Codex: weekly window spent, purchased credits left. */
+function seedCodexSpentWithCredits() {
+	usageCache.set(CODEX_ID, {
 		seven_day: {
 			utilization: 100,
-			resets_at: new Date(Date.now() + 3 * 24 * 3_600_000).toISOString(),
+			resets_at: new Date(WEEKLY_RESET_MS).toISOString(),
 		},
 		credits: { has_credits: true, unlimited: false, balance: "12" },
 	} as never);
 }
 
-afterEach(() => {
-	setUseExtraUsage(false);
-	usageCache.delete(ACCOUNT_ID);
+/** Anthropic: five-hour window spent, extra usage enabled with room left. */
+function seedAnthropicFiveHourSpentWithSpend(id = ANTHROPIC_ID) {
+	usageCache.set(id, {
+		five_hour: {
+			utilization: 100,
+			resets_at: new Date(FIVE_HOUR_RESET_MS).toISOString(),
+		},
+		seven_day: {
+			utilization: 40,
+			resets_at: new Date(WEEKLY_RESET_MS).toISOString(),
+		},
+		spend: { enabled: true, percent: 30 },
+		extra_usage: { is_enabled: true, utilization: 30, monthly_limit: 100 },
+	} as never);
+}
+
+beforeEach(() => {
+	// The setting is still accepted but must change nothing.
+	setUseExtraUsage(true);
 });
 
-describe("selectAccountsForRequest — extra usage", () => {
-	it("keeps excluding a spent account while the switch is off", async () => {
-		seedSpentWeeklyWithCredits();
-		const { ctx, select } = ctxFor([codexAccount()]);
+afterEach(() => {
+	setUseExtraUsage(false);
+	usageCache.delete(CODEX_ID);
+	usageCache.delete(ANTHROPIC_ID);
+	usageCache.delete(SPARE_ID);
+});
+
+describe("usage-cap prefilter — a full limit is final", () => {
+	it("excludes a spent Codex account with credits, setting on", async () => {
+		seedCodexSpentWithCredits();
+		const { ctx, select } = ctxFor([account(CODEX_ID, "codex")]);
 
 		await selectAccountsForRequest(meta(), ctx);
 
 		expect(select.mock.calls[0]?.[0]).toEqual([]);
 	});
 
-	it("admits the same account once extra usage may be spent", async () => {
-		seedSpentWeeklyWithCredits();
-		setUseExtraUsage(true);
-		const { ctx, select } = ctxFor([codexAccount()]);
+	it("excludes an Anthropic account at 100 % five-hour with extra usage left, setting on", async () => {
+		seedAnthropicFiveHourSpentWithSpend();
+		const { ctx, select } = ctxFor([
+			account(ANTHROPIC_ID, "anthropic"),
+			account(SPARE_ID, "anthropic"),
+		]);
 
 		await selectAccountsForRequest(meta(), ctx);
 
 		expect(select.mock.calls[0]?.[0]?.map((a: Account) => a.id)).toEqual([
-			ACCOUNT_ID,
+			SPARE_ID,
 		]);
 	});
 });
 
-describe("createPoolExhaustedResponse — extra usage", () => {
-	it("does not blame or wait on a usage window that extra usage is serving", async () => {
-		const resetMs = Date.now() + 3 * 24 * 3_600_000;
-		const snapshot = (extraUsageAvailable?: boolean) =>
-			new Map([
-				[ACCOUNT_ID, { utilization: 100, resetMs, extraUsageAvailable }],
-			]);
+describe("forced account availability — a full limit is final", () => {
+	it("isAccountAvailable is false for the snapshot of a spent account with extra usage", () => {
+		seedAnthropicFiveHourSpentWithSpend();
+		const snapshot = getRepresentativeUsageSnapshotForProvider(
+			usageCache.get(ANTHROPIC_ID),
+			"anthropic",
+		);
+		expect(snapshot).not.toBeNull();
+		expect(
+			isAccountAvailable(
+				account(ANTHROPIC_ID, "anthropic"),
+				Date.now(),
+				snapshot ?? undefined,
+			),
+		).toBe(false);
+	});
 
-		// Control: without extra usage the spent window is the reason, and its
-		// three-day reset is what the client is told to wait for.
-		const spent = createPoolExhaustedResponse([codexAccount()], snapshot());
-		const spentBody = (await spent.json()) as {
+	it("does not serve x-better-ccflare-account-id to a spent account with extra usage", async () => {
+		seedAnthropicFiveHourSpentWithSpend();
+		const { ctx } = ctxFor([
+			account(ANTHROPIC_ID, "anthropic"),
+			account(SPARE_ID, "anthropic"),
+		]);
+
+		let served: string[] = [];
+		try {
+			const result = await selectAccountsForRequest(
+				meta({ "x-better-ccflare-account-id": ANTHROPIC_ID }),
+				ctx,
+			);
+			served = result.map((a) => a.id);
+		} catch {
+			// A local refusal is also "not served".
+		}
+		expect(served).not.toContain(ANTHROPIC_ID);
+	});
+});
+
+describe("combo slot gate — a full limit is final", () => {
+	it("skips the slot of a spent account with extra usage", async () => {
+		seedAnthropicFiveHourSpentWithSpend();
+		const combo: ComboWithSlots = {
+			id: "combo-1",
+			name: "combo",
+			description: null,
+			enabled: true,
+			created_at: Date.now(),
+			updated_at: Date.now(),
+			slots: [
+				{
+					id: "slot-1",
+					combo_id: "combo-1",
+					account_id: ANTHROPIC_ID,
+					model: "claude-sonnet-4-5",
+					priority: 0,
+					enabled: true,
+				},
+				{
+					id: "slot-2",
+					combo_id: "combo-1",
+					account_id: SPARE_ID,
+					model: "claude-sonnet-4-5",
+					priority: 1,
+					enabled: true,
+				},
+			],
+		} as ComboWithSlots;
+		const { ctx } = ctxFor(
+			[account(ANTHROPIC_ID, "anthropic"), account(SPARE_ID, "anthropic")],
+			combo,
+		);
+
+		const result = await selectAccountsForRequest(
+			meta(),
+			ctx,
+			"claude-sonnet-4-5",
+		);
+
+		expect(result.map((a) => a.id)).toEqual([SPARE_ID]);
+	});
+});
+
+describe("createPoolExhaustedResponse — a full limit is final", () => {
+	it("blames the spent window and offers its reset, whatever extra usage says", async () => {
+		seedCodexSpentWithCredits();
+		const snapshot = getRepresentativeUsageSnapshotForProvider(
+			usageCache.get(CODEX_ID),
+			"codex",
+		);
+		expect(snapshot).not.toBeNull();
+
+		const response = createPoolExhaustedResponse(
+			[account(CODEX_ID, "codex")],
+			new Map([[CODEX_ID, snapshot as NonNullable<typeof snapshot>]]),
+		);
+		const body = (await response.json()) as {
 			error: {
 				accounts: { reason: string; available_at: string | null }[];
 				next_available_at: string | null;
 			};
 		};
-		expect(spentBody.error.accounts[0]?.reason).toBe("usage_exhausted");
-		expect(spentBody.error.next_available_at).toBe(
-			new Date(resetMs).toISOString(),
+		expect(body.error.accounts[0]?.reason).toBe("usage_exhausted");
+		expect(body.error.accounts[0]?.available_at).toBe(
+			new Date(WEEKLY_RESET_MS).toISOString(),
 		);
-
-		// On extra usage the window is not why the pool is empty, so it must not
-		// be named as the reason nor push a days-long Retry-After at the client.
-		const onCredits = createPoolExhaustedResponse(
-			[codexAccount()],
-			snapshot(true),
+		expect(body.error.next_available_at).toBe(
+			new Date(WEEKLY_RESET_MS).toISOString(),
 		);
-		const body = (await onCredits.json()) as typeof spentBody;
-		expect(body.error.accounts[0]?.reason).not.toBe("usage_exhausted");
-		expect(body.error.accounts[0]?.available_at).toBeNull();
-		expect(body.error.next_available_at).toBeNull();
 	});
 });

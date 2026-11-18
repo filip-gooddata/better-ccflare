@@ -316,6 +316,9 @@ function validateDatabaseConfig(
 	}
 }
 
+export const USE_EXTRA_USAGE_IGNORED_WARNING =
+	"use_extra_usage is set but ignored: it no longer does anything. An account at 100% of its five-hour, weekly or model-family limit is not used until that limit resets, whatever extra usage or spend says. Set it to false or remove it from the config file to silence this warning.";
+
 export class Config extends EventEmitter {
 	private configPath: string;
 	private data: ConfigData = {};
@@ -1226,15 +1229,11 @@ export class Config extends EventEmitter {
 	}
 
 	/**
-	 * Whether an account whose plan window is spent stays routable while its
-	 * provider reports billed capacity beyond the plan — Codex credits,
-	 * Anthropic extra usage. The provider keeps serving such an account (the
-	 * official Codex CLI carries on against credits); without this switch it is
-	 * left out of selection until the window resets.
-	 *
-	 * Off by default: extra usage is billed, so spending it must be chosen.
-	 * Owned by the dashboard like the other routing switches; the environment
-	 * can only seed it once (adoptUseExtraUsageFromEnv).
+	 * The stored "use extra usage" value. It no longer does anything: an
+	 * account at 100% of its five-hour, weekly or model-family limit is out
+	 * until that limit resets, whatever extra usage or spend says. The value is
+	 * still accepted and stored so old config files and API clients keep
+	 * working; reportUseExtraUsageAtStartup warns when it is set.
 	 */
 	getUseExtraUsage(): boolean {
 		return this.resolveFlag(this.data.use_extra_usage, false).value;
@@ -1250,9 +1249,9 @@ export class Config extends EventEmitter {
 	}
 
 	/**
-	 * Seed "use extra usage" from CCFLARE_USE_EXTRA_USAGE, once, for installs
-	 * configured from the environment (containers) — then the dashboard owns
-	 * it. Only an unset switch is seeded, and the value is written to the
+	 * Seed the stored "use extra usage" value from CCFLARE_USE_EXTRA_USAGE,
+	 * once, for installs configured from the environment (containers). The
+	 * value no longer does anything. Only an unset switch is seeded, and the value is written to the
 	 * config file, so a later deliberate change is never undone and the
 	 * dashboard never draws a switch an environment variable silently
 	 * overrides. Returns a line for the caller to log, or null when nothing
@@ -1267,7 +1266,17 @@ export class Config extends EventEmitter {
 		else if (/^(0|false|no|off)$/i.test(raw)) value = false;
 		else return null;
 		this.setUseExtraUsage(value);
-		return `use extra usage ${value ? "enabled" : "disabled"}: adopted from CCFLARE_USE_EXTRA_USAGE, which only seeds the setting — change it in Settings → Advanced`;
+		return `use extra usage ${value ? "enabled" : "disabled"}: adopted from CCFLARE_USE_EXTRA_USAGE, which only seeds the setting; the setting no longer does anything`;
+	}
+
+	/**
+	 * Start-up check for the retired "use extra usage" setting: seeds it from
+	 * the environment as before, then calls `warn` once when it is on. Off or
+	 * unset logs nothing.
+	 */
+	reportUseExtraUsageAtStartup(warn: (message: string) => void): void {
+		this.adoptUseExtraUsageFromEnv();
+		if (this.getUseExtraUsage()) warn(USE_EXTRA_USAGE_IGNORED_WARNING);
 	}
 
 	/**

@@ -1,7 +1,6 @@
 import {
 	getModelFamily,
 	isUsageExhausted,
-	isUseExtraUsageEnabled,
 	mapModelName,
 	splitModelRouting,
 } from "@better-ccflare/core";
@@ -10,7 +9,6 @@ import {
 	extractModelFamilyWindows,
 	extractWeeklyWindow,
 	getRepresentativeUsageSnapshotForProvider,
-	hasExtraUsageCapacity,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -45,19 +43,21 @@ import type { ProxyContext } from "./proxy-types";
  * Each limit mirrors the filter that removes the account today:
  * - `cooldown`: a future `rate_limited_until` (the strategies' isAccountAvailable).
  * - `five_hour` / `weekly`: the usage-cap prefilter in getOrderedAccounts,
- *   checked on BOTH windows rather than only the representative one, with the
- *   same extra-usage exception (the "use extra usage" switch AND provider
- *   capacity). A provider without those two windows falls back to the
- *   representative snapshot the prefilter uses, reported as `weekly`.
+ *   checked on BOTH windows rather than only the representative one. A full
+ *   window is always recorded: extra usage, spend and the (ignored) "use extra
+ *   usage" setting never make it usable. A provider without those two windows
+ *   falls back to the representative snapshot the prefilter uses, reported as
+ *   `weekly`.
  * - `family`: the model-family filter in selectAccountsForRequest. A standing
  *   family block counts in every mode, with the block's own end as its reset.
- *   Telemetry and the reactive 429 mark count only when capacity routing is
- *   on, with the same extra-usage exception as above
- *   (isAccountExhaustedForModel). A telemetry reset is the LATEST exhausted
- *   family row, since the account serves the family again only once every
- *   row has reset. A reactive 429 mark carries only a TTL guess, not a reset,
- *   so it counts as unknown (null) unless exhausted telemetry rows give the
- *   real one.
+ *   Full family telemetry counts in every mode too
+ *   (isAccountExhaustedForModel; extra usage plays no part there either);
+ *   only the reactive 429 mark needs capacity routing on. A telemetry reset
+ *   is the LATEST exhausted family row, since the account serves the family
+ *   again only once every row has reset, and unknown (null) when a full row
+ *   carries no usable reset. A reactive 429 mark carries only a TTL guess,
+ *   not a reset, so it counts as unknown (null) unless exhausted telemetry
+ *   rows give the real one.
  */
 export function collectLimitBlockedAccounts(
 	accounts: Account[],
@@ -105,15 +105,13 @@ function limitsInForce(
 	const provider = account.provider ?? "anthropic";
 	const usage = usageCache.get(account.id);
 	if (usage) {
-		const extraUsage =
-			isUseExtraUsageEnabled() && hasExtraUsageCapacity(usage, provider);
 		const windowLimit = (
 			kind: "five_hour" | "weekly",
 			window: StrategyUsageWindow | null,
 		): void => {
 			if (
 				window &&
-				isUsageExhausted(window.utilization, window.resetsAt, now, extraUsage)
+				isUsageExhausted(window.utilization, window.resetsAt, now)
 			) {
 				limits.push({ kind, resetAt: window.resetsAt });
 			}
@@ -128,19 +126,14 @@ function limitsInForce(
 			);
 			if (
 				snapshot &&
-				isUsageExhausted(
-					snapshot.utilization,
-					snapshot.resetMs,
-					now,
-					snapshot.extraUsageAvailable,
-				)
+				isUsageExhausted(snapshot.utilization, snapshot.resetMs, now)
 			) {
 				limits.push({ kind: "weekly", resetAt: snapshot.resetMs ?? null });
 			}
 		}
 	}
 
-	if (model && family) {
+	if (model) {
 		const familyLimit = familyLimitInForce(
 			account,
 			model,
@@ -156,22 +149,39 @@ function limitsInForce(
 function familyLimitInForce(
 	account: Account,
 	model: string,
-	family: string,
+	family: string | null,
 	capacityRoutingEnabled: boolean,
 	now: number,
 ): AccountLimit | null {
 	// Blocks are recorded for the family upstream refused: the family of the
 	// model this account actually sends (mapModelName honors "force account
 	// model", which turns mapping off).
-	const upstreamFamily =
-		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
-		family;
+	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
+	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
+	// A client alias with no family of its own still counts when the account
+	// maps it to a family.
+	if (!upstreamFamily) return null;
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };
-	if (!capacityRoutingEnabled) return null;
 
+	// Telemetry is read for the family the account actually sends (the
+	// mapping's primary model), the same family the block above uses.
 	const usage = usageCache.get(account.id);
+	const telemetry = isAccountExhaustedForModel(
+		usage,
+		getModelFamily(upstreamModel) ? upstreamModel : model,
+		now,
+	);
+	if (telemetry.exhausted) {
+		return {
+			kind: "family",
+			family: upstreamFamily,
+			resetAt: telemetry.resetAt,
+		};
+	}
+	if (!capacityRoutingEnabled || !family) return null;
+
 	const exhaustedRows = usage
 		? extractModelFamilyWindows(
 				usage,
@@ -187,14 +197,6 @@ function familyLimitInForce(
 			? Math.max(...exhaustedRows.map((row) => row.resetsAt as number))
 			: null;
 
-	const telemetry = isAccountExhaustedForModel(usage, model, now);
-	if (telemetry.exhausted) {
-		return {
-			kind: "family",
-			family,
-			resetAt: latestRowReset ?? telemetry.resetAt,
-		};
-	}
 	if (getFamilyExhaustionOrigin(account.id, family, now)) {
 		return { kind: "family", family, resetAt: latestRowReset };
 	}

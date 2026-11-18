@@ -184,9 +184,9 @@ function normalizeCodexUsageData(
 	// usage_snapshots may have no reset stored (accounts.rate_limit_reset keeps
 	// only the soonest one), and requiring a reset here is what used to discard it.
 	if (!hasWindowInfo(five_hour) && !hasWindowInfo(seven_day)) return null;
-	// Credits pass through untouched: the status label and the throttle display
-	// read them (via the shared usage snapshot) to agree with routing, which
-	// keeps serving a spent account that has credits when extra usage is on.
+	// Credits pass through untouched for display. They never make a spent
+	// window usable: routing never serves an account from extra usage, so the
+	// status label reads such an account as exhausted.
 	return usage.credits
 		? { five_hour, seven_day, credits: usage.credits }
 		: { five_hour, seven_day };
@@ -444,12 +444,7 @@ export function createAccountsListHandler(
 			);
 			return (
 				usage === null ||
-				!isUsageExhausted(
-					usage.utilization,
-					usage.resetMs,
-					now,
-					usage.extraUsageAvailable,
-				)
+				!isUsageExhausted(usage.utilization, usage.resetMs, now)
 			);
 		});
 
@@ -690,16 +685,8 @@ export function createAccountsListHandler(
 						usageThrottleSettings,
 						now,
 						// Display path: surface ALL per-model caps (m3 amber highlight);
-						// routing-side model matching happens in proxy.ts only. A spent
-						// window served on extra usage is not throttled there either.
-						{
-							scopedMode: "all",
-							extraUsageAvailable:
-								getRepresentativeUsageSnapshotForProvider(
-									fullUsageData as AnyUsageData,
-									account.provider ?? "anthropic",
-								)?.extraUsageAvailable === true,
-						},
+						// routing-side model matching happens in proxy.ts only.
+						{ scopedMode: "all" },
 					);
 					usageThrottledUntil = usageThrottleStatus.throttleUntil;
 					usageThrottledWindows = usageThrottleStatus.throttledWindows;
@@ -738,13 +725,6 @@ export function createAccountsListHandler(
 							fullUsageData,
 							account.provider ?? "anthropic",
 						),
-						// Same snapshot account selection admits on, so the label
-						// cannot say "exhausted" for an account it is still routing.
-						usageExtraUsageAvailable:
-							getRepresentativeUsageSnapshotForProvider(
-								fullUsageData as AnyUsageData | null,
-								account.provider ?? "anthropic",
-							)?.extraUsageAvailable === true,
 					},
 					now,
 				);

@@ -452,12 +452,12 @@ describe("usage throttling with extra usage", () => {
 		);
 	});
 
-	it("does not throttle a spent window that extra usage is serving", () => {
+	it("paces a spent window back to its reset even when a caller claims extra usage", () => {
 		const status = getUsageThrottleStatus(spent, settings, now, {
 			extraUsageAvailable: true,
-		});
-		expect(status.throttleUntil).toBeNull();
-		expect(status.throttledWindows).toEqual([]);
+		} as never);
+		expect(status.throttleUntil).toBe(new Date(resetAt).getTime());
+		expect(status.throttledWindows).toEqual(["five_hour"]);
 	});
 
 	it("keeps pacing a window that is over pace but not spent", () => {
@@ -465,11 +465,7 @@ describe("usage throttling with extra usage", () => {
 			five_hour: { utilization: 80, resets_at: resetAt },
 			seven_day: { utilization: 10, resets_at: null },
 		};
-		expect(
-			getUsageThrottleUntil(overPace, settings, now, {
-				extraUsageAvailable: true,
-			}),
-		).not.toBeNull();
+		expect(getUsageThrottleUntil(overPace, settings, now)).not.toBeNull();
 	});
 
 	describe("getAccountUsageThrottleUntil — the routing decision", () => {
@@ -484,11 +480,11 @@ describe("usage throttling with extra usage", () => {
 			).toBe(new Date(resetAt).getTime());
 		});
 
-		it("lets a spent Codex account with credits through once the switch is on", () => {
+		it("still throttles a spent Codex account with credits, setting on", () => {
 			setUseExtraUsage(true);
 			expect(
 				getAccountUsageThrottleUntil("codex", codexWithCredits, settings, now),
-			).toBeNull();
+			).toBe(new Date(resetAt).getTime());
 		});
 
 		it("still throttles a spent account that has no credits, switch on", () => {

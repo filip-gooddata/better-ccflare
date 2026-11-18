@@ -148,10 +148,9 @@ describe("isAccountExhaustedForModel", () => {
 
 	// ── v3 S4: overage tri-state — only `unavailable` may exclude ──────────────
 
-	// Paid overage is not capacity: it keeps a 100% family available only when
-	// the "use extra usage" switch is on AND the account has extra usage left
-	// (hasExtraUsageCapacity), the rule the account-level windows use.
-	describe("extra usage (switch AND remaining capacity, else exhausted)", () => {
+	// Paid overage is not capacity: a 100% family is exhausted whatever the
+	// overage/spend signals or the (ignored) "use extra usage" setting say.
+	describe("extra usage never keeps a full family available", () => {
 		afterEach(() => {
 			setUseExtraUsage(false);
 		});
@@ -205,22 +204,22 @@ describe("isAccountExhaustedForModel", () => {
 			).toBe(true);
 		});
 
-		it("keeps the family available with the switch on and extra usage left (spend under its limit)", () => {
+		it("stays exhausted with the setting on and extra usage left (spend under its limit)", () => {
 			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, {
 				spend: { enabled: true, percent: 40 },
 			});
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
-			).toBe(false);
+			).toBe(true);
 		});
 
-		it("keeps the family available with the switch on and legacy extra_usage enabled", () => {
+		it("stays exhausted with the setting on and legacy extra_usage enabled", () => {
 			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, legacy(true));
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
-			).toBe(false);
+			).toBe(true);
 		});
 
 		it("stays exhausted when no overage signal exists at all (no extra usage known)", () => {
@@ -231,7 +230,7 @@ describe("isAccountExhaustedForModel", () => {
 			).toBe(true);
 		});
 
-		it("newer spend.enabled=true takes precedence over legacy extra_usage.is_enabled=false", () => {
+		it("stays exhausted with spend.enabled=true over legacy extra_usage.is_enabled=false, setting on", () => {
 			setUseExtraUsage(true);
 			const data = scopedLimits(100, "Fable", futureReset, {
 				...legacy(false),
@@ -239,7 +238,7 @@ describe("isAccountExhaustedForModel", () => {
 			});
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
-			).toBe(false);
+			).toBe(true);
 		});
 
 		it("newer spend.enabled=false takes precedence over legacy extra_usage.is_enabled=true", () => {
@@ -357,6 +356,82 @@ describe("isAccountExhaustedForModel", () => {
 					},
 				],
 				spend: { enabled: false },
+			} as never;
+			expect(
+				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
+			).toBe(false);
+		});
+	});
+
+	// A full family row whose reset is missing or unparsable is still full:
+	// letting it through would bill overage, so it counts as exhausted with
+	// an unknown reset. A row with no percent stays unknown utilization.
+	describe("full family rows with no usable reset", () => {
+		const fableRow = (
+			percent: number | undefined,
+			resetsAt: string | null | undefined,
+			surface: string,
+		) => ({
+			kind: "weekly_scoped",
+			...(percent === undefined ? {} : { percent }),
+			...(resetsAt === undefined ? {} : { resets_at: resetsAt }),
+			scope: { model: { id: null, display_name: "Fable" }, surface },
+		});
+		const laterReset = new Date(NOW + 4 * 24 * 60 * 60 * 1000).toISOString();
+
+		it("counts a 100% row with resets_at null as exhausted with an unknown reset", () => {
+			const data = { limits: [fableRow(100, null, "cli")] } as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: null,
+			});
+		});
+
+		it("counts a 100% row with no resets_at field or an unparsable one as exhausted", () => {
+			for (const resetsAt of [undefined, "not-a-date"]) {
+				const data = { limits: [fableRow(100, resetsAt, "cli")] } as never;
+				expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual(
+					{ exhausted: true, resetAt: null },
+				);
+			}
+		});
+
+		it("reports an unknown reset when any full row has no reset", () => {
+			const data = {
+				limits: [fableRow(100, futureReset, "cli"), fableRow(120, null, "api")],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: null,
+			});
+		});
+
+		it("reports the latest reset when every full row has one", () => {
+			const data = {
+				limits: [
+					fableRow(100, futureReset, "cli"),
+					fableRow(100, laterReset, "api"),
+				],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: true,
+				resetAt: new Date(laterReset).getTime(),
+			});
+		});
+
+		it("stays not exhausted when a row has no percent", () => {
+			const data = {
+				limits: [fableRow(100, null, "cli"), fableRow(undefined, null, "api")],
+			} as never;
+			expect(isAccountExhaustedForModel(data, "claude-fable-5", NOW)).toEqual({
+				exhausted: false,
+				resetAt: null,
+			});
+		});
+
+		it("stays not exhausted when a full row's reset has passed", () => {
+			const data = {
+				limits: [fableRow(100, null, "cli"), fableRow(100, pastReset, "api")],
 			} as never;
 			expect(
 				isAccountExhaustedForModel(data, "claude-fable-5", NOW).exhausted,
