@@ -4046,8 +4046,12 @@ export function createAccountReloadHandler(dbOps: DatabaseOperations) {
 			// Clear refresh cache for this account
 			clearAccountRefreshCache(accountId);
 
-			// Clear usage cache for this account to prevent memory leaks
-			usageCache.delete(accountId);
+			// Clear usage cache for this account to prevent memory leaks, but keep
+			// a reading held until a full window's reset. Nothing stored names the
+			// upstream account or organisation, so reload cannot tell whether the
+			// new credentials changed it; keeping the hold fails closed until a
+			// newer reading under the new credentials replaces it.
+			usageCache.deleteUnlessHeld(accountId);
 
 			// Reload exists to pick up credentials written behind this server's back
 			// (a CLI re-authentication, a hand-edited row). New credentials can mean a
