@@ -18,6 +18,10 @@ import type {
 } from "@better-ccflare/types";
 import { cacheBodyStore } from "../cache-body-store";
 import type { ProxyContext } from "../handlers";
+import {
+	clearLimitRefusalCache,
+	rememberLimitRefusal,
+} from "../handlers/limit-response";
 import { clearFamilyExhaustionCache } from "../handlers/model-capacity";
 import { resetRateLimitProbeGatesForTests } from "../handlers/rate-limit-cooldown";
 import { clearVisionCapability } from "../handlers/vision-capability";
@@ -110,12 +114,14 @@ function usage(parts: {
 function limitHeaders(
 	resetAt: number,
 	account: string,
+	retryAfter?: string,
 ): Record<string, string> {
 	const resetSec = String(Math.floor(resetAt / 1000));
 	return {
 		"content-type": "application/json",
 		"request-id": `req_upstream_${account}`,
-		"retry-after": String(Math.ceil((resetAt - Date.now()) / 1000)),
+		"retry-after":
+			retryAfter ?? String(Math.ceil((resetAt - Date.now()) / 1000)),
 		"anthropic-ratelimit-unified-status": "rejected",
 		"anthropic-ratelimit-unified-reset": resetSec,
 		"anthropic-ratelimit-unified-remaining": "0",
@@ -137,11 +143,28 @@ function limitBody(account: string): string {
 	});
 }
 
-function limit429(resetAt: number, account: string): Response {
+function limit429(
+	resetAt: number,
+	account: string,
+	retryAfter?: string,
+): Response {
 	return new Response(limitBody(account), {
 		status: 429,
 		statusText: "Too Many Requests",
-		headers: limitHeaders(resetAt, account),
+		headers: limitHeaders(resetAt, account, retryAfter),
+	});
+}
+
+/** A retry-after that disagrees with the unified reset, as an aged refusal would. */
+const STALE_RETRY_AFTER = "17";
+
+/** Cache a real refusal for `account`, as an earlier upstream 429 would have. */
+function rememberRefusal(account: string, resetAt: number) {
+	rememberLimitRefusal(account, {
+		status: 429,
+		statusText: "Too Many Requests",
+		headers: new Headers(limitHeaders(resetAt, account, STALE_RETRY_AFTER)),
+		body: new TextEncoder().encode(limitBody(account)),
 	});
 }
 
@@ -324,7 +347,7 @@ async function send(ctx: ProxyContext, request = makeRequest()) {
 	}
 }
 
-async function expectUpstreamIdentity(
+async function _expectUpstreamIdentity(
 	received: Response | Error,
 	expected: { status: number; headers: Record<string, string>; body: string },
 ) {
@@ -343,8 +366,101 @@ async function expectUpstreamIdentity(
 	return added;
 }
 
+/** Upstream requests per account token seen by the fake fetch. */
+function perAccount(calls: string[]): Record<string, number> {
+	const counts: Record<string, number> = {};
+	for (const account of calls) counts[account] = (counts[account] ?? 0) + 1;
+	return counts;
+}
+
+const retryAfterFor = (resetAt: number) =>
+	String(Math.max(1, Math.floor(resetAt / 1000 - NOW / 1000)));
+
+/**
+ * The local 429 built from readings: Anthropic's shape, unified reset at the
+ * binding reset, retry-after counted from it, and no upstream headers.
+ */
+async function expectBuiltLimit429(
+	received: Response | Error,
+	expected: {
+		resetAt: number;
+		claim?: string;
+		head?: boolean;
+		/** Out only on a cooldown: no unified status, claim or reset. */
+		cooldown?: boolean;
+	},
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	expect(response.headers.get("content-type")).toContain("application/json");
+	expect(response.headers.get("x-should-retry")).toBe("true");
+	if (expected.cooldown) {
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-status"),
+		).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBeNull();
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-reset"),
+		).toBeNull();
+	} else {
+		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
+		expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+			String(Math.floor(expected.resetAt / 1000)),
+		);
+	}
+	expect(response.headers.get("retry-after")).toBe(
+		retryAfterFor(expected.resetAt),
+	);
+	if (expected.claim) {
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBe(expected.claim);
+	}
+	expect(response.headers.get("x-upstream-account")).toBeNull();
+	if (expected.head) return;
+	const body = (await response.json()) as {
+		type: string;
+		error: { type: string; message: unknown };
+	};
+	expect(body.type).toBe("error");
+	expect(body.error.type).toBe("rate_limit_error");
+	expect(typeof body.error.message).toBe("string");
+}
+
+/**
+ * A replayed real refusal: body bytes as received, every upstream header kept
+ * except retry-after (recounted from the unified reset) and date (now).
+ */
+async function expectReplayedRefusal(
+	received: Response | Error,
+	expected: { account: string; resetAt: number; body?: string },
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	const upstream = limitHeaders(expected.resetAt, expected.account);
+	for (const [name, value] of Object.entries(upstream)) {
+		if (HOP_BY_HOP.has(name) || name === "retry-after") continue;
+		expect([name, response.headers.get(name)]).toEqual([name, value]);
+	}
+	expect(response.headers.get("retry-after")).toBe(
+		retryAfterFor(expected.resetAt),
+	);
+	expect(response.headers.get("date")).toBe(new Date(NOW).toUTCString());
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	expect(bytes).toEqual(
+		new TextEncoder().encode(expected.body ?? limitBody(expected.account)),
+	);
+}
+
 beforeEach(() => {
 	setSystemTime(new Date(NOW));
+	clearLimitRefusalCache();
 	clearVisionCapability();
 	resetRateLimitProbeGatesForTests();
 	spyOn(usageCollectorModule, "getUsageCollector").mockReturnValue({
@@ -358,6 +474,7 @@ afterEach(() => {
 	setSystemTime();
 	globalThis.fetch = originalFetch;
 	usageCache.clear();
+	clearLimitRefusalCache();
 	clearFamilyExhaustionCache();
 	clearVisionCapability();
 	resetRateLimitProbeGatesForTests();
@@ -366,7 +483,7 @@ afterEach(() => {
 
 describe("session-pace with every account out on limits", () => {
 	for (const stream of [false, true]) {
-		it(`forwards to the account that resets first and returns its upstream response unchanged (stream=${stream})`, async () => {
+		it(`answers the local 429 of the account that resets first and forwards nothing (stream=${stream})`, async () => {
 			const weekly = makeAccount("weekly");
 			const fiveHour = makeAccount("five");
 			usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
@@ -378,17 +495,35 @@ describe("session-pace with every account out on limits", () => {
 
 			const response = await send(ctx, makeRequest({ stream }));
 
-			expect(calls).toEqual(["five"]);
-			const added = await expectUpstreamIdentity(response, {
-				status: 429,
-				headers: limitHeaders(NOW + 2 * HOUR, "five"),
-				body: limitBody("five"),
+			expect(perAccount(calls)).toEqual({});
+			await expectBuiltLimit429(response, {
+				resetAt: NOW + 2 * HOUR,
+				claim: "five_hour",
 			});
-			expect(added).toEqual(["x-better-ccflare-request-id"]);
+		});
+
+		it(`replays the cached real 429 of the account that resets first, rebased to now (stream=${stream})`, async () => {
+			const weekly = makeAccount("weekly");
+			const fiveHour = makeAccount("five");
+			usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
+			usageCache.set("five", usage({ fiveHour: win(100, NOW + 2 * HOUR) }));
+			rememberRefusal("five", NOW + 2 * HOUR);
+			const calls = installUpstream((account) =>
+				limit429(NOW + 2 * HOUR, account),
+			);
+			const { ctx } = makeCtx([weekly, fiveHour], paceStrategy());
+
+			const response = await send(ctx, makeRequest({ stream }));
+
+			expect(perAccount(calls)).toEqual({});
+			await expectReplayedRefusal(response, {
+				account: "five",
+				resetAt: NOW + 2 * HOUR,
+			});
 		});
 	}
 
-	it("passes a success from the target through like any success", async () => {
+	it("answers the local 429 even when the account it names would have served", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		usageCache.set("a", usage({ fiveHour: win(100, NOW + 3 * HOUR) }));
@@ -396,11 +531,48 @@ describe("session-pace with every account out on limits", () => {
 		const calls = installUpstream((account) => ok200(account));
 		const { ctx } = makeCtx([a, b], paceStrategy());
 
-		const response = (await send(ctx)) as Response;
+		const response = await send(ctx);
 
-		expect(calls).toEqual(["b"]);
-		expect(response.status).toBe(200);
-		expect(await response.text()).toContain("hi from b");
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
+	});
+
+	it("takes the reset from the cooldown when the account it names is out only on a cooldown", async () => {
+		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
+		const b = makeAccount("b");
+		usageCache.set("a", usage({ fiveHour: win(40, NOW + 4 * HOUR) }));
+		usageCache.set("b", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
+		const calls = installUpstream((account) => ok200(account));
+		const { ctx } = makeCtx([a, b], paceStrategy());
+
+		const response = await send(ctx);
+
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
+	});
+
+	it("answers a bypass-session request without a forced account with the local 429", async () => {
+		// Cooldowns, not full windows: on this branch the usage-cap prefilter
+		// still readmits a capped account for the bypass header (the gate
+		// stream closes that).
+		const a = makeAccount("a", { rate_limited_until: NOW + 3 * HOUR });
+		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
+		const calls = installUpstream((account) => ok200(account));
+		const { ctx } = makeCtx([a, b], paceStrategy());
+
+		const response = await send(
+			ctx,
+			headerRequest({ "x-better-ccflare-bypass-session": "true" }),
+		);
+
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
+		});
 	});
 
 	for (const session of ["mapped-session", "new-session", null]) {
@@ -417,15 +589,14 @@ describe("session-pace with every account out on limits", () => {
 			usageCache.set("b", usage({ fiveHour: win(100, NOW + HOUR) }));
 			const calls = installUpstream((account) => limit429(NOW + HOUR, account));
 
-			const response = (await send(ctx, makeRequest({ session }))) as Response;
+			const response = await send(ctx, makeRequest({ session }));
 
-			expect(calls).toEqual(["b"]);
-			expect(response.status).toBe(429);
-			expect(await response.text()).toBe(limitBody("b"));
+			expect(perAccount(calls)).toEqual({});
+			await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
 		});
 	}
 
-	it("forwards a family-exhausted request to the account whose family limit resets first", async () => {
+	it("answers a family-exhausted request with the family 429 of the account whose family limit resets first", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		usageCache.set(
@@ -443,15 +614,14 @@ describe("session-pace with every account out on limits", () => {
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["b"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + 20 * HOUR, "b"),
-			body: limitBody("b"),
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + 20 * HOUR,
+			claim: "seven_day_opus",
 		});
 	});
 
-	it("never targets a paused account, even one that resets first", async () => {
+	it("never describes a paused account, even one that resets first", async () => {
 		const paused = makeAccount("paused", { paused: true });
 		const b = makeAccount("b");
 		usageCache.set("paused", usage({ fiveHour: win(100, NOW + HOUR) }));
@@ -461,10 +631,10 @@ describe("session-pace with every account out on limits", () => {
 		);
 		const { ctx } = makeCtx([paused, b], paceStrategy());
 
-		const response = (await send(ctx)) as Response;
+		const response = await send(ctx);
 
-		expect(calls).toEqual(["b"]);
-		expect(response.status).toBe(429);
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, { resetAt: NOW + 4 * HOUR });
 	});
 
 	it("keeps the proxy's own error when every account is paused", async () => {
@@ -497,7 +667,7 @@ describe("other strategies keep today's local errors", () => {
 		expect(body.error.type).toBe("pool_exhausted");
 	});
 
-	it("keeps the local 429 model_family_exhausted", async () => {
+	it("keeps the local family 429", async () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -510,8 +680,14 @@ describe("other strategies keep today's local errors", () => {
 
 		expect(calls).toEqual([]);
 		expect(response.status).toBe(429);
-		const body = (await response.json()) as { error: { code: string } };
-		expect(body.error.code).toBe("model_family_exhausted");
+		const body = (await response.json()) as {
+			error: { type: string; code?: string };
+		};
+		expect(body.error.type).toBe("rate_limit_error");
+		expect(body.error.code).toBeUndefined();
+		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
 	});
 
 	it("still turns an upstream 429 on the last candidate into the local error", async () => {
@@ -531,56 +707,52 @@ describe("other strategies keep today's local errors", () => {
 });
 
 describe("failover path C", () => {
-	it("returns the held refusal when the account that refused last resets first", async () => {
+	it("replays the held refusal, retry-after recounted from its unified reset, when the account that refused last resets first", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		const calls = installUpstream((account) =>
 			account === "a"
 				? limit429(NOW + 3 * HOUR, "a")
-				: limit429(NOW + HOUR, "b"),
+				: limit429(NOW + HOUR, "b", STALE_RETRY_AFTER),
 		);
 		const { ctx } = makeCtx([a, b], earliestResetStrategy());
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "b"),
-			body: limitBody("b"),
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "b",
+			resetAt: NOW + HOUR,
 		});
 	});
 
-	it("forwards once more to the earliest account when it is not the one held", async () => {
+	it("answers the local 429 of the earliest account when it is not the one held, with no further upstream request", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		const calls = installUpstream((account) =>
 			account === "a"
-				? limit429(NOW + HOUR, "a")
+				? limit429(NOW + HOUR, "a", STALE_RETRY_AFTER)
 				: limit429(NOW + 3 * HOUR, "b"),
 		);
 		const strategy = earliestResetStrategy();
-		const { ctx, writes, row } = makeCtx([a, b], strategy);
+		const { ctx, row } = makeCtx([a, b], strategy);
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b", "a"]);
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
 		expect(strategy.picks).toHaveLength(1);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "a"),
-			body: limitBody("a"),
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
 		});
-		// The extra forward is on the rule path: its refusal does not grow the streak.
-		expect(writes.at(-1)).toMatchObject({ id: "a", increment: false });
 		expect(row("a").consecutive_rate_limits).toBe(1);
 	});
 
-	it("passes a success from the extra forward through", async () => {
+	it("never asks the earliest account again, even when it would now serve", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		const calls = installUpstream((account, index) =>
-			index === 2
+			index >= 2
 				? ok200(account)
 				: account === "a"
 					? limit429(NOW + HOUR, "a")
@@ -588,10 +760,36 @@ describe("failover path C", () => {
 		);
 		const { ctx } = makeCtx([a, b], earliestResetStrategy());
 
-		const response = (await send(ctx)) as Response;
+		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b", "a"]);
-		expect(response.status).toBe(200);
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
+		});
+	});
+
+	it("replays the held refusal when the rule picks no account", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const calls = installUpstream((account) =>
+			account === "a"
+				? limit429(NOW + HOUR, "a")
+				: limit429(NOW + 3 * HOUR, "b", STALE_RETRY_AFTER),
+		);
+		const strategy = {
+			...plainStrategy(),
+			selectWhenAllLimited: () => null,
+		} as unknown as LoadBalancingStrategy;
+		const { ctx } = makeCtx([a, b], strategy);
+
+		const response = await send(ctx);
+
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "b",
+			resetAt: NOW + 3 * HOUR,
+		});
 	});
 
 	it("leaves a strategy without the rule at today's local error", async () => {
@@ -631,11 +829,10 @@ describe("failover path C", () => {
 		const response = await send(ctx);
 
 		expect(writes).toHaveLength(0);
-		expect(calls).toEqual(["a", "b", "a"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "a"),
-			body: limitBody("a"),
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
 		});
 	});
 
@@ -645,23 +842,22 @@ describe("failover path C", () => {
 		const calls = installUpstream((account) =>
 			account === "a"
 				? limit429(NOW + 3 * HOUR, "a")
-				: limit429(NOW + HOUR, "b"),
+				: limit429(NOW + HOUR, "b", STALE_RETRY_AFTER),
 		);
 		const { ctx } = makeCtx([a, b], earliestResetStrategy());
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "b"),
-			body: limitBody("b"),
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "b",
+			resetAt: NOW + HOUR,
 		});
 	});
 });
 
 describe("refusals on the rule path (point 6)", () => {
-	it("leave consecutive_rate_limits unchanged and the account eligible once its reset passes", async () => {
+	it("are answered locally, leave consecutive_rate_limits and the cooldown unchanged, and the account eligible once its reset passes", async () => {
 		const a = makeAccount("a", { consecutive_rate_limits: 2 });
 		const b = makeAccount("b");
 		usageCache.set("b", usage({ sevenDay: win(100, NOW + 40 * HOUR) }));
@@ -671,14 +867,15 @@ describe("refusals on the rule path (point 6)", () => {
 		const { ctx, writes, row } = makeCtx([a, b], paceStrategy());
 
 		for (let i = 0; i < 4; i++) {
-			const response = (await send(ctx)) as Response;
-			expect(response.status).toBe(429);
+			await expectBuiltLimit429(await send(ctx), {
+				resetAt: NOW + HOUR,
+				cooldown: true,
+			});
 		}
 
-		expect(calls).toEqual(["a", "a", "a", "a"]);
+		expect(perAccount(calls)).toEqual({});
 		expect(row("a").consecutive_rate_limits).toBe(2);
-		expect(writes).toHaveLength(4);
-		expect(writes.every((w) => w.id === "a" && !w.increment)).toBe(true);
+		expect(writes).toHaveLength(0);
 		expect(row("a").rate_limited_until).toBe(NOW + HOUR);
 		expect(row("a").paused).toBe(false);
 
@@ -692,7 +889,7 @@ describe("refusals on the rule path (point 6)", () => {
 });
 
 describe("end-to-end ordering", () => {
-	it("prefers the account out on its 5-hour window over the one out for the week", async () => {
+	it("describes the account out on its 5-hour window, not the one out for the week", async () => {
 		const weekly = makeAccount("weekly", { priority: 0 });
 		const five = makeAccount("five", { priority: 5 });
 		usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 20 * HOUR) }));
@@ -702,11 +899,32 @@ describe("end-to-end ordering", () => {
 		);
 		const { ctx } = makeCtx([weekly, five], paceStrategy());
 
-		const response = (await send(ctx)) as Response;
+		const response = await send(ctx);
 
-		expect(calls).toEqual(["five"]);
-		expect(response.status).toBe(429);
-		expect(response.headers.get("x-upstream-account")).toBe("five");
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + 4 * HOUR,
+			claim: "five_hour",
+		});
+	});
+
+	it("describes the cached refusal of the account it picks, not another account's", async () => {
+		const weekly = makeAccount("weekly", { priority: 0 });
+		const five = makeAccount("five", { priority: 5 });
+		usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 20 * HOUR) }));
+		usageCache.set("five", usage({ fiveHour: win(100, NOW + 4 * HOUR) }));
+		rememberRefusal("weekly", NOW + 20 * HOUR);
+		rememberRefusal("five", NOW + 4 * HOUR);
+		const calls = installUpstream((account) => ok200(account));
+		const { ctx } = makeCtx([weekly, five], paceStrategy());
+
+		const response = await send(ctx);
+
+		expect(perAccount(calls)).toEqual({});
+		await expectReplayedRefusal(response, {
+			account: "five",
+			resetAt: NOW + 4 * HOUR,
+		});
 	});
 });
 
@@ -742,6 +960,9 @@ describe("requests that own their routing never reach failover path C", () => {
 	for (const [label, headers] of cases) {
 		it(`answers ${label} that gets a 429 as today, with no second forward`, async () => {
 			const run = async (strategy: LoadBalancingStrategy) => {
+				// Each run starts from no readings: the 429 a run gets marks its account
+				// in the usage cache, which would otherwise carry into the next run.
+				usageCache.clear();
 				const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 				const b = makeAccount("b");
 				const calls = installUpstream((account) =>
@@ -763,7 +984,12 @@ describe("requests that own their routing never reach failover path C", () => {
 });
 
 /** A 429 whose body is larger than the held-refusal buffer, with a cancel probe. */
-function bigLimit429(resetAt: number, account: string, size = 100 * 1024) {
+function bigLimit429(
+	resetAt: number,
+	account: string,
+	retryAfter?: string,
+	size = 100 * 1024,
+) {
 	const text = JSON.stringify({
 		type: "error",
 		error: { type: "rate_limit_error", message: "x".repeat(size) },
@@ -788,29 +1014,29 @@ function bigLimit429(resetAt: number, account: string, size = 100 * 1024) {
 	const response = new Response(body, {
 		status: 429,
 		statusText: "Too Many Requests",
-		headers: limitHeaders(resetAt, account),
+		headers: limitHeaders(resetAt, account, retryAfter),
 	});
 	return { response, text, state };
 }
 
 describe("a limit refusal larger than the held-refusal buffer", () => {
-	it("reaches the client whole when it is the only answer", async () => {
+	it("reaches the client whole, rebased to now, when it is the only answer", async () => {
 		const a = makeAccount("a");
-		const big = bigLimit429(NOW + HOUR, "a");
+		const big = bigLimit429(NOW + HOUR, "a", STALE_RETRY_AFTER);
 		const calls = installUpstream(() => big.response);
 		const { ctx } = makeCtx([a], earliestResetStrategy());
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "a"),
+		expect(perAccount(calls)).toEqual({ a: 1 });
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
 			body: big.text,
 		});
 	});
 
-	it("is forwarded whole when its account resets first, after a later refusal", async () => {
+	it("is released and its account answered locally when it resets first, after a later refusal", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		const big = bigLimit429(NOW + HOUR, "a");
@@ -821,14 +1047,10 @@ describe("a limit refusal larger than the held-refusal buffer", () => {
 
 		const response = await send(ctx);
 
-		// a is asked once more on the rule path and answers with a normal 429.
-		expect(calls).toEqual(["a", "b", "a"]);
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
 		expect(big.state.cancelled).toBe(true);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + 3 * HOUR, "a"),
-			body: limitBody("a"),
-		});
+		// Too large to keep, so a's answer is built from its cooldown.
+		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
 	});
 
 	it("is released when a later refusal replaces it", async () => {
@@ -836,18 +1058,38 @@ describe("a limit refusal larger than the held-refusal buffer", () => {
 		const b = makeAccount("b");
 		const big = bigLimit429(NOW + 3 * HOUR, "a");
 		const calls = installUpstream((account) =>
-			account === "a" ? big.response : limit429(NOW + HOUR, "b"),
+			account === "a"
+				? big.response
+				: limit429(NOW + HOUR, "b", STALE_RETRY_AFTER),
 		);
 		const { ctx } = makeCtx([a, b], earliestResetStrategy());
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b"]);
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
 		expect(big.state.cancelled).toBe(true);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "b"),
-			body: limitBody("b"),
+		await expectReplayedRefusal(response, {
+			account: "b",
+			resetAt: NOW + HOUR,
+		});
+	});
+
+	it("is released when the rule picks another account, and nothing more is asked upstream", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		const big = bigLimit429(NOW + 3 * HOUR, "b");
+		const calls = installUpstream((account) =>
+			account === "a" ? limit429(NOW + HOUR, "a") : big.response,
+		);
+		const { ctx } = makeCtx([a, b], earliestResetStrategy());
+
+		const response = await send(ctx);
+
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		expect(big.state.cancelled).toBe(true);
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
 		});
 	});
 
@@ -884,29 +1126,30 @@ describe("a held limit refusal and an exception after it", () => {
 
 	it("leaves the held body to the client when it is replayed", async () => {
 		const a = makeAccount("a");
-		const big = bigLimit429(NOW + HOUR, "a");
-		installUpstream(() => big.response);
+		const big = bigLimit429(NOW + HOUR, "a", STALE_RETRY_AFTER);
+		const calls = installUpstream(() => big.response);
 		const { ctx } = makeCtx([a], earliestResetStrategy());
 
 		const response = await send(ctx);
 
 		expect(big.state.cancelled).toBe(false);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "a"),
+		expect(perAccount(calls)).toEqual({ a: 1 });
+		await expectReplayedRefusal(response, {
+			account: "a",
+			resetAt: NOW + HOUR,
 			body: big.text,
 		});
 	});
 });
 
 describe("failover path C target discovery", () => {
-	it("answers with the held refusal when reading the accounts fails", async () => {
+	it("replays the held refusal, rebased to now, when reading the accounts fails", async () => {
 		const a = makeAccount("a");
 		const b = makeAccount("b");
 		const calls = installUpstream((account) =>
 			account === "a"
 				? limit429(NOW + HOUR, "a")
-				: limit429(NOW + 3 * HOUR, "b"),
+				: limit429(NOW + 3 * HOUR, "b", STALE_RETRY_AFTER),
 		);
 		const { ctx, dbOps } = makeCtx([a, b], earliestResetStrategy());
 		const ops = dbOps as unknown as Record<string, unknown>;
@@ -918,11 +1161,10 @@ describe("failover path C target discovery", () => {
 
 		const response = await send(ctx);
 
-		expect(calls).toEqual(["a", "b"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + 3 * HOUR, "b"),
-			body: limitBody("b"),
+		expect(perAccount(calls)).toEqual({ a: 1, b: 1 });
+		await expectReplayedRefusal(response, {
+			account: "b",
+			resetAt: NOW + 3 * HOUR,
 		});
 	});
 });
@@ -938,7 +1180,7 @@ describe("session-pace with every account out on limits and capacity routing on"
 		makeCtx(accounts, paceStrategy(), { capacityRouting: true });
 
 	for (const stream of [false, true]) {
-		it(`returns the upstream 429 of the account usable first for a message (stream=${stream})`, async () => {
+		it(`answers the local 429 of the account usable first for a message (stream=${stream})`, async () => {
 			const weekly = makeAccount("weekly");
 			const five = makeAccount("five");
 			usageCache.set("weekly", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
@@ -950,18 +1192,16 @@ describe("session-pace with every account out on limits and capacity routing on"
 
 			const response = await send(ctx, makeRequest({ stream }));
 
-			expect((response as Response).status).toBe(429);
-			expect(calls).toEqual(["five"]);
-			await expectUpstreamIdentity(response, {
-				status: 429,
-				headers: limitHeaders(NOW + 2 * HOUR, "five"),
-				body: limitBody("five"),
+			expect(perAccount(calls)).toEqual({});
+			await expectBuiltLimit429(response, {
+				resetAt: NOW + 2 * HOUR,
+				claim: "five_hour",
 			});
 		});
 	}
 
 	for (const session of ["first-request-of-a-session", null]) {
-		it(`routes session=${session} to the account usable first`, async () => {
+		it(`answers session=${session} with the local 429 of the account usable first`, async () => {
 			const a = makeAccount("a");
 			const b = makeAccount("b");
 			usageCache.set("a", usage({ fiveHour: win(100, NOW + 3 * HOUR) }));
@@ -971,17 +1211,12 @@ describe("session-pace with every account out on limits and capacity routing on"
 
 			const response = await send(ctx, makeRequest({ session }));
 
-			expect((response as Response).status).toBe(429);
-			expect(calls).toEqual(["b"]);
-			await expectUpstreamIdentity(response, {
-				status: 429,
-				headers: limitHeaders(NOW + HOUR, "b"),
-				body: limitBody("b"),
-			});
+			expect(perAccount(calls)).toEqual({});
+			await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
 		});
 	}
 
-	it("routes on cooldowns alone when usage data is missing, as right after a restart", async () => {
+	it("builds the answer from cooldowns alone when usage data is missing, as right after a restart", async () => {
 		const a = makeAccount("a", { rate_limited_until: NOW + 2 * HOUR });
 		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
 		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
@@ -989,16 +1224,14 @@ describe("session-pace with every account out on limits and capacity routing on"
 
 		const response = await send(ctx);
 
-		expect((response as Response).status).toBe(429);
-		expect(calls).toEqual(["b"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "b"),
-			body: limitBody("b"),
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, {
+			resetAt: NOW + HOUR,
+			cooldown: true,
 		});
 	});
 
-	it("returns the upstream 429 for count_tokens", async () => {
+	it("answers count_tokens with the local 429", async () => {
 		const a = makeAccount("a");
 		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
 		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
@@ -1017,16 +1250,11 @@ describe("session-pace with every account out on limits and capacity routing on"
 
 		const response = await send(ctx, request);
 
-		expect((response as Response).status).toBe(429);
-		expect(calls).toEqual(["a"]);
-		await expectUpstreamIdentity(response, {
-			status: 429,
-			headers: limitHeaders(NOW + HOUR, "a"),
-			body: limitBody("a"),
-		});
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, { resetAt: NOW + HOUR });
 	});
 
-	it("returns the upstream 429 for HEAD /api/hello", async () => {
+	it("answers HEAD /api/hello with the local 429", async () => {
 		const a = makeAccount("a");
 		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
 		const calls = installUpstream((account) => limit429(NOW + HOUR, account));
@@ -1035,14 +1263,10 @@ describe("session-pace with every account out on limits and capacity routing on"
 			method: "HEAD",
 		});
 
-		const response = (await send(ctx, request)) as Response;
+		const response = await send(ctx, request);
 
-		expect((response as Response).status).toBe(429);
-		expect(calls).toEqual(["a"]);
-		expect(response.status).toBe(429);
-		expect(response.headers.get("retry-after")).toBe(
-			limitHeaders(NOW + HOUR, "a")["retry-after"],
-		);
+		expect(perAccount(calls)).toEqual({});
+		await expectBuiltLimit429(response, { resetAt: NOW + HOUR, head: true });
 	});
 
 	it("keeps the proxy's own 503 when every account is paused or needs re-login", async () => {

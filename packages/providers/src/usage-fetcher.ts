@@ -2,7 +2,6 @@ import {
 	type AccountUsageSnapshot,
 	CLAUDE_CLI_VERSION,
 	getModelFamily,
-	isUseExtraUsageEnabled,
 } from "@better-ccflare/core";
 import { Logger } from "@better-ccflare/logger";
 import {
@@ -330,6 +329,64 @@ export function extractModelFamilyWindows(
 		});
 	}
 	return rows;
+}
+
+/** Flat account windows a full reading is held for (admission's set). */
+const HELD_FLAT_WINDOWS = [
+	"five_hour",
+	"seven_day",
+	"seven_day_oauth_apps",
+] as const;
+
+/** `limits[]` kinds a full reading is held for. */
+const HELD_LIMIT_KINDS = new Set<unknown>([
+	"session",
+	"weekly_all",
+	"weekly_scoped",
+]);
+
+/** How long a full window holds when its reading gives no reset: a week. */
+const UNKNOWN_FULL_RESET_HOLD_MS = 7 * 24 * 3_600_000;
+
+/**
+ * Until when a reading that shows a window full must stay in the cache: the
+ * latest reset among its full windows (five-hour, weekly, the flat
+ * `seven_day_oauth_apps` window, and model-scoped weekly rows, flat or
+ * `limits[]` shape), now plus a week when a full window
+ * has no reset. Undefined when nothing in the reading is full; a full window
+ * whose reset already passed holds nothing.
+ */
+export function fullReadingHoldUntil(
+	data: AnyUsageData,
+	now: number = Date.now(),
+): number | undefined {
+	const d = data as UsageData;
+	const windows: StrategyUsageWindow[] = [];
+	// Every shape admission reads as a limit: the flat account windows
+	// (including `seven_day_oauth_apps`) and every `limits[]` session,
+	// weekly_all and weekly_scoped row.
+	for (const key of HELD_FLAT_WINDOWS) {
+		const window = windowFrom(d[key], undefined);
+		if (window) windows.push(window);
+	}
+	if (Array.isArray(d.limits)) {
+		for (const limit of d.limits) {
+			if (!limit || !HELD_LIMIT_KINDS.has(limit.kind)) continue;
+			if (typeof limit.percent !== "number") continue;
+			windows.push({
+				utilization: limit.percent,
+				resetsAt: parseResetMs(limit.resets_at),
+			});
+		}
+	}
+	let until: number | undefined;
+	for (const window of windows) {
+		if (!(window.utilization >= 100)) continue;
+		const end = window.resetsAt ?? now + UNKNOWN_FULL_RESET_HOLD_MS;
+		if (end <= now) continue;
+		until = until === undefined ? end : Math.max(until, end);
+	}
+	return until;
 }
 
 /**
@@ -676,6 +733,10 @@ function utilizationForProvider(
  *   `extra_usage_exhausted` (issue #293), not something to predict from
  *   telemetry.
  *
+ * The opposite never holds: a five_hour or seven_day window at 100% is final.
+ * Extra usage left in the overage pool does not make a spent plan window
+ * usable; the router never serves a request from extra usage.
+ *
  * Use {@link getRankingUtilizationForProvider} for load-balancing order, where
  * a spent overage pool legitimately makes an account the less attractive pick.
  */
@@ -876,12 +937,19 @@ export function getRepresentativeUsageResetMs(
  * provider exposes no utilization surface at all. Callers must fall back to
  * the usage-free check rather than read null as "not exhausted by telemetry".
  *
+ * Anthropic and Codex: when any hard window (five-hour or weekly) is still
+ * full — >= 100% with a future or unknown reset — the snapshot reports that
+ * window, so a stale full window picked as representative can never hide a
+ * window that is still full (see {@link fullHardWindowSnapshot}). `now`
+ * decides "future" for that check only.
+ *
  * `provider` is taken as given: callers holding a nullable `account.provider`
  * apply their own `?? "anthropic"` default before calling.
  */
 export function getRepresentativeUsageSnapshotForProvider(
 	data: AnyUsageData | null | undefined,
 	provider: string,
+	now: number = Date.now(),
 ): AccountUsageSnapshot | null {
 	if (!data) return null;
 	if (provider === "zai") {
@@ -894,7 +962,45 @@ export function getRepresentativeUsageSnapshotForProvider(
 		if (!winning) return null;
 		return { utilization: winning.percentage, resetMs: winning.resetAt };
 	}
-	return plainUsageSnapshot(data, provider);
+	return (
+		fullHardWindowSnapshot(data, provider, now) ??
+		plainUsageSnapshot(data, provider)
+	);
+}
+
+/**
+ * The still-full hard window of an Anthropic or Codex payload, or null when
+ * none is. A hard window is the five-hour or the all-models weekly one
+ * (extra_usage is not: it has no reset and is not a plan limit); it is still
+ * full at >= 100% with a reset after `now` or no usable reset at all. Among
+ * several, an unknown reset wins (the account cannot be shown to come back),
+ * else the latest reset (it serves again only once every full window has
+ * reset). Utilization and reset come from that same window.
+ */
+function fullHardWindowSnapshot(
+	data: AnyUsageData,
+	provider: string,
+	now: number,
+): AccountUsageSnapshot | null {
+	if (provider !== "anthropic" && provider !== "codex") return null;
+	let picked: StrategyUsageWindow | null = null;
+	for (const window of [
+		extractFiveHourWindow(data, provider),
+		extractWeeklyWindow(data, provider),
+	]) {
+		if (!window || window.utilization < 100) continue;
+		if (window.resetsAt !== null && window.resetsAt <= now) continue;
+		if (
+			picked === null ||
+			(picked.resetsAt !== null &&
+				(window.resetsAt === null || window.resetsAt > picked.resetsAt))
+		) {
+			picked = window;
+		}
+	}
+	return picked
+		? { utilization: picked.utilization, resetMs: picked.resetsAt }
+		: null;
 }
 
 /**
@@ -910,23 +1016,19 @@ function plainUsageSnapshot(
 ): AccountUsageSnapshot | null {
 	const utilization = getRepresentativeUtilizationForProvider(data, provider);
 	if (utilization === null) return null;
-	const snapshot: AccountUsageSnapshot = {
+	// No extra-usage flag rides along: a full window is final, whatever the
+	// provider's billed capacity beyond the plan.
+	return {
 		utilization,
 		resetMs: getRepresentativeUsageResetMs(data, provider),
 	};
-	// Policy and fact together: the operator allows extra usage AND the
-	// provider says there is some. The window itself is reported unchanged —
-	// only whether it shuts the account out differs.
-	if (isUseExtraUsageEnabled() && hasExtraUsageCapacity(data, provider)) {
-		snapshot.extraUsageAvailable = true;
-	}
-	return snapshot;
 }
 
 /**
  * Whether the provider reports billed capacity that keeps serving after the
- * plan window is spent. A fact about the account only; whether to use it is
- * the "use extra usage" setting's call (see plainUsageSnapshot).
+ * plan window is spent. A display fact about the account only: no routing
+ * gate reads it, because a full plan window is final and the router never
+ * serves a request from extra usage (the "use extra usage" setting is ignored).
  *
  * - codex: purchased credits or an unlimited allowance (`credits`).
  * - anthropic: overage that is enabled and not yet used up. The 2026 `spend`
@@ -1059,11 +1161,29 @@ export function normalizeUsageSnapshotForHistory(
  */
 export type AccessTokenProvider = () => Promise<string>;
 
+export type PolledReadingListener = (
+	accountId: string,
+	data: AnyUsageData,
+	requestedAt: number,
+) => void;
+
+function isHeld(entry: { holdUntil?: number }, now: number): boolean {
+	return entry.holdUntil !== undefined && entry.holdUntil > now;
+}
+
 /**
  * In-memory cache for usage data per account
  */
 class UsageCache {
-	private cache = new Map<string, { data: AnyUsageData; timestamp: number }>();
+	private cache = new Map<
+		string,
+		{ data: AnyUsageData; timestamp: number; holdUntil?: number }
+	>();
+	/**
+	 * Listeners told about every Anthropic poll reading that reached the cache,
+	 * with the time its request went out. Kept across {@link clear}.
+	 */
+	private polledReadingListeners = new Set<PolledReadingListener>();
 	/**
 	 * Per-account write counter, bumped by {@link install} and by every teardown
 	 * ({@link invalidateInFlight}). A poll captures it before its request goes on
@@ -1320,8 +1440,15 @@ class UsageCache {
 			this.capacityRestoredCallbacks.delete(accountId);
 			this.staleWeeklyResetCallbacks.delete(accountId);
 			this.snapshotCallbacks.delete(accountId);
-			// Clean up cache entry when polling stops to prevent memory leaks
-			this.cache.delete(accountId);
+			// Clean up cache entry when polling stops to prevent memory leaks,
+			// except a reading held until a full window's reset: a restart
+			// ("Refresh usage") must not drop it before a newer reading
+			// replaces it. Account removal drops it with delete(); otherwise
+			// the age sweep removes it once the hold ends.
+			const cached = this.cache.get(accountId);
+			if (!cached || !isHeld(cached, Date.now())) {
+				this.cache.delete(accountId);
+			}
 			this.invalidateInFlight(accountId);
 			this.usageRateLimitedUntil.delete(accountId);
 			// Clear any in-flight fetch so it doesn't linger after polling stops.
@@ -1633,7 +1760,22 @@ class UsageCache {
 				return { success: false, retryAfterMs: result.retryAfterMs };
 			} else {
 				// Default to Anthropic usage data
+				// Same stale-poll guard as Codex: the traffic path marks an account
+				// full from response headers (proxy header-mark-out.ts) while a poll
+				// may already be on the wire; that poll's older reading must not
+				// put the account back in rotation.
+				const generationBefore = this.generations.get(accountId) ?? 0;
+				const requestedAt = Date.now();
 				const result = await fetchUsageData(token);
+				if (
+					result.data &&
+					(this.generations.get(accountId) ?? 0) !== generationBefore
+				) {
+					log.debug(
+						`Discarding Anthropic usage poll for account ${accountId}: another writer updated the cache while the request was in flight`,
+					);
+					return { success: true, retryAfterMs: null };
+				}
 				if (result.data) {
 					// Snapshot before clearing — needed for the capacity-restored guard below.
 					const wasRateLimited = this.usageRateLimitedUntil.has(accountId);
@@ -1646,10 +1788,17 @@ class UsageCache {
 							"anthropic",
 							callback,
 						);
+					// A reading that confirms a window full stays until that
+					// window's reset, like a header mark: failed polls must not
+					// age the account back into rotation. A newer poll replaces
+					// it as usual.
+					const holdUntil = fullReadingHoldUntil(result.data);
 					this.cache.set(accountId, {
 						data: result.data,
 						timestamp: Date.now(),
+						...(holdUntil !== undefined ? { holdUntil } : {}),
 					});
+					this.notifyPolledReading(accountId, result.data, requestedAt);
 					const snapshotCb = this.snapshotCallbacks.get(accountId);
 					if (snapshotCb) snapshotCb(accountId, result.data as UsageData);
 					const utilization = getRepresentativeUtilization(
@@ -1729,7 +1878,7 @@ class UsageCache {
 		let cleanedCount = 0;
 
 		for (const [accountId, cached] of this.cache.entries()) {
-			if (now - cached.timestamp > maxAgeMs) {
+			if (now - cached.timestamp > maxAgeMs && !isHeld(cached, now)) {
 				this.cache.delete(accountId);
 				cleanedCount++;
 			}
@@ -1749,7 +1898,7 @@ class UsageCache {
 
 		// Clean up stale entries while accessing
 		const age = Date.now() - cached.timestamp;
-		if (age > 10 * 60 * 1000) {
+		if (age > 10 * 60 * 1000 && !isHeld(cached, Date.now())) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			log.debug(
@@ -1764,11 +1913,49 @@ class UsageCache {
 	/**
 	 * Write a payload into the cache and bump the account's generation. Every
 	 * write must go through here so an in-flight poll can tell that it lost a
-	 * race — see {@link generations}.
+	 * race — see {@link generations}. Without an explicit `holdUntil`, a
+	 * payload that shows a window full is held until that window's reset
+	 * ({@link fullReadingHoldUntil}).
 	 */
-	private install(accountId: string, data: AnyUsageData): void {
-		this.cache.set(accountId, { data, timestamp: Date.now() });
+	private install(
+		accountId: string,
+		data: AnyUsageData,
+		explicitHoldUntil?: number,
+	): void {
+		const holdUntil = explicitHoldUntil ?? fullReadingHoldUntil(data);
+		this.cache.set(accountId, {
+			data,
+			timestamp: Date.now(),
+			...(holdUntil !== undefined ? { holdUntil } : {}),
+		});
 		this.invalidateInFlight(accountId);
+	}
+
+	/**
+	 * Subscribe to Anthropic poll readings as they reach the cache. The
+	 * listener gets the reading and the time its request went out, so it can
+	 * tell a reading taken after some event from one already on the wire.
+	 * Returns an unsubscribe function.
+	 */
+	onPolledReading(listener: PolledReadingListener): () => void {
+		this.polledReadingListeners.add(listener);
+		return () => this.polledReadingListeners.delete(listener);
+	}
+
+	private notifyPolledReading(
+		accountId: string,
+		data: AnyUsageData,
+		requestedAt: number,
+	): void {
+		for (const listener of this.polledReadingListeners) {
+			try {
+				listener(accountId, data, requestedAt);
+			} catch (error) {
+				log.warn(
+					`Polled-reading listener failed for account ${accountId}: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 	}
 
 	/**
@@ -1784,10 +1971,16 @@ class UsageCache {
 	}
 
 	/**
-	 * Set cached usage data for an account
+	 * Set cached usage data for an account. With `holdUntil` (by default the
+	 * reset of any window the payload shows full), the entry does not expire
+	 * by age before that time; the next write replaces it as usual.
 	 */
-	set(accountId: string, data: AnyUsageData): void {
-		this.install(accountId, data);
+	set(
+		accountId: string,
+		data: AnyUsageData,
+		options: { holdUntil?: number } = {},
+	): void {
+		this.install(accountId, data, options.holdUntil);
 
 		// Periodic cleanup of stale entries to prevent memory bloat
 		// Run cleanup every 100 sets to balance performance and memory
@@ -1852,13 +2045,27 @@ class UsageCache {
 
 		const age = Date.now() - cached.timestamp;
 		// Clean up if too old
-		if (age > 10 * 60 * 1000) {
+		if (age > 10 * 60 * 1000 && !isHeld(cached, Date.now())) {
 			// 10 minutes max age
 			this.cache.delete(accountId);
 			return null;
 		}
 
 		return age;
+	}
+
+	/**
+	 * Clear cached data for an account whose credentials were reloaded, except
+	 * a reading held until a full window's reset: a reload must not reopen a
+	 * known-full account before a newer reading replaces it. Any in-flight
+	 * poll (made with the old credentials) is invalidated either way.
+	 */
+	deleteUnlessHeld(accountId: string): void {
+		const cached = this.cache.get(accountId);
+		if (!cached || !isHeld(cached, Date.now())) {
+			this.cache.delete(accountId);
+		}
+		this.invalidateInFlight(accountId);
 	}
 
 	/**

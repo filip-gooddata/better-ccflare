@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { setUseExtraUsage } from "@better-ccflare/core";
+import { usageCache } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
 import {
 	collectWindows,
@@ -372,6 +373,67 @@ describe("createUsageThrottledResponse", () => {
 		expect(body.error.message).toContain("Codex A");
 		expect(body.error.message).toContain("Codex B");
 	});
+
+	describe("every throttled account at a full limit", () => {
+		const HOUR = 3_600_000;
+		const usageAt = (five: number, fiveResetMs: number, seven = 40) => ({
+			five_hour: {
+				utilization: five,
+				resets_at: new Date(fiveResetMs).toISOString(),
+			},
+			seven_day: {
+				utilization: seven,
+				resets_at: new Date(Date.now() + 72 * HOUR).toISOString(),
+			},
+		});
+		afterEach(() => usageCache.clear());
+
+		it("answers the local 429 of the account whose limit resets soonest", async () => {
+			const soon = Date.now() + 2 * HOUR;
+			usageCache.set("acc-late", usageAt(100, Date.now() + 4 * HOUR) as never);
+			usageCache.set("acc-soon", usageAt(100, soon) as never);
+			const response = createUsageThrottledResponse([
+				makeAccount({ id: "acc-late", name: "late", provider: "anthropic" }),
+				makeAccount({ id: "acc-soon", name: "soon", provider: "anthropic" }),
+			]);
+
+			expect(response.status).toBe(429);
+			expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+				String(Math.floor(soon / 1000)),
+			);
+			expect(
+				response.headers.get(
+					"anthropic-ratelimit-unified-representative-claim",
+				),
+			).toBe("five_hour");
+			const body = (await response.json()) as { error: { type: string } };
+			expect(body.error.type).toBe("rate_limit_error");
+		});
+
+		it("keeps the 529 when one account is only pace-throttled below 100 %", () => {
+			usageCache.set("acc-full", usageAt(100, Date.now() + 2 * HOUR) as never);
+			usageCache.set("acc-pace", usageAt(85, Date.now() + 2 * HOUR) as never);
+			const response = createUsageThrottledResponse([
+				makeAccount({ id: "acc-full", name: "full", provider: "anthropic" }),
+				makeAccount({ id: "acc-pace", name: "pace", provider: "anthropic" }),
+			]);
+			expect(response.status).toBe(529);
+			expect(response.headers.get("Retry-After")).toBe("60");
+		});
+
+		it("keeps the 529 when an account has no cached usage", () => {
+			usageCache.set("acc-full", usageAt(100, Date.now() + 2 * HOUR) as never);
+			const response = createUsageThrottledResponse([
+				makeAccount({ id: "acc-full", name: "full", provider: "anthropic" }),
+				makeAccount({
+					id: "acc-unknown",
+					name: "unknown",
+					provider: "anthropic",
+				}),
+			]);
+			expect(response.status).toBe(529);
+		});
+	});
 });
 
 describe("collectWindows with a single flat window", () => {
@@ -452,12 +514,12 @@ describe("usage throttling with extra usage", () => {
 		);
 	});
 
-	it("does not throttle a spent window that extra usage is serving", () => {
+	it("paces a spent window back to its reset even when a caller claims extra usage", () => {
 		const status = getUsageThrottleStatus(spent, settings, now, {
 			extraUsageAvailable: true,
-		});
-		expect(status.throttleUntil).toBeNull();
-		expect(status.throttledWindows).toEqual([]);
+		} as never);
+		expect(status.throttleUntil).toBe(new Date(resetAt).getTime());
+		expect(status.throttledWindows).toEqual(["five_hour"]);
 	});
 
 	it("keeps pacing a window that is over pace but not spent", () => {
@@ -465,11 +527,7 @@ describe("usage throttling with extra usage", () => {
 			five_hour: { utilization: 80, resets_at: resetAt },
 			seven_day: { utilization: 10, resets_at: null },
 		};
-		expect(
-			getUsageThrottleUntil(overPace, settings, now, {
-				extraUsageAvailable: true,
-			}),
-		).not.toBeNull();
+		expect(getUsageThrottleUntil(overPace, settings, now)).not.toBeNull();
 	});
 
 	describe("getAccountUsageThrottleUntil — the routing decision", () => {
@@ -484,11 +542,11 @@ describe("usage throttling with extra usage", () => {
 			).toBe(new Date(resetAt).getTime());
 		});
 
-		it("lets a spent Codex account with credits through once the switch is on", () => {
+		it("still throttles a spent Codex account with credits, setting on", () => {
 			setUseExtraUsage(true);
 			expect(
 				getAccountUsageThrottleUntil("codex", codexWithCredits, settings, now),
-			).toBeNull();
+			).toBe(new Date(resetAt).getTime());
 		});
 
 		it("still throttles a spent account that has no credits, switch on", () => {

@@ -23,8 +23,6 @@ import {
 } from "../account-selector";
 import {
 	collectLimitBlockedAccounts,
-	isAllLimitedSelection,
-	markAllLimitedSelection,
 	selectAllLimitedTarget,
 } from "../limit-blocked";
 import {
@@ -113,6 +111,27 @@ function usage(parts: {
 	if (parts.spend !== null) data.spend = parts.spend ?? { enabled: false };
 	return data as never;
 }
+
+/** Anthropic usage with one full Fable weekly_scoped row. */
+function fullFableUsage(resetAt: number) {
+	return {
+		five_hour: win(10, NOW + HOUR),
+		seven_day: win(10, NOW + 48 * HOUR),
+		limits: [
+			{
+				kind: "weekly_scoped",
+				percent: 100,
+				resets_at: iso(resetAt),
+				scope: { model: { id: null, display_name: "Fable" }, surface: null },
+			},
+		],
+	} as never;
+}
+
+/** An account whose mapping sends Opus requests upstream as Fable. */
+const opusToFable = {
+	model_mappings: JSON.stringify({ opus: ["claude-fable-5"] }),
+};
 
 /** A fake strategy that filters like the real ones (isAccountAvailable). */
 function availabilityStrategy(
@@ -285,7 +304,7 @@ describe("collectLimitBlockedAccounts", () => {
 		expect(collect([a], {}, makeMeta(), NOW + 6 * HOUR)).toEqual([]);
 	});
 
-	it("leaves out an account that extra usage keeps usable", () => {
+	it("lists a full five-hour window even with the setting on and extra usage left", () => {
 		setUseExtraUsage(true);
 		const a = makeAccount("a");
 		usageCache.set(
@@ -295,10 +314,27 @@ describe("collectLimitBlockedAccounts", () => {
 				spend: { enabled: true, percent: 20 },
 			}),
 		);
-		expect(collect([a])).toEqual([]);
+		expect(limitsOf(collect([a]), "a")).toEqual([
+			{ kind: "five_hour", resetAt: NOW + HOUR },
+		]);
 	});
 
-	it("still lists the account when extra usage exists but the switch is off", () => {
+	it("lists a full weekly window even with the setting on and extra usage left", () => {
+		setUseExtraUsage(true);
+		const a = makeAccount("a");
+		usageCache.set(
+			"a",
+			usage({
+				sevenDay: win(100, NOW + 3 * 24 * HOUR),
+				spend: { enabled: true, percent: 20 },
+			}),
+		);
+		expect(limitsOf(collect([a]), "a")).toEqual([
+			{ kind: "weekly", resetAt: NOW + 3 * 24 * HOUR },
+		]);
+	});
+
+	it("lists the account when extra usage exists and the setting is off", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -342,7 +378,7 @@ describe("collectLimitBlockedAccounts", () => {
 		expect(collect([makeAccount("a")])).toEqual([]);
 	});
 
-	it("lists the family limit only when the family filter is on, at the latest family reset", () => {
+	it("lists a full family in every mode, at the latest family reset", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -353,10 +389,71 @@ describe("collectLimitBlockedAccounts", () => {
 				],
 			}),
 		);
-		expect(collect([a], { capacityRouting: false })).toEqual([]);
-		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
-			{ kind: "family", family: "opus", resetAt: NOW + 30 * HOUR },
+		for (const capacityRouting of [false, true]) {
+			expect(limitsOf(collect([a], { capacityRouting }), "a")).toEqual([
+				{ kind: "family", family: "opus", resetAt: NOW + 30 * HOUR },
+			]);
+		}
+	});
+
+	it("lists a full family row with no reset as a family limit with an unknown reset", () => {
+		const a = makeAccount("a");
+		usageCache.set("a", {
+			five_hour: win(10, NOW + HOUR),
+			seven_day: win(10, NOW + 48 * HOUR),
+			limits: [
+				{
+					kind: "weekly_scoped",
+					percent: 100,
+					resets_at: null,
+					scope: { model: { id: null, display_name: "Opus" }, surface: null },
+				},
+			],
+		} as never);
+		expect(limitsOf(collect([a], { capacityRouting: false }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: null },
 		]);
+	});
+
+	it("lists the full family of the model sent upstream after the account mapping", () => {
+		const a = makeAccount("a", opusToFable);
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			expect(limitsOf(collect([a], { capacityRouting }), "a")).toEqual([
+				{ kind: "family", family: "fable", resetAt: NOW + 10 * HOUR },
+			]);
+		}
+	});
+
+	it("lists the full family a familyless client alias is mapped to", () => {
+		const accounts = [
+			makeAccount("a", {
+				model_mappings: JSON.stringify({ "custom-alias": ["claude-fable-5"] }),
+			}),
+		];
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const blocked = collectLimitBlockedAccounts(
+			accounts,
+			makeCtx({ accounts, strategy: availabilityStrategy() }),
+			makeMeta(),
+			"custom-alias",
+			NOW,
+		);
+		expect(limitsOf(blocked, "a")).toEqual([
+			{ kind: "family", family: "fable", resetAt: NOW + 10 * HOUR },
+		]);
+	});
+
+	it("does not list another family's full row when the request is not mapped to it", () => {
+		const a = makeAccount("a");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		expect(collect([a], { capacityRouting: true })).toEqual([]);
+	});
+
+	it("leaves a reactive family mark out while capacity routing is off", () => {
+		const a = makeAccount("a");
+		markFamilyExhausted("a", "opus", NOW);
+		expect(collect([a], { capacityRouting: false })).toEqual([]);
 	});
 
 	it("does not count overage reported enabled as family capacity", () => {
@@ -378,7 +475,7 @@ describe("collectLimitBlockedAccounts", () => {
 		]);
 	});
 
-	it("keeps the family with the extra-usage switch on and extra usage left", () => {
+	it("lists the full family even with the setting on and extra usage left", () => {
 		const a = makeAccount("a");
 		usageCache.set(
 			"a",
@@ -388,7 +485,9 @@ describe("collectLimitBlockedAccounts", () => {
 			}),
 		);
 		setUseExtraUsage(true);
-		expect(collect([a], { capacityRouting: true })).toEqual([]);
+		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
+			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
+		]);
 	});
 
 	it("gives a reactive family mark an unknown reset", () => {
@@ -414,16 +513,6 @@ describe("collectLimitBlockedAccounts", () => {
 		expect(limitsOf(collect([a], { capacityRouting: true }), "a")).toEqual([
 			{ kind: "family", family: "opus", resetAt: NOW + 12 * HOUR },
 		]);
-	});
-});
-
-describe("all-limited selection mark", () => {
-	it("is set only on the marked request", () => {
-		const marked = makeMeta();
-		const other = makeMeta();
-		markAllLimitedSelection(marked, "a");
-		expect(isAllLimitedSelection(marked)).toBe(true);
-		expect(isAllLimitedSelection(other)).toBe(false);
 	});
 });
 
@@ -462,8 +551,150 @@ describe("selectAllLimitedTarget", () => {
 	});
 });
 
+describe("selectAccountsForRequest: a full limit is never a candidate", () => {
+	it("excludes an account whose family telemetry is full while capacity routing is off", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set(
+			"a",
+			usage({ family: [{ percent: 100, resetAt: NOW + 10 * HOUR }] }),
+		);
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("excludes an account whose mapping sends the request as a full family", async () => {
+		const a = makeAccount("a", opusToFable);
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			const ctx = makeCtx({
+				accounts: [a, b],
+				strategy: availabilityStrategy(),
+				capacityRouting,
+			});
+			const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+			expect(selected.map((x) => x.id)).toEqual(["b"]);
+		}
+	});
+
+	it("excludes an account that maps a familyless client alias to a full family", async () => {
+		const a = makeAccount("a", {
+			model_mappings: JSON.stringify({ "custom-alias": ["claude-fable-5"] }),
+		});
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		for (const capacityRouting of [false, true]) {
+			const ctx = makeCtx({
+				accounts: [a, b],
+				strategy: availabilityStrategy(),
+				capacityRouting,
+			});
+			const selected = await selectAccountsForRequest(
+				makeMeta(),
+				ctx,
+				"custom-alias",
+			);
+			expect(selected.map((x) => x.id)).toEqual(["b"]);
+		}
+	});
+
+	it("skips a combo slot whose account sends the slot model as a full family, capacity routing off", async () => {
+		const a = makeAccount("a", opusToFable);
+		const b = makeAccount("b");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const slot = (id: string, account: string, priority: number) => ({
+			id,
+			combo_id: "combo-1",
+			account_id: account,
+			model: MODEL,
+			priority,
+			enabled: true,
+		});
+		const combo = {
+			id: "combo-1",
+			name: "Combo",
+			description: null,
+			enabled: true,
+			created_at: NOW,
+			updated_at: NOW,
+			slots: [slot("slot-a", "a", 0), slot("slot-b", "b", 1)],
+		} as ComboWithSlots;
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+			activeCombo: combo,
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("keeps routing a familyless client alias that no account maps to a full family", async () => {
+		const a = makeAccount("a");
+		usageCache.set("a", fullFableUsage(NOW + 10 * HOUR));
+		const ctx = makeCtx({ accounts: [a], strategy: availabilityStrategy() });
+		const selected = await selectAccountsForRequest(
+			makeMeta(),
+			ctx,
+			"custom-alias",
+		);
+		expect(selected.map((x) => x.id)).toEqual(["a"]);
+	});
+
+	it("keeps an account with only a reactive family mark while capacity routing is off", async () => {
+		const a = makeAccount("a");
+		markFamilyExhausted("a", "opus", NOW);
+		const ctx = makeCtx({
+			accounts: [a],
+			strategy: availabilityStrategy(),
+			capacityRouting: false,
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["a"]);
+	});
+
+	it("excludes an account whose stale full five-hour window hides a full weekly window", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set(
+			"a",
+			usage({
+				fiveHour: win(100, NOW - HOUR),
+				sevenDay: win(100, NOW + 30 * HOUR),
+			}),
+		);
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+		});
+		const selected = await selectAccountsForRequest(makeMeta(), ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+
+	it("keeps a full account out of normal selection whatever the bypass-session header says", async () => {
+		const a = makeAccount("a");
+		const b = makeAccount("b");
+		usageCache.set("a", usage({ fiveHour: win(100, NOW + HOUR) }));
+		const ctx = makeCtx({
+			accounts: [a, b],
+			strategy: availabilityStrategy(),
+		});
+		const meta = makeMeta({
+			headers: { "x-better-ccflare-bypass-session": "true" },
+		});
+		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
+		expect(selected.map((x) => x.id)).toEqual(["b"]);
+	});
+});
+
 describe("selectAccountsForRequest with the all-limited rule", () => {
-	it("returns the strategy's target and marks the request when every account is out on limits", async () => {
+	it("returns no account to forward when every account is out on limits", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 		const b = makeAccount("b");
@@ -473,10 +704,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			strategy: availabilityStrategy(pick.fn),
 		});
 		const meta = makeMeta();
-		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(true);
-		expect(pick.calls[0].map((e) => e.account.id).sort()).toEqual(["a", "b"]);
+		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 	});
 
 	it("keeps today's empty result under a strategy without the method", async () => {
@@ -484,21 +712,13 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const ctx = makeCtx({ accounts: [a], strategy: availabilityStrategy() });
 		const meta = makeMeta();
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 	});
 
 	it("does not fire while any account is selectable", async () => {
 		const pick = recordingPick();
-		setUseExtraUsage(true);
 		const a = makeAccount("a");
 		const b = makeAccount("b", { rate_limited_until: NOW + HOUR });
-		usageCache.set(
-			"a",
-			usage({
-				fiveHour: win(100, NOW + HOUR),
-				spend: { enabled: true, percent: 10 },
-			}),
-		);
+		usageCache.set("a", usage({ fiveHour: win(50, NOW + HOUR) }));
 		const ctx = makeCtx({
 			accounts: [a, b],
 			strategy: availabilityStrategy(pick.fn),
@@ -506,11 +726,10 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const meta = makeMeta();
 		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
 		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
-	it("forwards a family-exhausted request instead of setting the family side channel", async () => {
+	it("returns no account to forward for a family-exhausted request", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a");
 		usageCache.set(
@@ -523,13 +742,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			capacityRouting: true,
 		});
 		const meta = makeMeta();
-		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(true);
-		expect(getModelFamilyExhaustionInfo(meta)).toBeNull();
-		expect(pick.calls[0][0].limits).toEqual([
-			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
-		]);
+		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 	});
 
 	it("keeps the family side channel under a strategy without the method", async () => {
@@ -563,11 +776,10 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			headers: { "x-better-ccflare-account-id": "a" },
 		});
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
-	it("keeps an auto-refresh bypass request out of the rule", async () => {
+	it("returns no account to forward for a bypass-session request without a forced account", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 		const ctx = makeCtx({
@@ -578,7 +790,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			headers: { "x-better-ccflare-bypass-session": "true" },
 		});
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(pick.calls).toHaveLength(0);
 	});
 
 	it("leaves a combo with session fallback disabled at today's empty result", async () => {
@@ -610,7 +821,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		});
 		const meta = makeMeta();
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
@@ -626,7 +836,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const meta = makeMeta();
 		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
 		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
@@ -641,16 +850,14 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			return { strategy, ctx: makeCtx({ accounts, strategy }) };
 		}
 
-		it("sends the request to the 5-hour account over the weekly one", async () => {
+		it("forwards to neither the 5-hour account nor the weekly one", async () => {
 			const a = makeAccount("a");
 			const b = makeAccount("b");
 			usageCache.set("a", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
 			usageCache.set("b", usage({ fiveHour: win(100, NOW + 2 * HOUR) }));
 			const { ctx } = paceCtx([a, b]);
 			const meta = makeMeta({ session: "s1" });
-			const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-			expect(selected.map((x) => x.id)).toEqual(["b"]);
-			expect(isAllLimitedSelection(meta)).toBe(true);
+			expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 		});
 
 		it("applies to mapped, new and no-session requests alike", async () => {
@@ -667,9 +874,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 
 			for (const session of ["mapped", "new", null]) {
 				const meta = makeMeta({ session });
-				const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-				expect(selected.map((x) => x.id)).toEqual(["b"]);
-				expect(isAllLimitedSelection(meta)).toBe(true);
+				expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 			}
 		});
 	});

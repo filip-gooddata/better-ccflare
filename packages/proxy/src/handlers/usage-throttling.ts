@@ -3,11 +3,12 @@ import {
 	getModelFamily,
 	weeklyScopedWindowKey,
 } from "@better-ccflare/core";
-import {
-	type AnyUsageData,
-	getRepresentativeUsageSnapshotForProvider,
-} from "@better-ccflare/providers";
+import type { AnyUsageData } from "@better-ccflare/providers";
 import type { Account } from "@better-ccflare/types";
+import {
+	localLimitInputForAccount,
+	localLimitResponseForAccount,
+} from "./limit-response";
 
 const RETRY_AFTER_SECONDS = 60;
 
@@ -272,13 +273,6 @@ function isWindowThrottlingEnabled(
 export interface UsageThrottleOptions {
 	requestModel?: string | null;
 	scopedMode?: "match" | "all";
-	/**
-	 * The account is serving past a spent window on allowed extra usage (see
-	 * the snapshot's `extraUsageAvailable`). Pacing a window that is already
-	 * spent cannot save anything — that traffic is billed beyond the plan — so
-	 * spent windows are not throttled; windows with headroom still are.
-	 */
-	extraUsageAvailable?: boolean;
 }
 
 export function getUsageThrottleStatus(
@@ -310,7 +304,6 @@ export function getUsageThrottleStatus(
 			continue;
 		}
 		if (!isWindowThrottlingEnabled(window.window, settings)) continue;
-		if (opts?.extraUsageAvailable && window.utilization >= 100) continue;
 		if (window.resetAtMs <= now) continue;
 		const startMs = computeWindowStartMs(window.resetAtMs, window.window);
 		if (startMs === null || startMs >= window.resetAtMs) continue;
@@ -349,28 +342,34 @@ export function getUsageThrottleUntil(
 }
 
 /**
- * The routing-path throttle decision for one account: getUsageThrottleUntil
- * with the account's own extra-usage state taken from the same snapshot
- * account selection admits on, so a spent account that selection lets through
- * on extra usage is not then refused here with a local 529.
+ * The routing-path throttle decision for one account. A spent window paces
+ * back to its reset like any other: extra usage never makes it usable, so
+ * there is no per-account exception here. `provider` is kept for callers.
  */
 export function getAccountUsageThrottleUntil(
-	provider: string,
+	_provider: string,
 	data: AnyUsageData | null | undefined,
 	settings: UsageThrottleSettings,
 	now = Date.now(),
-	opts?: Omit<UsageThrottleOptions, "extraUsageAvailable">,
+	opts?: UsageThrottleOptions,
 ): number | null {
-	const extraUsageAvailable =
-		getRepresentativeUsageSnapshotForProvider(data, provider)
-			?.extraUsageAvailable === true;
-	return getUsageThrottleUntil(data ?? null, settings, now, {
-		...opts,
-		extraUsageAvailable,
-	});
+	return getUsageThrottleUntil(data ?? null, settings, now, opts);
 }
 
+/**
+ * The local answer when usage throttling holds back every candidate. When
+ * each throttled account is held because one of its limits is full (a
+ * window at >= 100 % whose reset is ahead), the request is refused for the
+ * same reason upstream would refuse it, so the answer is the Anthropic-shaped
+ * limit 429 (limit-response.ts) for the account whose limit resets soonest:
+ * its `retry-after` is the earliest time any of them can serve again, and
+ * Claude Code shows the limit instead of retrying an overload. Otherwise at
+ * least one account is only paced below its limit and will serve again
+ * shortly: the 529 overload with a fixed short Retry-After stays.
+ */
 export function createUsageThrottledResponse(accounts: Account[]): Response {
+	const full = fullLimitAccountResettingSoonest(accounts);
+	if (full) return localLimitResponseForAccount(full);
 	const names = accounts.map((account) => account.name).join(", ");
 	return new Response(
 		JSON.stringify({
@@ -388,4 +387,35 @@ export function createUsageThrottledResponse(accounts: Account[]): Response {
 			},
 		},
 	);
+}
+
+/**
+ * The account whose full limit resets soonest, when every account in
+ * `accounts` has a full limit (localLimitInputForAccount binds a window at
+ * >= 100 % with its reset ahead); null when any account lacks cached usage or
+ * is throttled below its limits, or the list is empty.
+ */
+export function fullLimitAccountResettingSoonest(
+	accounts: Account[],
+	now: number = Date.now(),
+): Account | null {
+	let best: { account: Account; resetMs: number } | null = null;
+	for (const account of accounts) {
+		const input = localLimitInputForAccount(account.id, {
+			now,
+			provider: account.provider,
+		});
+		if (!input || input.resetMs === null || input.resetMs <= now) return null;
+		const window =
+			input.binding.kind === "five_hour"
+				? input.fiveHour
+				: input.binding.kind === "seven_day"
+					? input.sevenDay
+					: null;
+		if (!window || window.utilization < 100) return null;
+		if (!best || input.resetMs < best.resetMs) {
+			best = { account, resetMs: input.resetMs };
+		}
+	}
+	return best?.account ?? null;
 }

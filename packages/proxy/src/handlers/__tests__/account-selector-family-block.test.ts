@@ -191,8 +191,8 @@ for (const mode of ["off", "exhausted"] as const) {
 				FABLE,
 			);
 
-			expect(result.map((acc) => acc.id)).toEqual(["b"]);
-			expect(getModelFamilyExhaustionInfo(meta)).toBeNull();
+			// The pick names whose limit the answer describes; nothing is forwarded.
+			expect(result).toEqual([]);
 			expect(seen).toHaveLength(1);
 			expect(seen[0].map((entry) => [entry.account.id, entry.limits])).toEqual([
 				["a", [{ kind: "family", family: "fable", resetAt: aUntil }]],
@@ -292,22 +292,23 @@ describe("collectLimitBlockedAccounts — family blocks", () => {
 	});
 });
 
-describe("createModelFamilyExhaustedResponse — family_blocked wording", () => {
-	it("says upstream refused the family, without claiming weekly exhaustion", async () => {
+describe("createModelFamilyExhaustedResponse — family_blocked", () => {
+	it("answers the local limit 429 for the family, without claiming weekly exhaustion", async () => {
 		const response = createModelFamilyExhaustedResponse({
 			family: "fable",
 			resetAt: Date.now() + DAY,
 			origin: "family_blocked",
 		});
 		const body = (await response.json()) as {
-			error: { code: string; message: string };
+			error: { type: string; message: string };
 		};
 
 		expect(response.status).toBe(429);
-		expect(body.error.code).toBe("model_family_exhausted");
-		expect(body.error.message).toContain(
-			"Upstream refused the fable model family on every available account",
-		);
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBe("seven_day_fable");
+		expect(Object.keys(body.error).sort()).toEqual(["message", "type"]);
+		expect(body.error.type).toBe("rate_limit_error");
 		expect(body.error.message).not.toContain("weekly");
 	});
 });

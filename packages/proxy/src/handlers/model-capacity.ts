@@ -1,9 +1,11 @@
-import { getModelFamily, isUseExtraUsageEnabled } from "@better-ccflare/core";
+import { getModelFamily } from "@better-ccflare/core";
+import type { AnyUsageData } from "@better-ccflare/providers";
 import {
-	type AnyUsageData,
-	hasExtraUsageCapacity,
-} from "@better-ccflare/providers";
-import { collectWindows } from "./usage-throttling";
+	buildLocalCooldownResponse,
+	buildLocalLimitResponse,
+	localLimitInputForAccount,
+	localLimitResponseForAccount,
+} from "./limit-response";
 
 export interface ModelExhaustionResult {
 	exhausted: boolean;
@@ -21,6 +23,9 @@ export type OverageStatus = "available" | "unavailable" | "unknown";
  * resolves to an actual boolean, the status is "unknown" — not assumed
  * disabled — since a missing/contradictory signal says nothing about the
  * account's real billing state.
+ *
+ * For logging and display only: no routing gate reads it. "available"
+ * overage never makes a full limit usable (see isAccountExhaustedForModel).
  */
 export function resolveOverageStatus(
 	usageData: AnyUsageData | null | undefined,
@@ -42,94 +47,102 @@ export function resolveOverageStatus(
 	return "unknown";
 }
 
+interface RawFamilyRow {
+	percent: unknown;
+	resetsAt: unknown;
+}
+
 /**
- * Counts the RAW weekly_scoped limits[] rows attributable to `family`,
- * regardless of whether their percent/resets_at values are usable. The
- * normalizer ({@link collectWindows}) silently drops rows with a missing
- * percent or an unparsable/absent reset — fresh windows legitimately carry
- * `resets_at: null` — so the "ALL rows exhausted" check below must compare
- * against this raw count: a dropped partial row is unproven capacity, and
- * unproven capacity means fail open, not "exhausted by omission".
+ * The RAW weekly_scoped limits[] rows attributable to `family`, whatever
+ * their percent/resets_at values. Read directly rather than through
+ * collectWindows, which drops rows with a missing percent or an
+ * absent/unparsable reset: a full row with no usable reset is still full.
  */
-function countRawScopedFamilyRows(
+function rawScopedFamilyRows(
 	usageData: AnyUsageData | null | undefined,
 	family: string,
-): number {
+): RawFamilyRow[] {
 	const limits = (usageData as { limits?: unknown[] } | null | undefined)
 		?.limits;
-	if (!Array.isArray(limits)) return 0;
-	let count = 0;
+	if (!Array.isArray(limits)) return [];
+	const rows: RawFamilyRow[] = [];
 	for (const entry of limits) {
 		const row = entry as {
 			kind?: string;
+			percent?: unknown;
+			resets_at?: unknown;
 			scope?: { model?: { display_name?: string | null } | null } | null;
 		} | null;
 		if (!row || row.kind !== "weekly_scoped") continue;
 		const name = row.scope?.model?.display_name?.trim();
 		if (!name) continue;
-		if (getModelFamily(name) === family) count++;
+		if (getModelFamily(name) === family) {
+			rows.push({ percent: row.percent, resetsAt: row.resets_at });
+		}
 	}
-	return count;
+	return rows;
+}
+
+function parseRowReset(resetsAt: unknown): number | null {
+	if (typeof resetsAt !== "string" || !resetsAt) return null;
+	const ms = new Date(resetsAt).getTime();
+	return Number.isFinite(ms) ? ms : null;
 }
 
 /**
  * Checks whether the account's weekly per-model (weekly_scoped) cap for the
  * given model's family is fully exhausted: EVERY weekly_scoped row for that
- * family is at percent >= 100 with a reset still in the future (a single
- * non-exhausted row — e.g. a distinct surface — means the family still has
- * usable capacity), AND extra usage may not carry the request past the cap.
- * Paid overage is not capacity: it keeps the family available only when the
- * process-wide "use extra usage" switch is on AND the account has extra usage
- * left (hasExtraUsageCapacity: enabled and under its spend limit) — the same
- * rule the account-level five-hour/weekly gating uses. An overage merely
- * reported as enabled, with the switch off or the spend limit reached, does
- * not keep the family available.
+ * family is at percent >= 100 with a reset in the future or unknown (a
+ * single non-exhausted row — e.g. a distinct surface — means the family
+ * still has usable capacity). A full row whose `resets_at` is missing or
+ * unparsable counts as exhausted with an unknown reset. Paid overage is
+ * never capacity: a full family is exhausted whatever the overage,
+ * extra-usage or spend signals and the (ignored) "use extra usage" setting
+ * say — the same rule the account-level five-hour/weekly gating uses.
+ * resolveOverageStatus reads those signals for logging only.
  *
- * Fails open (returns {exhausted:false}) whenever the family can't be
- * confidently attributed: unknown request-model family, a scoped row whose
- * display name has no known family mapping, a reset that has already
- * passed (stale telemetry), a family row the normalizer had to drop
- * (missing percent / unusable reset — see {@link countRawScopedFamilyRows}),
- * or missing telemetry altogether. A false positive here removes a working
- * account from rotation; a false negative just costs one extra 429
- * round-trip, so the asymmetry favors not excluding.
+ * `resetAt` is the LATEST row reset, since the account serves the family
+ * again only once every full row has reset; it is null when any full row's
+ * reset is unknown.
+ *
+ * Fails open (returns {exhausted:false}) whenever utilization is unknown or
+ * the family can't be attributed: unknown request-model family, no scoped
+ * row whose display name maps to the family, a family row with no numeric
+ * percent, a row whose reset has already passed (stale telemetry), or
+ * missing telemetry altogether. A false negative is not cheap: it forwards
+ * to an account whose family limit is full, and upstream may then bill the
+ * request as overage. So a full row is never discounted for lacking a reset;
+ * only unknown utilization or a reset already past fails open.
  */
 export function isAccountExhaustedForModel(
 	usageData: AnyUsageData | null | undefined,
 	model: string | null | undefined,
 	now: number = Date.now(),
 ): ModelExhaustionResult {
+	const notExhausted = { exhausted: false, resetAt: null };
 	const family = model ? getModelFamily(model) : null;
-	if (!family) return { exhausted: false, resetAt: null };
+	if (!family) return notExhausted;
 
-	const familyRows = collectWindows(usageData ?? null).filter(
-		(window) => window.scoped && window.modelFamily === family,
-	);
-	if (familyRows.length === 0) return { exhausted: false, resetAt: null };
+	const rows = rawScopedFamilyRows(usageData, family);
+	if (rows.length === 0) return notExhausted;
 
-	// A raw family row the normalizer dropped (missing percent, resets_at
-	// null/unparsable) is unproven capacity — "all remaining rows exhausted"
-	// would be exhaustion by omission, so fail open instead.
-	if (countRawScopedFamilyRows(usageData, family) !== familyRows.length) {
-		return { exhausted: false, resetAt: null };
+	let latestReset: number | null = null;
+	let unknownReset = false;
+	for (const row of rows) {
+		if (typeof row.percent !== "number" || !Number.isFinite(row.percent)) {
+			return notExhausted;
+		}
+		if (row.percent < 100) return notExhausted;
+		const resetMs = parseRowReset(row.resetsAt);
+		if (resetMs === null) {
+			unknownReset = true;
+			continue;
+		}
+		if (resetMs <= now) return notExhausted;
+		if (latestReset === null || resetMs > latestReset) latestReset = resetMs;
 	}
 
-	const exhaustedRows = familyRows.filter(
-		(window) => window.utilization >= 100 && window.resetAtMs > now,
-	);
-	if (exhaustedRows.length !== familyRows.length) {
-		return { exhausted: false, resetAt: null };
-	}
-
-	if (
-		isUseExtraUsageEnabled() &&
-		hasExtraUsageCapacity(usageData, "anthropic")
-	) {
-		return { exhausted: false, resetAt: null };
-	}
-
-	const resetAt = Math.min(...exhaustedRows.map((window) => window.resetAtMs));
-	return { exhausted: true, resetAt };
+	return { exhausted: true, resetAt: unknownReset ? null : latestReset };
 }
 
 // ── Negative cache ────────────────────────────────────────────────────────────
@@ -384,78 +397,45 @@ export interface ModelFamilyExhaustionInfo {
 	family: string;
 	resetAt: number | null;
 	origin: FamilyExhaustionOrigin;
+	/**
+	 * The account the answer describes (the one usable again first). With it
+	 * the answer is that account's local limit 429 (its cached real 429, else
+	 * one built from its usage); without it, a 429 built from the family and
+	 * `resetAt` alone.
+	 */
+	accountId?: string;
 }
 
-const DEFAULT_RETRY_AFTER_SECONDS = 60;
-const MAX_RETRY_AFTER_SECONDS = 3600;
-
 /**
- * Structured 429 returned when every candidate account for a request's
- * model family has been filtered out as capacity-exhausted, instead of
- * exhausting the normal per-account failover loop against accounts that are
- * already known to reject this model family. Anthropic-compatible shape:
- * `error.type` is the standard "rate_limit_error", with a separate
- * machine-readable `error.code` of "model_family_exhausted".
- *
- * Only a telemetry_confirmed origin may assert "weekly capacity exhausted"
- * in the message — a purely reactive (recent_upstream_rejection) mark uses
- * neutral wording, since it was never corroborated by the account's own
- * limits[] telemetry and may be misattributed to the wrong window.
+ * The 429 returned when every candidate account for a request's model family
+ * is out for that family, instead of failing over against accounts known to
+ * reject it. It is the no-extra-usage local limit 429 (limit-response.ts):
+ * Anthropic's status, unified headers and body shape, with the family as the
+ * binding limit (claim `seven_day_<family>`, an approximate name) and
+ * `retry-after` counted to `resetAt`. The body carries Anthropic's fixed
+ * rate-limit text, which names no window, so no `origin` (a cooldown, a
+ * reactive mark) is misattributed to weekly capacity; `origin` no longer
+ * changes the response, except `cooldown_masked`: an account with room for
+ * the family exists and is only cooling down, so that answer is the cooldown
+ * 429 (no unified status, claim or reset; `retry-after` counted to `resetAt`).
  */
 export function createModelFamilyExhaustedResponse(
 	info: ModelFamilyExhaustionInfo,
 ): Response {
-	const retryAfterSeconds =
-		info.resetAt != null
-			? Math.max(
-					1,
-					Math.min(
-						MAX_RETRY_AFTER_SECONDS,
-						Math.ceil((info.resetAt - Date.now()) / 1000),
-					),
-				)
-			: DEFAULT_RETRY_AFTER_SECONDS;
-
-	const resetIso =
-		info.resetAt != null ? new Date(info.resetAt).toISOString() : null;
-
-	// The non-confirmed wording must stay accurate for MIXED provenance too
-	// (some accounts telemetry-filtered, some only recently rejected), so it
-	// names both possibilities instead of asserting "all recently rejected".
-	// "cooldown_masked" gets its own wording: the real blocker there is an
-	// account temporarily sidelined by a rate-limit cooldown, not weekly
-	// capacity — asserting exhaustion (or even "recently rejected upstream")
-	// would misattribute a minutes-long cooldown to a days-long weekly cap.
-	const message =
-		info.origin === "telemetry_confirmed"
-			? `All available accounts have exhausted their weekly ${info.family} capacity.` +
-				(resetIso ? ` Earliest reset at ${resetIso}.` : "")
-			: info.origin === "cooldown_masked"
-				? `An account with available ${info.family} capacity is temporarily in a rate-limit cooldown (not capacity-exhausted).` +
-					(resetIso ? ` Retry after ${resetIso}.` : "")
-				: info.origin === "family_blocked"
-					? `Upstream refused the ${info.family} model family on every available account until its limit resets.` +
-						(resetIso ? ` Earliest reset at ${resetIso}.` : "")
-					: `All available accounts are temporarily unavailable for the ${info.family} model family (capacity exhausted or recently rejected upstream).` +
-						(resetIso ? ` Retry after ${resetIso}.` : "");
-
-	return new Response(
-		JSON.stringify({
-			type: "error",
-			error: {
-				type: "rate_limit_error",
-				code: "model_family_exhausted",
-				message,
-				family: info.family,
-				resetAt: info.resetAt,
-			},
-		}),
-		{
-			status: 429,
-			headers: {
-				"Content-Type": "application/json",
-				"Retry-After": String(retryAfterSeconds),
-			},
-		},
-	);
+	if (info.origin === "cooldown_masked") {
+		return buildLocalCooldownResponse(
+			info.accountId ? localLimitInputForAccount(info.accountId) : null,
+			info.resetAt,
+		);
+	}
+	if (info.accountId) {
+		return localLimitResponseForAccount(
+			{ id: info.accountId },
+			{ family: info.family, familyResetMs: info.resetAt },
+		);
+	}
+	return buildLocalLimitResponse({
+		binding: { kind: "family", family: info.family },
+		resetMs: info.resetAt,
+	});
 }

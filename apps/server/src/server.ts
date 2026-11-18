@@ -21,7 +21,6 @@ import {
 	registerDisposable,
 	setForceAccountModel,
 	setPricingLogger,
-	setUseExtraUsage,
 	shutdown,
 	TIME_CONSTANTS,
 	USAGE_THRESHOLD_PAUSE_REASON,
@@ -67,6 +66,7 @@ import {
 import {
 	AutoRefreshScheduler,
 	CacheKeepaliveScheduler,
+	clearCooldownOnCapacityRestored,
 	drainUsageCollector,
 	earliestCodexResetMs,
 	forceCloseCircuit,
@@ -1065,21 +1065,17 @@ function startUsagePollingWithRefresh(
 					// Usage API shows available capacity (<100%). If rate_limited_until is
 					// set in the future (seat-reassignment case), clear it now rather than
 					// waiting for the natural expiry timer — the polling loop has confirmed
-					// the seat is available again.
-					proxyContext.dbOps
-						.getAccount(accountId)
-						.then((acc) => {
-							if (
-								acc?.rate_limited_until &&
-								Number(acc.rate_limited_until) > Date.now()
-							) {
-								return proxyContext.dbOps
-									.forceResetAccountRateLimit(accountId)
-									.then(() => {
-										logger.info(
-											`Cleared stale rate_limited_until for account ${acc.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
-										);
-									});
+					// the seat is available again. An active overage_in_use bench is kept.
+					clearCooldownOnCapacityRestored(proxyContext.dbOps, accountId)
+						.then((outcome) => {
+							if (outcome === "cleared") {
+								logger.info(
+									`Cleared stale rate_limited_until for account ${accountId}: usage polling shows available capacity (seat reassignment or early reset)`,
+								);
+							} else if (outcome === "kept-bench") {
+								logger.info(
+									`Kept overage_in_use bench for account ${accountId}: it ends at its reset or on a reading showing both five-hour and weekly below 100%`,
+								);
 							}
 						})
 						.catch((err) =>
@@ -1347,12 +1343,11 @@ export default async function startServer(options?: {
 	// which may depend on config; mirror the setting there before anything can
 	// route. The config POST handler mirrors it again after a write.
 	setForceAccountModel(config.getForceAccountModel());
-	// Same constraint for "use extra usage": the usage snapshot that gates
-	// admission is built in providers. Seed it from the environment first (a
-	// one-time adoption into the config file), then mirror the result.
-	const extraUsageNote = config.adoptUseExtraUsageFromEnv();
-	if (extraUsageNote) new Logger("Startup").info(extraUsageNote);
-	setUseExtraUsage(config.getUseExtraUsage());
+	// "Use extra usage" is retired: still read from the config, never mirrored
+	// into routing. Warn once when it is on so the operator knows it is ignored.
+	config.reportUseExtraUsageAtStartup((message) =>
+		new Logger("Startup").warn(message),
+	);
 	installOutboundProxy(() => config.getOutboundProxy());
 	// The usage poller detects Codex window rollovers with the same predicate
 	// as the traffic path, so it must ride the same window. Config cannot be

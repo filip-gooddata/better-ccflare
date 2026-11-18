@@ -22,6 +22,11 @@ import {
 	tryGetUsageCollector,
 } from "../usage-collector";
 import { drainBody } from "./discard-body-cancel";
+import {
+	applyOverageCooldown,
+	holdsOverageBench,
+	SUCCESS_MAY_CLEAR_COOLDOWN_SQL,
+} from "./header-mark-out";
 import { isInternalProbe, type ProxyContext } from "./proxy-types";
 import {
 	applyRateLimitCooldown,
@@ -609,13 +614,23 @@ export async function processProxyResponse(
 		// putting the account straight back into rotation in front of the next
 		// request. 4xx still clears, as before: those did reach the account's own
 		// upstream accounting.
-		if (account.rate_limited_until && response.status < 500) {
+		//
+		// An overage_in_use bench is the exception: it means the account's
+		// limits are spent and upstream serves it from extra usage, which a
+		// response admitted before the bench does not disprove. It holds until
+		// its reset or a newer usage reading shows recovery (header-mark-out.ts).
+		const clearedAt = Date.now();
+		if (
+			account.rate_limited_until &&
+			response.status < 500 &&
+			!holdsOverageBench(account, clearedAt)
+		) {
 			account.rate_limited_until = null;
 			ctx.asyncWriter.enqueue(async () => {
 				const db = ctx.dbOps.getAdapter();
 				await db.run(
-					"UPDATE accounts SET rate_limited_until = NULL WHERE id = ? AND rate_limited_until IS NOT NULL",
-					[account.id],
+					`UPDATE accounts SET rate_limited_until = NULL WHERE id = ? AND rate_limited_until IS NOT NULL AND ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL}`,
+					[account.id, clearedAt],
 				);
 				log.debug(
 					`Cleared rate_limited_until for account ${account.name} on successful response`,
@@ -623,6 +638,11 @@ export async function processProxyResponse(
 			});
 		}
 	}
+
+	// After the clear above, so a response served on extra usage benches the
+	// account for the next request instead of being undone by its own
+	// success. Reads headers only; the body still streams to the client.
+	applyOverageCooldown(response, account, ctx);
 
 	return false;
 }

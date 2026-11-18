@@ -132,7 +132,7 @@ describe("createAccountForceResetRateLimitHandler", () => {
 		expect(untouched?.rate_limited_until).not.toBeNull();
 	});
 
-	it("lifts the targeted account's family blocks and leaves other accounts' blocks", async () => {
+	it("keeps the targeted account's unexpired family blocks and other accounts' blocks", async () => {
 		await insertRow("uuid-4", "delta");
 		const until = Date.now() + 24 * 60 * 60 * 1000;
 		blockFamily("uuid-4", "fable", until, "header");
@@ -142,8 +142,15 @@ describe("createAccountForceResetRateLimitHandler", () => {
 		const response = await handler(makeRequest(), "uuid-4");
 		expect(response.ok).toBe(true);
 
-		expect(getFamilyBlocksForAccount("uuid-4")).toEqual([]);
+		// A manual reset must not admit known exhausted capacity: the blocks
+		// stand until their reset.
+		expect(
+			getFamilyBlocksForAccount("uuid-4")
+				.map((b) => b.family)
+				.sort(),
+		).toEqual(["fable", "opus"]);
 		expect(getFamilyBlock("uuid-5", "fable")?.until).toBe(until);
+		clearFamilyBlocksForAccount("uuid-4");
 		clearFamilyBlocksForAccount("uuid-5");
 	});
 });

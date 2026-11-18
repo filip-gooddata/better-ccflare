@@ -21,6 +21,34 @@ export interface MarkAccountRateLimitedResult {
 }
 
 /**
+ * The `rate_limited_until` / `rate_limited_reason` assignments of a cooldown
+ * write. Any cooldown but an overage bench may extend an `overage_in_use`
+ * bench that has not reached its reset, never shorten or relabel it: ending
+ * it early would readmit an account that is spending extra usage. An overage
+ * bench keeps the later of its own deadline and an active stored one, so a
+ * second response reporting an earlier reset cannot end the bench. All right-
+ * hand sides read the row as it was before the update.
+ */
+function cooldownAssignments(
+	until: number,
+	reason: RateLimitReason,
+	now: number,
+): { sql: string; params: unknown[] } {
+	if (reason === "overage_in_use") {
+		return {
+			sql: "rate_limited_until = CASE WHEN rate_limited_until > ? AND rate_limited_until > ? THEN rate_limited_until ELSE ? END, rate_limited_reason = ?",
+			params: [now, until, until, reason],
+		};
+	}
+	const bench =
+		"(rate_limited_reason = 'overage_in_use' AND rate_limited_until > ?)";
+	return {
+		sql: `rate_limited_until = CASE WHEN ${bench} AND rate_limited_until > ? THEN rate_limited_until ELSE ? END, rate_limited_reason = CASE WHEN ${bench} THEN rate_limited_reason ELSE ? END`,
+		params: [now, until, until, now, reason],
+	};
+}
+
+/**
  * Options for {@link AccountRepository.markAccountRateLimited}.
  * `authoritativeObservedAt` (only read when the streak is not incremented)
  * marks `until` as an upstream-reported reset observed at that time: it
@@ -326,18 +354,18 @@ export class AccountRepository extends BaseRepository<Account> {
 		// cooldown in the display, and nothing would clear it when the bench
 		// expires, so the account would read as rate-limited forever.
 		let applied = true;
+		const cooldown = cooldownAssignments(until, reason, Date.now());
 		if (incrementStreak) {
 			await this.run(
 				`UPDATE accounts
            SET consecutive_rate_limits = COALESCE(consecutive_rate_limits, 0) + 1,
-               rate_limited_until      = ?,
-               rate_limited_reason     = ?,
+               ${cooldown.sql},
                rate_limited_at         = ?,
                rate_limit_status       = NULL,
                rate_limit_reset        = NULL,
                rate_limit_reset_at     = NULL
          WHERE id = ?`,
-				[until, reason, Date.now(), accountId],
+				[...cooldown.params, Date.now(), accountId],
 			);
 		} else if (options.authoritativeObservedAt != null) {
 			// An upstream-reported reset replaces the stored deadline even when
@@ -349,8 +377,7 @@ export class AccountRepository extends BaseRepository<Account> {
 			// An accepted extension keeps a newer stored stamp.
 			const changes = await this.runWithChanges(
 				`UPDATE accounts
-           SET rate_limited_until      = ?,
-               rate_limited_reason     = ?,
+           SET ${cooldown.sql},
                rate_limited_at         = CASE
                  WHEN rate_limited_at IS NOT NULL AND rate_limited_at > ?
                  THEN rate_limited_at ELSE ? END,
@@ -363,8 +390,7 @@ export class AccountRepository extends BaseRepository<Account> {
                 OR rate_limited_at IS NULL
                 OR rate_limited_at <= ?)`,
 				[
-					until,
-					reason,
+					...cooldown.params,
 					options.authoritativeObservedAt,
 					options.authoritativeObservedAt,
 					accountId,
@@ -396,17 +422,25 @@ export class AccountRepository extends BaseRepository<Account> {
 			// guard but covers the cross-request DB race that guard can't see. A
 			// plain WHERE predicate (not GREATEST/MAX) so the same SQL runs
 			// unchanged on both SQLite and PostgreSQL.
+			// An overage bench already keeps the later deadline in its
+			// assignment and must still label a longer cooldown, so it skips
+			// the expiry guard.
+			const overage = reason === "overage_in_use";
 			const changes = await this.runWithChanges(
 				`UPDATE accounts
-           SET rate_limited_until      = ?,
-               rate_limited_reason     = ?,
+           SET ${cooldown.sql},
                rate_limited_at         = ?,
                rate_limit_status       = NULL,
                rate_limit_reset        = NULL,
                rate_limit_reset_at     = NULL
-         WHERE id = ?
-           AND (rate_limited_until IS NULL OR rate_limited_until <= ?)`,
-				[until, reason, Date.now(), accountId, until],
+         WHERE id = ?${
+						overage
+							? ""
+							: "\n           AND (rate_limited_until IS NULL OR rate_limited_until <= ?)"
+					}`,
+				overage
+					? [...cooldown.params, Date.now(), accountId]
+					: [...cooldown.params, Date.now(), accountId, until],
 			);
 			applied = changes > 0;
 			if (!applied) {
@@ -494,20 +528,44 @@ export class AccountRepository extends BaseRepository<Account> {
 		return changes > 0;
 	}
 
-	async clearRateLimitState(accountId: string): Promise<number> {
+	/**
+	 * Manual reset. Clears every cooldown field except an `overage_in_use`
+	 * bench still ahead of `now`: that bench means the account was being
+	 * served from extra usage, and it lifts only at its reset or on a newer
+	 * usage reading showing both windows below 100 %.
+	 */
+	async clearRateLimitState(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<number> {
+		const benchActive =
+			"(rate_limited_reason = 'overage_in_use' AND rate_limited_until > ?)";
 		return this.runWithChanges(
 			`UPDATE accounts
 			 SET
-			 	rate_limited_until = NULL,
-			 	rate_limited_reason = NULL,
-			 	rate_limited_at = NULL,
+			 	rate_limited_until = CASE WHEN ${benchActive} THEN rate_limited_until ELSE NULL END,
+			 	rate_limited_reason = CASE WHEN ${benchActive} THEN rate_limited_reason ELSE NULL END,
+			 	rate_limited_at = CASE WHEN ${benchActive} THEN rate_limited_at ELSE NULL END,
 			 	rate_limit_reset = NULL,
 			 	rate_limit_reset_at = NULL,
 			 	rate_limit_status = NULL,
 			 	rate_limit_remaining = NULL
 			 WHERE id = ?`,
-			[accountId],
+			[now, now, now, accountId],
 		);
+	}
+
+	/** End (epoch ms) of the account's `overage_in_use` bench if still ahead of `now`. */
+	async getActiveOverageBenchUntil(
+		accountId: string,
+		now: number = Date.now(),
+	): Promise<number | null> {
+		const row = await this.get<{ rate_limited_until: number | string }>(
+			`SELECT rate_limited_until FROM accounts
+			 WHERE id = ? AND rate_limited_reason = 'overage_in_use' AND rate_limited_until > ?`,
+			[accountId, now],
+		);
+		return row ? Number(row.rate_limited_until) : null;
 	}
 
 	async pause(accountId: string, reason = "manual"): Promise<void> {

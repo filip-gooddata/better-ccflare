@@ -272,6 +272,9 @@ export function shouldCountAsCircuitFailure(kind: FailureKind): boolean {
 		// Funding gap, not account health — never benched, see the doc comment.
 		case "upstream_402_out_of_credits":
 			return false;
+		// A spent plan limit seen on a served response, not a failure.
+		case "overage_in_use":
+			return false;
 		case "upstream_429_with_reset":
 		case "upstream_429_no_reset_default_5h":
 		case "upstream_429_no_reset_probe_cooldown":

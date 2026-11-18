@@ -44,11 +44,6 @@ export interface RateLimitStatusInput {
 	usageUtilization: number | null;
 	/** Reset time (ms epoch) of the representative usage window, if known. */
 	usageResetMs?: number | null;
-	/**
-	 * The representative window is spent but the account is still served on
-	 * allowed extra usage (Codex credits, Anthropic extra usage).
-	 */
-	usageExtraUsageAvailable?: boolean;
 }
 
 function minutesLeft(untilMs: number, now: number): number {
@@ -62,12 +57,9 @@ export function computeRateLimitStatusDisplay(
 	const { usageUtilization, usageResetMs } = input;
 
 	if (isUsageExhausted(usageUtilization, usageResetMs, now)) {
-		// Same window, different consequence: the account still serves, billed
-		// against extra usage until the window resets. Saying "exhausted" would
-		// contradict selection; saying "OK" would hide that it is now billed.
-		const label = input.usageExtraUsageAvailable
-			? "extra_usage"
-			: "usage_exhausted";
+		// A full window is final: routing never serves it from extra usage, so
+		// it reads exhausted whatever extra usage the account has left.
+		const label = "usage_exhausted";
 		if (usageResetMs != null && usageResetMs > now) {
 			return `${label} (${minutesLeft(usageResetMs, now)}m)`;
 		}

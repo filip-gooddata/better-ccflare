@@ -43,12 +43,12 @@ import {
 	clearAccountRefreshCache,
 	clearAutoRefreshTrackingForAccount,
 	clearCodexModelCacheForAccount,
-	clearFamilyBlocksForAccount,
 	clearFamilyExhaustionForAccount,
 	clearModelCooldownsForAccount,
 	clearOpenAICompatibleModelCacheForAccount,
 	clearPendingRotation,
 	clearVisionCapability,
+	getFamilyBlocksForAccount,
 	getPeakHoursState,
 	getUsageThrottleStatus,
 	refreshCodexUsageForAccount,
@@ -113,6 +113,9 @@ const RATE_LIMIT_REASONS = new Set<RateLimitReason>([
 	// so this set stays a faithful mirror of the union and a future path that
 	// does persist it cannot be silently nulled.
 	"upstream_402_out_of_credits",
+	// Written to accounts.rate_limited_reason when a response reports overage
+	// in use: the account is benched until the unified reset.
+	"overage_in_use",
 ]);
 
 function toRateLimitReason(v: string | null): RateLimitReason | null {
@@ -184,9 +187,9 @@ function normalizeCodexUsageData(
 	// usage_snapshots may have no reset stored (accounts.rate_limit_reset keeps
 	// only the soonest one), and requiring a reset here is what used to discard it.
 	if (!hasWindowInfo(five_hour) && !hasWindowInfo(seven_day)) return null;
-	// Credits pass through untouched: the status label and the throttle display
-	// read them (via the shared usage snapshot) to agree with routing, which
-	// keeps serving a spent account that has credits when extra usage is on.
+	// Credits pass through untouched for display. They never make a spent
+	// window usable: routing never serves an account from extra usage, so the
+	// status label reads such an account as exhausted.
 	return usage.credits
 		? { five_hour, seven_day, credits: usage.credits }
 		: { five_hour, seven_day };
@@ -444,12 +447,7 @@ export function createAccountsListHandler(
 			);
 			return (
 				usage === null ||
-				!isUsageExhausted(
-					usage.utilization,
-					usage.resetMs,
-					now,
-					usage.extraUsageAvailable,
-				)
+				!isUsageExhausted(usage.utilization, usage.resetMs, now)
 			);
 		});
 
@@ -690,16 +688,8 @@ export function createAccountsListHandler(
 						usageThrottleSettings,
 						now,
 						// Display path: surface ALL per-model caps (m3 amber highlight);
-						// routing-side model matching happens in proxy.ts only. A spent
-						// window served on extra usage is not throttled there either.
-						{
-							scopedMode: "all",
-							extraUsageAvailable:
-								getRepresentativeUsageSnapshotForProvider(
-									fullUsageData as AnyUsageData,
-									account.provider ?? "anthropic",
-								)?.extraUsageAvailable === true,
-						},
+						// routing-side model matching happens in proxy.ts only.
+						{ scopedMode: "all" },
 					);
 					usageThrottledUntil = usageThrottleStatus.throttleUntil;
 					usageThrottledWindows = usageThrottleStatus.throttledWindows;
@@ -738,13 +728,6 @@ export function createAccountsListHandler(
 							fullUsageData,
 							account.provider ?? "anthropic",
 						),
-						// Same snapshot account selection admits on, so the label
-						// cannot say "exhausted" for an account it is still routing.
-						usageExtraUsageAvailable:
-							getRepresentativeUsageSnapshotForProvider(
-								fullUsageData as AnyUsageData | null,
-								account.provider ?? "anthropic",
-							)?.extraUsageAvailable === true,
 					},
 					now,
 				);
@@ -1268,7 +1251,10 @@ export function createAccountRemoveHandler(dbOps: DatabaseOperations) {
 			// account to prevent memory leaks. `delete()` only clears the cache
 			// entry — `stopPolling()` also clears the timer and tracking maps,
 			// otherwise the poll loop keeps rescheduling itself forever.
+			// stopPolling() keeps a reading held until a full window's reset,
+			// so drop it explicitly.
 			usageCache.stopPolling(accountId);
+			usageCache.delete(accountId);
 
 			// Also clear token-manager state (in-flight refresh, failure/backoff
 			// counters) for the removed account — otherwise it lingers until the
@@ -3949,9 +3935,61 @@ export function createAccountModelFallbacksUpdateHandler(
 	};
 }
 
+/** Limit holds a manual reset leaves in place, reported to the operator. */
+export interface KeptLimitHolds {
+	overageBench: { until: number; untilIso: string } | null;
+	familyBlocks: Array<{
+		family: string;
+		until: number;
+		untilIso: string;
+		source: string;
+	}>;
+}
+
+async function keptLimitHolds(
+	dbOps: DatabaseOperations,
+	accountId: string,
+	now: number,
+): Promise<KeptLimitHolds> {
+	const benchUntil = await dbOps.getActiveOverageBenchUntil(accountId, now);
+	return {
+		overageBench:
+			benchUntil === null
+				? null
+				: { until: benchUntil, untilIso: new Date(benchUntil).toISOString() },
+		familyBlocks: getFamilyBlocksForAccount(accountId, now)
+			.sort((a, b) => a.family.localeCompare(b.family))
+			.map((block) => ({
+				family: block.family,
+				until: block.until,
+				untilIso: new Date(block.until).toISOString(),
+				source: block.source,
+			})),
+	};
+}
+
+function describeKeptLimitHolds(kept: KeptLimitHolds): string {
+	const parts: string[] = [];
+	if (kept.overageBench) {
+		parts.push(
+			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%.`,
+		);
+	}
+	if (kept.familyBlocks.length > 0) {
+		parts.push(
+			`Kept family blocks until their reset: ${kept.familyBlocks
+				.map((block) => `${block.family} until ${block.untilIso}`)
+				.join(", ")}.`,
+		);
+	}
+	return parts.join(" ");
+}
+
 /**
- * Create an account force-reset rate limit handler
- * Clears rate limit lock fields and triggers immediate usage refresh when possible.
+ * Create an account force-reset rate limit handler.
+ * Clears ordinary cooldown fields and triggers an immediate usage refresh when
+ * possible. Keeps an active overage_in_use bench and unexpired family blocks,
+ * and reports them in `kept`.
  */
 export function createAccountForceResetRateLimitHandler(
 	dbOps: DatabaseOperations,
@@ -3972,7 +4010,11 @@ export function createAccountForceResetRateLimitHandler(
 				return errorResponse(NotFound("Account not found"));
 			}
 
-			const resetSuccess = dbOps.forceResetAccountRateLimit(accountId);
+			// Keeps an active overage_in_use bench; the family blocks are kept
+			// too. Both stand for known exhausted capacity, and lifting them
+			// before a reading confirms recovery could serve the next request
+			// from extra usage.
+			const resetSuccess = await dbOps.forceResetAccountRateLimit(accountId);
 			if (!resetSuccess) {
 				return errorResponse(
 					new Error(
@@ -3981,9 +4023,6 @@ export function createAccountForceResetRateLimitHandler(
 				);
 			}
 			clearAccountRefreshCache(accountId);
-			// A hand reset lifts the account's per-family blocks too, not only
-			// the account-wide one.
-			clearFamilyBlocksForAccount(accountId);
 
 			// Trigger immediate poll if this server has a polling token provider for the account.
 			let usagePollTriggered = await usageCache.refreshNow(accountId);
@@ -4016,10 +4055,24 @@ export function createAccountForceResetRateLimitHandler(
 				`Force-reset rate limit for account '${account.name}' (usage poll triggered: ${usagePollTriggered})`,
 			);
 
+			// Read after the refresh: a recovery reading may have released the bench.
+			const now = Date.now();
+			const kept = await keptLimitHolds(dbOps, accountId, now);
+			if (kept.overageBench || kept.familyBlocks.length > 0) {
+				log.info(
+					`Force-reset kept limit holds for account '${account.name}': ${describeKeptLimitHolds(kept)}`,
+				);
+			}
+
 			return jsonResponse({
 				success: true,
-				message: `Rate limit state cleared for account '${account.name}'`,
+				message: `Rate limit state cleared for account '${account.name}'.${
+					kept.overageBench || kept.familyBlocks.length > 0
+						? ` ${describeKeptLimitHolds(kept)}`
+						: ""
+				}`,
 				usagePollTriggered,
+				kept,
 			});
 		} catch (error) {
 			log.error("Account force-reset rate limit error:", error);
@@ -4060,8 +4113,12 @@ export function createAccountReloadHandler(dbOps: DatabaseOperations) {
 			// Clear refresh cache for this account
 			clearAccountRefreshCache(accountId);
 
-			// Clear usage cache for this account to prevent memory leaks
-			usageCache.delete(accountId);
+			// Clear usage cache for this account to prevent memory leaks, but keep
+			// a reading held until a full window's reset. Nothing stored names the
+			// upstream account or organisation, so reload cannot tell whether the
+			// new credentials changed it; keeping the hold fails closed until a
+			// newer reading under the new credentials replaces it.
+			usageCache.deleteUnlessHeld(accountId);
 
 			// Reload exists to pick up credentials written behind this server's back
 			// (a CLI re-authentication, a hand-edited row). New credentials can mean a

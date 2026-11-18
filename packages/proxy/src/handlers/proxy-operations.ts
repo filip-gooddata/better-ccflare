@@ -17,6 +17,8 @@ import {
 } from "@better-ccflare/core";
 import {
 	sanitizeProxyHeaders,
+	stripProxyOnlyHeaders,
+	withoutProxyOnlyHeaders,
 	withSanitizedProxyHeaders,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
@@ -37,6 +39,8 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	AccountLimit,
+	LimitBlockedAccount,
 	RateLimitReason,
 	RequestMeta,
 } from "@better-ccflare/types";
@@ -56,7 +60,12 @@ import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
 import { classifyRefusalScope, rateLimitHeaderSummary } from "./family-refusal";
-import { isAllLimitedSelection } from "./limit-blocked";
+import {
+	collectLimitBlockedAccounts,
+	fullLimitAnswer,
+	type LocalLimitAnswer,
+	selectAllLimitedAnswer,
+} from "./limit-blocked";
 import { blockFamily, markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
@@ -94,6 +103,11 @@ function resolveForwardToClient(ctx: ProxyContext) {
 }
 
 import { cancelDiscardedResponseBody } from "./discard-body-cancel";
+import {
+	observeLimitHeaders,
+	readingsBeforeHeaderMark,
+} from "./header-mark-out";
+import { limitRefusalResetMs, rememberLimitRefusal } from "./limit-response";
 
 const SYNTHETIC_RESPONSE_HEADER = "x-better-ccflare-synthetic-response";
 const SYNTHETIC_STATUS_HEADER = "x-better-ccflare-synthetic-status";
@@ -996,8 +1010,10 @@ export async function isModelUnavailableError(
  *   3. If retries also return 1305 - converts to a synthetic 429 so isModelUnavailableError
  *      triggers model fallback (e.g. glm-5.2 -> glm-4.7)
  *   4. If no 1305 - returns the original response unchanged
+ *
+ * Exported for tests.
  */
-async function checkZai1305(
+export async function checkZai1305(
 	response: Response,
 	account: Account,
 	requestClone: Request,
@@ -1040,6 +1056,9 @@ async function checkZai1305(
 
 			const retryRaw = await makeProxyRequest(requestClone.clone());
 			const retryHeaders = new Headers(retryRaw.headers);
+			// This retry bypasses forwardUpstream, so drop the proxy-only
+			// headers here: upstream must not pass off its answer as ours.
+			stripProxyOnlyHeaders(retryHeaders);
 			retryHeaders.set(
 				"x-better-ccflare-request-id",
 				response.headers.get("x-better-ccflare-request-id") || "",
@@ -1162,7 +1181,9 @@ export async function proxyUnauthenticated(
 				clientSessionId: requestMeta.clientSessionId ?? null,
 				query: url.search || null,
 				projectAttributionSource: requestMeta.projectAttributionSource ?? null,
-				response,
+				// No forwardUpstream on this path, so drop the proxy-only headers
+				// here: upstream must not pass off its answer as ours.
+				response: withoutProxyOnlyHeaders(response),
 				timestamp: requestMeta.timestamp,
 				retryAttempt: 0,
 				failoverAttempts: 0,
@@ -1348,14 +1369,16 @@ export function releaseHeldLimitRefusal(held: HeldLimitRefusal): void {
 /**
  * Rebuild a held refusal for the client: the upstream status, body bytes and
  * headers, minus the ones every proxied response loses (Bun already decoded
- * the body, see sanitizeProxyHeaders), plus the request-id tag every proxied
- * response carries.
+ * the body, see sanitizeProxyHeaders) and the proxy-only local-429 marker (an
+ * upstream refusal is not the proxy's own), plus the request-id tag every
+ * proxied response carries.
  */
 export function replayLimitRefusal(
 	held: HeldLimitRefusal,
 	requestId: string,
 ): Response {
 	const headers = sanitizeProxyHeaders(held.headers);
+	stripProxyOnlyHeaders(headers);
 	headers.set("x-better-ccflare-request-id", requestId);
 	return new Response(held.body, {
 		status: held.status,
@@ -1441,6 +1464,225 @@ export function systemSuspectScan(bodyText: string | undefined): string {
 	}
 }
 
+/** A candidate skipped right before an upstream send because it was full. */
+export interface GatedAttempt {
+	account: Account;
+	/** The model the skipped send would have asked for. */
+	model: string | undefined;
+	/** True when `model` is sent upstream verbatim (a cycled fallback model):
+	 * its own family counts, not the family the mappings would make of it. */
+	upstream: boolean;
+	answer: LocalLimitAnswer;
+}
+
+const gatedAttempts = new WeakMap<RequestMeta, GatedAttempt[]>();
+
+/** Every send this request skipped at the attempt gate, in order. */
+export function getGatedAttempts(meta: RequestMeta): GatedAttempt[] {
+	return gatedAttempts.get(meta) ?? [];
+}
+
+/**
+ * Thrown from the upstream send itself when the account is full by the time
+ * the request is about to leave: request preparation awaits (provider
+ * transforms, the upstream observation hook), and the account can fill up
+ * meanwhile. proxyWithAccount turns it into a skipped attempt (null).
+ */
+class SendGatedError extends Error {
+	constructor(accountName: string) {
+		super(`Send to ${accountName} skipped: the account is full`);
+		this.name = "SendGatedError";
+	}
+}
+
+/** The limits a gated skip stands on, read the way its gate read them. */
+function gatedBlockedEntry(
+	entry: GatedAttempt,
+	ctx: ProxyContext,
+	meta: RequestMeta,
+	now: number,
+): LimitBlockedAccount[] {
+	if (!entry.upstream) {
+		return collectLimitBlockedAccounts(
+			[entry.account],
+			ctx,
+			meta,
+			entry.model,
+			now,
+		);
+	}
+	// The model was sent verbatim: collectLimitBlockedAccounts would map it,
+	// so take the account's windows from it and the family from the gate.
+	const windows = collectLimitBlockedAccounts(
+		[entry.account],
+		ctx,
+		meta,
+		undefined,
+		now,
+	);
+	const limits = windows[0]?.limits ?? [];
+	if (entry.answer.family) {
+		limits.push({
+			kind: "family",
+			family: entry.answer.family,
+			resetAt: entry.answer.familyResetMs,
+		});
+	}
+	return limits.length > 0 ? [{ account: entry.account, limits }] : [];
+}
+
+/** A limit that binds every route of an account, whatever model it sends. */
+function isAccountWideLimit(limit: AccountLimit): boolean {
+	return limit.kind !== "family";
+}
+
+/**
+ * When a set of limits lets go: the latest reset; null when any is unknown.
+ * The all-limited rule reads an account's limits the same way.
+ */
+function latestReset(limits: AccountLimit[]): number | null {
+	let latest = Number.NEGATIVE_INFINITY;
+	for (const limit of limits) {
+		if (limit.resetAt === null) return null;
+		latest = Math.max(latest, limit.resetAt);
+	}
+	return latest;
+}
+
+/** One way the request could reach an account: a model it would send. */
+interface AccountRoute {
+	/** The limits only this route stands on (its model family). */
+	own: AccountLimit[];
+	answer: LocalLimitAnswer | null;
+}
+
+interface AccountRoutes {
+	account: Account;
+	/** Limits on the whole account (five-hour, weekly, cooldown), deduplicated. */
+	shared: AccountLimit[];
+	routes: AccountRoute[];
+}
+
+/**
+ * The account's earliest usable route: per route the latest of the shared
+ * limits and its own; across routes the earliest, an unknown reset last, the
+ * first skipped on a tie. Returned with the limits it stands on, as the
+ * all-limited rule should rank the account.
+ */
+function bindingRoute(entry: AccountRoutes): {
+	blocked: LimitBlockedAccount;
+	answer: LocalLimitAnswer | null;
+} {
+	let best: { limits: AccountLimit[]; at: number; route: AccountRoute } | null =
+		null;
+	for (const route of entry.routes) {
+		const limits = [...entry.shared, ...route.own];
+		const at = latestReset(limits) ?? Number.POSITIVE_INFINITY;
+		if (best === null || at < best.at) best = { limits, at, route };
+	}
+	return {
+		blocked: {
+			account: entry.account,
+			limits: best?.limits ?? [...entry.shared],
+		},
+		answer: best?.route.answer ?? null,
+	};
+}
+
+/**
+ * The local 429 for a request whose sends the gate skipped: the account the
+ * strategy's all-limited rule ranks first (for session-pace, the account
+ * usable again first) among the skipped accounts and the accounts this
+ * request did ask that are now limit-blocked (a cooldown its own refusal or
+ * error set counts). An account skipped on several models (a model and its
+ * fallbacks) is usable again as soon as any of those routes is: per account
+ * each skip is a route, read with the model it would have sent; the routes
+ * combine as the earliest usable one, while the account-wide limits
+ * (five-hour, weekly, cooldown) bind every route. The account is ranked, and
+ * answered, by that route. The first skipped answer when the strategy has no
+ * rule or declines; null when nothing was skipped.
+ */
+export async function rankFullLimitAnswers(
+	entries: GatedAttempt[],
+	ctx: ProxyContext,
+	meta: RequestMeta,
+	now: number = Date.now(),
+	attempted: { accounts: Account[]; model: string | undefined } = {
+		accounts: [],
+		model: undefined,
+	},
+): Promise<LocalLimitAnswer | null> {
+	const first = entries[0];
+	if (!first) return null;
+	if (!ctx.strategy.selectWhenAllLimited) return first.answer;
+
+	const byAccount = new Map<string, AccountRoutes>();
+	const add = (
+		blocked: LimitBlockedAccount,
+		answer: LocalLimitAnswer | null,
+	) => {
+		let known = byAccount.get(blocked.account.id);
+		if (!known) {
+			known = { account: blocked.account, shared: [], routes: [] };
+			byAccount.set(blocked.account.id, known);
+		}
+		const own: AccountLimit[] = [];
+		for (const limit of blocked.limits) {
+			if (!isAccountWideLimit(limit)) own.push(limit);
+			else if (
+				!known.shared.some(
+					(s) => s.kind === limit.kind && s.resetAt === limit.resetAt,
+				)
+			)
+				known.shared.push(limit);
+		}
+		known.routes.push({ own, answer });
+	};
+	const skipped = new Set<string>();
+	for (const entry of entries) {
+		skipped.add(entry.account.id);
+		for (const blocked of gatedBlockedEntry(entry, ctx, meta, now)) {
+			add(blocked, entry.answer);
+		}
+	}
+	const others = new Map<string, Account>();
+	for (const account of attempted.accounts) {
+		if (!skipped.has(account.id)) others.set(account.id, account);
+	}
+	for (const blocked of collectLimitBlockedAccounts(
+		[...others.values()],
+		ctx,
+		meta,
+		attempted.model,
+		now,
+	)) {
+		add(blocked, null);
+	}
+
+	const answers = new Map<string, LocalLimitAnswer>();
+	const blocked: LimitBlockedAccount[] = [];
+	for (const entry of byAccount.values()) {
+		const binding = bindingRoute(entry);
+		blocked.push(binding.blocked);
+		if (binding.answer) answers.set(entry.account.id, binding.answer);
+	}
+	const target =
+		blocked.length > 0
+			? ctx.strategy.selectWhenAllLimited(blocked, meta)
+			: null;
+	if (!target) return first.answer;
+	const gated = answers.get(target.id);
+	if (gated) return gated;
+	const other = others.get(target.id);
+	if (!other) return first.answer;
+	// An account this request asked and that is now on a limit: its own local
+	// 429. Nothing is forwarded to it.
+	return (
+		(await selectAllLimitedAnswer(ctx, meta, attempted.model, now, [other])) ??
+		first.answer
+	);
+}
+
 /**
  * Whether this account has another combo slot, in the request's current
  * combo DEFINITION, carrying a DIFFERENT model than `model`. Only then is a 429
@@ -1514,19 +1756,44 @@ export async function proxyWithAccount(
 ): Promise<Response | null> {
 	/**
 	 * Fail over from an upstream limit refusal: hand it to `onLimitRefusal`
-	 * when the all-limited rule can use it. Returns false when it was not
-	 * held (no receiver, another strategy, or an unreadable body); the caller
-	 * then drains it.
+	 * when the all-limited rule can use it, and remember a 429 with a future
+	 * unified reset as this account's last real refusal (rememberLimitRefusal)
+	 * on every request, held or not, so a later local 429 can replay it. A
+	 * refusal that is only remembered has its body read here (a body over the
+	 * buffer bound is cancelled, not cached). Returns false when the body was
+	 * neither held nor read (no receiver or another strategy and nothing to
+	 * remember, or an unreadable body); the caller then drains it.
 	 */
 	const holdLimitRefusal = async (rawResponse: Response): Promise<boolean> => {
-		if (!onLimitRefusal || !ctx.strategy.selectWhenAllLimited) return false;
+		const hold =
+			onLimitRefusal && ctx.strategy.selectWhenAllLimited
+				? onLimitRefusal
+				: null;
+		const resetMs =
+			rawResponse.status === 429
+				? limitRefusalResetMs(rawResponse.headers)
+				: null;
+		const remember = resetMs !== null && resetMs > Date.now();
+		if (!hold && !remember) return false;
 		let body: HeldLimitRefusal["body"];
 		try {
 			body = await readHeldBody(rawResponse.body, MAX_TERMINAL_REJECTION_BYTES);
 		} catch {
 			return false;
 		}
-		onLimitRefusal({
+		if (remember && !(body instanceof ReadableStream)) {
+			rememberLimitRefusal(account.id, {
+				status: rawResponse.status,
+				statusText: rawResponse.statusText,
+				headers: rawResponse.headers,
+				body,
+			});
+		}
+		if (!hold) {
+			if (body instanceof ReadableStream) body.cancel().catch(() => {});
+			return true;
+		}
+		hold({
 			account,
 			status: rawResponse.status,
 			statusText: rawResponse.statusText,
@@ -1557,7 +1824,19 @@ export async function proxyWithAccount(
 		// invariant that every provider has to remember. Merged with
 		// drainAbortController so the terminal-recovery drain deadline can also
 		// abort this same fetch later.
-		const forwardUpstream = (target: Request) => {
+		//
+		// Every send passes the attempt gate one last time inside `send`, right
+		// before the fetch and after every await of request preparation: an
+		// account that filled up meanwhile is not sent to (SendGatedError).
+		// `gate` is the model the send carries; it defaults to the attempt's
+		// current gate model.
+		const forwardUpstream = (
+			target: Request,
+			gate: { model: string | undefined; upstream: boolean } = {
+				model: gateModel,
+				upstream: gateUpstream,
+			},
+		) => {
 			const signal = AbortSignal.any([req.signal, drainAbortController.signal]);
 			return forwardObservedUpstream(
 				provider,
@@ -1570,16 +1849,32 @@ export async function proxyWithAccount(
 					nativeResponses: isTrustedNativeResponses(requestMeta),
 					signal,
 				},
-				(wire) =>
-					makeProxyRequest(
+				(wire) => {
+					if (fullBeforeSend(gate.model, gate.upstream)) {
+						throw new SendGatedError(account.name);
+					}
+					return makeProxyRequest(
 						wire,
 						undefined,
 						undefined,
 						undefined,
 						undefined,
 						signal,
-					),
-			);
+					);
+				},
+			).then((upstream) => {
+				// Only a 429 the proxy builds itself carries the local-429
+				// marker: one arriving from upstream is dropped before anything
+				// classifies, caches or forwards this response.
+				const response = withoutProxyOnlyHeaders(upstream);
+				// Every upstream answer, before any classification or forwarding:
+				// a response that shows the account out marks it for the next
+				// request. Headers only; the body is left to the caller.
+				observeLimitHeaders(response, account, {
+					keepalive: isInternalProbe(req.headers, ctx, "keepalive"),
+				});
+				return response;
+			});
 		};
 		if (
 			process.env.DEBUG?.includes("proxy") ||
@@ -1695,6 +1990,41 @@ export async function proxyWithAccount(
 		 */
 		const visionKeyModel =
 			(modelOverride ? modelOverride : baseBodyContext.getModel()) ?? "";
+
+		/**
+		 * The model the attempt gate reads: the slot's pin or the request's own
+		 * model, as selection reads it (limit-blocked maps it to what this
+		 * account sends), until model cycling sends a fallback model verbatim.
+		 */
+		let gateModel: string | undefined = visionKeyModel || undefined;
+		/** True once `gateModel` is a cycled model sent upstream verbatim. */
+		let gateUpstream = false;
+
+		/**
+		 * The gate before every upstream send of this attempt: true when the
+		 * account is at a full limit for `model` (five-hour, weekly, or the
+		 * model's family), whatever the extra-usage setting says. Selection
+		 * already left full accounts out; this catches an account that filled up
+		 * since (a response of this request, another request, a usage poll) and
+		 * a fallback model whose family is full. A skipped send is recorded so
+		 * the proxy can answer with the local 429 when nothing else serves.
+		 */
+		const fullBeforeSend = (
+			model: string | undefined,
+			upstream = false,
+		): boolean => {
+			const answer = fullLimitAnswer(account, ctx, model, undefined, {
+				upstreamModel: upstream,
+			});
+			if (!answer) return false;
+			const skipped = gatedAttempts.get(requestMeta) ?? [];
+			skipped.push({ account, model, upstream, answer });
+			gatedAttempts.set(requestMeta, skipped);
+			log.warn(
+				`Not sending to ${account.name} for model "${model ?? "none"}": the account is at a full limit (family=${answer.family ?? "none"}); skipping it`,
+			);
+			return true;
+		};
 
 		/**
 		 * Whether this attempt's image refusal must NOT reach the vision
@@ -1950,6 +2280,13 @@ export async function proxyWithAccount(
 			);
 		}
 
+		if (
+			!isSyntheticProviderResponse(outgoing.request) &&
+			fullBeforeSend(gateModel, gateUpstream)
+		) {
+			return null;
+		}
+
 		// Make the request (or unwrap a synthetic provider response)
 		let rawResponse = isSyntheticProviderResponse(outgoing.request)
 			? materializeSyntheticResponse(outgoing.request)
@@ -1979,6 +2316,10 @@ export async function proxyWithAccount(
 					}),
 					recoveredBodyText,
 				);
+				if (fullBeforeSend(gateModel, gateUpstream)) {
+					cancelDiscardedResponseBody(rawResponse);
+					return null;
+				}
 				cancelDiscardedResponseBody(rawResponse);
 				rawResponse = await forwardUpstream(outgoing.request);
 			}
@@ -2036,6 +2377,13 @@ export async function proxyWithAccount(
 				}
 
 				// Make the retry request (or unwrap a synthetic provider response)
+				if (
+					!isSyntheticProviderResponse(retryTransformedRequest) &&
+					fullBeforeSend(gateModel, gateUpstream)
+				) {
+					cancelDiscardedResponseBody(rawResponse);
+					return null;
+				}
 				cancelDiscardedResponseBody(rawResponse);
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
@@ -2081,6 +2429,13 @@ export async function proxyWithAccount(
 					// A URL-based rebuild drops the signal — carry it over.
 					signal: req.signal,
 				});
+				if (
+					!isSyntheticProviderResponse(retryRequest) &&
+					fullBeforeSend(gateModel, gateUpstream)
+				) {
+					cancelDiscardedResponseBody(rawResponse);
+					return null;
+				}
 				cancelDiscardedResponseBody(rawResponse);
 				rawResponse = isSyntheticProviderResponse(retryRequest)
 					? materializeSyntheticResponse(retryRequest)
@@ -2095,6 +2450,9 @@ export async function proxyWithAccount(
 				// response in hand, so the descriptor must stay with it.
 				adoptOutgoingRequest(retryRequest, strippedBodyText);
 			} catch (err) {
+				// A send the final gate skipped is not a failed retry: the account
+				// is full, so the attempt is skipped.
+				if (err instanceof SendGatedError) throw err;
 				log.warn("Failed to retry without cache_control:", err);
 			}
 		}
@@ -2703,7 +3061,7 @@ export async function proxyWithAccount(
 				const refusal = isClaudeProvider
 					? classifyRefusalScope({
 							headers: rawResponse.headers,
-							usageData: usageCache.get(account.id),
+							usageData: readingsBeforeHeaderMark(account.id),
 							model: requestedModel,
 							now: Date.now(),
 							headerResetAt: resetIsInferred ? null : cooldown.until,
@@ -2734,7 +3092,6 @@ export async function proxyWithAccount(
 							resetTime: cooldown.until,
 							resetIsInferred,
 							reason,
-							preserveStreak: isAllLimitedSelection(requestMeta),
 						},
 						ctx,
 					);
@@ -3234,6 +3591,11 @@ export async function proxyWithAccount(
 					// provider.
 					const nextSplit = splitModelRouting(nextModel);
 					const nextBareModel = nextSplit.model;
+					// A fallback model whose family (or the account) is full is not
+					// sent: upstream would serve it from extra usage. The next entry
+					// may still be usable; when none is, the previous refusal fails
+					// over below.
+					if (fullBeforeSend(nextBareModel, true)) continue;
 					const patchedContext = patchModelAndRouting(
 						effectiveBodyContext,
 						nextBareModel,
@@ -3309,10 +3671,21 @@ export async function proxyWithAccount(
 						}
 					}
 
+					// Again after the awaits above: the account or the model's family
+					// may have filled up while this request was being prepared.
+					if (
+						!isSyntheticProviderResponse(retryTransformedRequest) &&
+						fullBeforeSend(nextBareModel, true)
+					) {
+						continue;
+					}
 					cancelDiscardedResponseBody(rawResponse);
 					rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 						? materializeSyntheticResponse(retryTransformedRequest)
-						: await forwardUpstream(retryTransformedRequest);
+						: await forwardUpstream(retryTransformedRequest, {
+								model: nextBareModel,
+								upstream: true,
+							});
 					attemptedModels.push(nextBareModel);
 					if (retryTransformedBodyText === undefined) {
 						// Body unreadable — unreachable for a buffer-backed Request.
@@ -3345,6 +3718,8 @@ export async function proxyWithAccount(
 					// From here on, every response belongs to `nextModel`, not to the
 					// model the request asked for. See `modelCycledTo`.
 					modelCycledTo = true;
+					gateModel = nextBareModel;
+					gateUpstream = true;
 
 					rawResponse = await checkZai1305(
 						rawResponse,
@@ -3427,7 +3802,7 @@ export async function proxyWithAccount(
 							isClaudeProvider && lastAttemptedModel
 								? classifyRefusalScope({
 										headers: rawResponse.headers,
-										usageData: usageCache.get(account.id),
+										usageData: readingsBeforeHeaderMark(account.id),
 										model: lastAttemptedModel,
 										now: Date.now(),
 										headerResetAt: resetIsInferred ? null : cooldown.until,
@@ -3464,7 +3839,6 @@ export async function proxyWithAccount(
 									resetTime: cooldown.until,
 									resetIsInferred,
 									reason,
-									preserveStreak: isAllLimitedSelection(requestMeta),
 								},
 								ctx,
 							);
@@ -3684,6 +4058,9 @@ export async function proxyWithAccount(
 						// fails over without ever reaching a drain placed after
 						// the await. That left the whole 529 body holding its
 						// off-heap backing store until GC — issue #273.
+						// Re-check right before the re-issue: the account may have
+						// filled up during the backoff. The 529 then stands.
+						if (fullBeforeSend(gateModel, gateUpstream)) break;
 						cancelDiscardedResponseBody(response);
 						const retryResponse = await reissueRequestInPlace();
 						response = retryResponse;
@@ -3796,6 +4173,9 @@ export async function proxyWithAccount(
 					// 529 loop above: a rejecting re-issue must not strand this
 					// body. Only the body is consumed — the `x-should-retry`
 					// header read at the top of the next iteration still works.
+					// Re-check right before the re-issue: the account may have
+					// filled up during the backoff. The server error then stands.
+					if (fullBeforeSend(gateModel, gateUpstream)) break;
 					cancelDiscardedResponseBody(response);
 					const retryResponse = await reissueRequestInPlace();
 					response = retryResponse;
@@ -4060,6 +4440,9 @@ export async function proxyWithAccount(
 			{ ...ctx, provider },
 		);
 	} catch (err) {
+		// The final gate skipped a send: the account filled up while the request
+		// was being prepared. Skip this attempt, as the gates before it do.
+		if (err instanceof SendGatedError) return null;
 		// A client disconnect now aborts the upstream fetch by design. That is
 		// not an account failure: returning null would send the proxy through
 		// every remaining account and every fallback route for a request nobody
@@ -4208,12 +4591,7 @@ export function createPoolExhaustedResponse(
 		const usage = usageSnapshots?.get(account.id);
 		const usageExhausted =
 			usage !== undefined &&
-			isUsageExhausted(
-				usage.utilization,
-				usage.resetMs,
-				now,
-				usage.extraUsageAvailable,
-			);
+			isUsageExhausted(usage.utilization, usage.resetMs, now);
 
 		const reason: PoolExhaustionAccountReason = isVisionUnsupported
 			? // The account is healthy; it simply could not read the image. It was
@@ -4270,12 +4648,7 @@ export function createPoolExhaustedResponse(
 		const usage = usageSnapshots?.get(account.id);
 		if (
 			usage &&
-			isUsageExhausted(
-				usage.utilization,
-				usage.resetMs,
-				now,
-				usage.extraUsageAvailable,
-			) &&
+			isUsageExhausted(usage.utilization, usage.resetMs, now) &&
 			usage.resetMs &&
 			usage.resetMs > now
 		) {

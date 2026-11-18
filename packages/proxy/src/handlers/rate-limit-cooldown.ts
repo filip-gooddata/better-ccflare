@@ -316,7 +316,9 @@ export function applyRateLimitCooldown(
 				? Math.min(rateLimitInfo.resetTime, capUntil)
 				: capUntil;
 	} else if (
-		isExplicitResetHonoured() &&
+		// A response served on extra usage names the reset of a spent plan
+		// limit; benching for less would let the next request spend credits.
+		(isExplicitResetHonoured() || reason === "overage_in_use") &&
 		!rateLimitInfo.resetIsInferred &&
 		rateLimitInfo.resetTime != null &&
 		rateLimitInfo.resetTime > now
@@ -403,8 +405,34 @@ export function applyRateLimitCooldown(
 		account.rate_limited_until != null &&
 		account.rate_limited_until > cooldownUntil;
 
+	// Any other cooldown may extend an active overage bench, never shorten or
+	// relabel it: ending it early readmits an account spending extra usage.
+	// The database write applies the same rule (markAccountRateLimited).
+	const keepsOverageBench =
+		reason !== "overage_in_use" &&
+		account.rate_limited_reason === "overage_in_use" &&
+		account.rate_limited_until != null &&
+		account.rate_limited_until > now;
+
+	// An overage bench never shortens an active cooldown, whatever its reason:
+	// two in-flight responses may report different resets, and the earlier one
+	// must not end the bench. It keeps the later deadline and the bench label.
+	// The database write applies the same rule (markAccountRateLimited).
+	const overageKeepsLaterDeadline =
+		reason === "overage_in_use" &&
+		account.rate_limited_until != null &&
+		account.rate_limited_until > now &&
+		account.rate_limited_until > cooldownUntil;
+
 	// In-memory update so the rest of this request sees consistent state.
-	if (!keepsLaterCooldown) {
+	if (overageKeepsLaterDeadline) {
+		account.rate_limited_at = now;
+		account.rate_limited_reason = reason;
+	} else if (keepsOverageBench) {
+		if (cooldownUntil > (account.rate_limited_until as number)) {
+			account.rate_limited_until = cooldownUntil;
+		}
+	} else if (!keepsLaterCooldown) {
 		account.rate_limited_until = cooldownUntil;
 		account.rate_limited_at = now;
 		account.rate_limited_reason = reason;

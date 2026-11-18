@@ -446,20 +446,34 @@ curl -X POST http://localhost:8080/api/accounts/uuid-here/usage-pause-thresholds
 Force-clear persisted rate-limit lock state for an account and trigger immediate usage polling when possible.
 
 **What it does:**
-- Clears `rate_limited_until`
-- Clears `rate_limit_reset`
-- Clears `rate_limit_status`
-- Clears `rate_limit_remaining`
-- Triggers immediate usage poll for the account (if polling is configured in-process)
+- Clears `rate_limited_until`, `rate_limited_reason` and `rate_limited_at` (an ordinary cooldown)
+- Clears `rate_limit_reset`, `rate_limit_reset_at`, `rate_limit_status` and `rate_limit_remaining`
+- Triggers immediate usage poll for the account (if polling is configured in-process, else a direct usage fetch for Anthropic OAuth accounts)
+
+**What it keeps:** a manual reset never lifts known exhausted capacity, because the next request could then be served from extra usage.
+- An active `overage_in_use` bench (the account answered with `overage-in-use: true`) stays until its `rate_limited_until`, or until a newer usage poll (the in-process poller, not the one-off direct fetch fallback) shows both the five-hour and the weekly window below 100 %. A bench whose time has passed is cleared.
+- Unexpired model-family blocks (for example a Fable weekly limit) stay in this server's memory until their reset, also when the usage refresh fails or returns no family telemetry. Expired blocks are dropped.
+
+`kept` lists what is still in force after the refresh; both parts are empty when nothing was kept. `until` is epoch milliseconds.
 
 **Response:**
 ```json
 {
   "success": true,
-  "message": "Rate limit state cleared for account 'myaccount'",
-  "usagePollTriggered": true
+  "message": "Rate limit state cleared for account 'myaccount'. Kept the overage_in_use bench until 2026-11-18T15:00:00.000Z: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%. Kept family blocks until their reset: fable until 2026-11-20T09:00:00.000Z.",
+  "usagePollTriggered": true,
+  "kept": {
+    "overageBench": { "until": 1795014000000, "untilIso": "2026-11-18T15:00:00.000Z" },
+    "familyBlocks": [
+      { "family": "fable", "until": 1795165200000, "untilIso": "2026-11-20T09:00:00.000Z", "source": "header" }
+    ]
+  }
 }
 ```
+
+With nothing kept, `message` is `Rate limit state cleared for account 'myaccount'.` and `kept` is `{ "overageBench": null, "familyBlocks": [] }`.
+
+The CLI `--force-reset-rate-limit <name>` clears the database the same way (keeping an active bench), then calls this endpoint on local servers (configured port, 8080, 8081). It stops at the first server that accepts the usage poll. It prints the kept bench, the family blocks the answering servers reported, the ports it did not check, or, when no server answered, that family blocks in a server's memory were not checked or cleared.
 
 **Example:**
 ```bash
@@ -914,11 +928,13 @@ curl -X POST http://localhost:8080/api/config/force-account-model \
 
 #### GET /api/config/use-extra-usage
 
-Whether an account whose plan window is spent stays in rotation while its provider reports billed capacity beyond the plan (Codex credits, Anthropic extra usage). Config-file setting, off by default; `CCFLARE_USE_EXTRA_USAGE` can only seed it once — see [Use Extra Usage](configuration.md#use-extra-usage) in configuration.md.
+The stored `use_extra_usage` value. **It no longer does anything**: a full five-hour, weekly or model-family limit is final, whatever extra usage or spend says. Still accepted and stored so old clients keep working; `ignored` is always `true`. `CCFLARE_USE_EXTRA_USAGE` can only seed the stored value once — see [Use Extra Usage](configuration.md#use-extra-usage) in configuration.md.
+
+The forced-account request header `x-better-ccflare-account-id` cannot get around this. It no longer bypasses a full five-hour, weekly or model-family limit: ordinary traffic forced to a full account falls back to normal selection, then gets the local 429 when nothing remains, and an auto-refresh probe forced to it gets that account's local 429. An account benched because a response carried `overage-in-use: true` is treated the same way. See [Forced account and probes at a full limit](routing-architecture.md#session-pace-sessionpacestrategy).
 
 **Response:**
 ```json
-{ "enabled": false, "source": "default" }
+{ "enabled": false, "source": "default", "ignored": true, "note": "use_extra_usage no longer does anything: ..." }
 ```
 
 **Example:**
@@ -928,7 +944,7 @@ curl http://localhost:8080/api/config/use-extra-usage
 
 #### POST /api/config/use-extra-usage
 
-Enable or disable serving on extra usage. Takes effect immediately, no restart required.
+Stores the value and returns 200, but it has no effect: routing never serves a full limit on extra usage. `effective` is always `false`.
 
 **Request:**
 ```json
@@ -937,7 +953,7 @@ Enable or disable serving on extra usage. Takes effect immediately, no restart r
 
 **Response:**
 ```json
-{ "success": true, "enabled": true, "source": "file", "effective": true }
+{ "success": true, "enabled": true, "source": "file", "effective": false, "ignored": true, "note": "use_extra_usage no longer does anything: ..." }
 ```
 
 **Example:**

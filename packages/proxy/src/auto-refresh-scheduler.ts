@@ -34,6 +34,11 @@ import {
 	INTERNAL_PROBE_SECRET_HEADER,
 	LOCAL_REFUSAL_ERROR_TYPES,
 } from "./handlers";
+import { SUCCESS_MAY_CLEAR_COOLDOWN_SQL } from "./handlers/header-mark-out";
+import {
+	LOCAL_429_HEADER,
+	limitRefusalResetMs,
+} from "./handlers/limit-response";
 import {
 	flushPendingRotation,
 	getPendingRotation,
@@ -51,6 +56,40 @@ const log = new Logger("AutoRefreshScheduler");
  * its reset is unknown or still in the future.
  */
 const UNKNOWN_USAGE_RESET = 0;
+
+/**
+ * Whether a failed probe was refused because the account is at a full limit
+ * or on a cooldown: a 429 with unified status `rejected` (the proxy's local
+ * limit 429 and upstream's real one both carry it), or any 429 the proxy
+ * built itself ({@link LOCAL_429_HEADER}, which also marks the cooldown-only
+ * answer that claims no limit). Either way the account is held, not broken.
+ * Any other 429 is not a limit refusal.
+ */
+function isLimitRefusal(response: Response): boolean {
+	if (response.status !== 429) return false;
+	return (
+		response.headers.get("anthropic-ratelimit-unified-status") === "rejected" ||
+		response.headers.has(LOCAL_429_HEADER)
+	);
+}
+
+/**
+ * When a limit refusal lets the account be probed again: its unified reset,
+ * or for the proxy's own cooldown answer (no unified reset) its retry-after,
+ * which counts to the cooldown end. Null when no reset is known: a local
+ * limit answer without a unified reset, or a cooldown answer with an unknown
+ * end, carries only the default retry-after, which is no reset at all; the
+ * uncounted-failure ladder spaces those probes instead.
+ */
+function limitRefusalHoldUntil(response: Response, now: number): number | null {
+	const resetMs = limitRefusalResetMs(response.headers);
+	if (resetMs !== null) return resetMs;
+	if (response.headers.get(LOCAL_429_HEADER) !== "cooldown") return null;
+	const retryAfterS = Number(response.headers.get("retry-after"));
+	return Number.isFinite(retryAfterS) && retryAfterS > 0
+		? now + retryAfterS * 1000
+		: null;
+}
 
 /**
  * Whether a failed probe's response is better-ccflare's own refusal rather
@@ -102,6 +141,10 @@ export class AutoRefreshScheduler {
 	private refreshMutexResolver: (() => void) | null = null;
 	// Track consecutive failure counts for accounts to identify consistently failing ones
 	private consecutiveFailures: Map<string, number> = new Map();
+	// accountId -> reset (epoch ms) of the full limit a probe was refused for.
+	// No probe goes to the account before it: the usage poll's resets_at says
+	// when the account is usable again, a probe could only be refused again.
+	private limitRefusedUntil: Map<string, number> = new Map();
 	// Threshold for marking an account as needing re-authentication
 	private readonly FAILURE_THRESHOLD = 5;
 	// Timestamp (ms) of the last probe sent to a failure_threshold-paused account.
@@ -192,6 +235,7 @@ export class AutoRefreshScheduler {
 		// Clear the tracking maps to free memory
 		this.lastRefreshResetTime.clear();
 		this.consecutiveFailures.clear();
+		this.limitRefusedUntil.clear();
 		this.lastFailureProbeAt.clear();
 		for (const accountId of this.uncountedProbeFailures.keys()) {
 			clearProbeBackoff(accountId);
@@ -697,10 +741,14 @@ export class AutoRefreshScheduler {
 				const rateLimitInfo = provider.parseRateLimit(response);
 
 				// Update rate limit fields from unified headers
+				// A probe's success never clears an overage_in_use bench still ahead
+				// of its reset: that bench says the account's limits are spent
+				// (header-mark-out.ts). Every other cooldown clears as before.
+				const clearedAt = Date.now();
 				if (rateLimitInfo.resetTime) {
 					await this.db.run(
-						"UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limited_until = NULL WHERE id = ?",
-						[rateLimitInfo.resetTime, Date.now(), accountRow.id],
+						`UPDATE accounts SET rate_limit_reset = ?, rate_limit_reset_at = ?, rate_limited_until = CASE WHEN ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL} THEN NULL ELSE rate_limited_until END WHERE id = ?`,
+						[rateLimitInfo.resetTime, clearedAt, clearedAt, accountRow.id],
 					);
 
 					// Update our tracking with the NEW rate_limit_reset from the API
@@ -716,8 +764,8 @@ export class AutoRefreshScheduler {
 					// Even if no reset time is provided, clear rate_limited_until as the refresh was successful
 					// Also make sure to clear any existing rate_limited_until value to ensure the account is not stuck
 					await this.db.run(
-						"UPDATE accounts SET rate_limited_until = NULL WHERE id = ?",
-						[accountRow.id],
+						`UPDATE accounts SET rate_limited_until = NULL WHERE id = ? AND ${SUCCESS_MAY_CLEAR_COOLDOWN_SQL}`,
+						[accountRow.id, clearedAt],
 					);
 					log.info(
 						`Cleared rate_limited_until for ${accountRow.name} as account has been refreshed (no new reset time)`,
@@ -845,6 +893,23 @@ export class AutoRefreshScheduler {
 				// cooldown instead: the prompt this probe just spent is locked for
 				// 24 hours whether the account was overloaded or not.
 				this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+				return false;
+			}
+
+			// A full account is not a broken one: never count its limit refusal
+			// toward the pause. Hold probes off until the refusal's reset; with
+			// no reset to go by, the uncounted-failure ladder spaces them.
+			if (isLimitRefusal(response)) {
+				const now = Date.now();
+				const resetMs = limitRefusalHoldUntil(response, now);
+				log.warn(
+					`Auto-refresh probe for ${accountRow.name} was refused for a full limit${resetMs !== null ? ` until ${new Date(resetMs).toISOString()}` : ""} — not counting toward the ${this.FAILURE_THRESHOLD}-failure pause threshold`,
+				);
+				if (resetMs !== null && resetMs > now) {
+					this.limitRefusedUntil.set(accountRow.id, resetMs);
+				} else {
+					this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+				}
 				return false;
 			}
 
@@ -1539,6 +1604,13 @@ export class AutoRefreshScheduler {
 				}
 			}
 
+			// And the holds of accounts refused for a full limit
+			for (const accountId of this.limitRefusedUntil.keys()) {
+				if (!activeAccountIdSet.has(accountId)) {
+					this.limitRefusedUntil.delete(accountId);
+				}
+			}
+
 			// And what has already been announced about an exhausted usage window
 			for (const accountId of this.usageExhaustedAnnouncedFor.keys()) {
 				if (!activeAccountIdSet.has(accountId)) {
@@ -1734,12 +1806,9 @@ export class AutoRefreshScheduler {
 		const { utilization, resetMs } = snapshot;
 		// The same predicate the selector and /health use, staleness guard
 		// included: a 100% reading whose reset has already passed is the poller
-		// lagging behind a rollover, not an exhausted window.
-		//
-		// Deliberately WITHOUT the snapshot's extraUsageAvailable: an account
-		// serving on extra usage still has a spent window, and a probe sent to
-		// it now would only be billed against that extra usage while learning
-		// nothing the traffic path is not already reporting.
+		// lagging behind a rollover, not an exhausted window. Extra usage
+		// plays no part: a spent window is final, and a probe sent to it now
+		// could only be billed beyond the plan.
 		if (!isUsageExhausted(utilization, resetMs, now)) return false;
 
 		const until =
@@ -1786,6 +1855,18 @@ export class AutoRefreshScheduler {
 				);
 				return false;
 			}
+		}
+
+		// A probe was refused for a full limit whose reset is still ahead.
+		const refusedUntil = this.limitRefusedUntil.get(account.id);
+		if (refusedUntil !== undefined) {
+			if (now < refusedUntil) {
+				log.debug(
+					`Skipping probe for account ${account.name} — refused for a full limit until ${new Date(refusedUntil).toISOString()}`,
+				);
+				return false;
+			}
+			this.limitRefusedUntil.delete(account.id);
 		}
 
 		// Nothing to refresh while the usage window is spent. Checked ahead of the

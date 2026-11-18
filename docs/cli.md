@@ -211,6 +211,8 @@ bun run cli --force-reset-rate-limit <name>
 - Clears `rate_limit_remaining`
 - Attempts to trigger immediate usage polling on running local servers
 
+**What it keeps:** an active `overage_in_use` bench (the account was answered from extra usage) and active model-family blocks stay in force until their reset. A reset never makes a full limit usable again. The command prints what it kept and until when, and the ports it did not check. See `POST /api/accounts/:id/force-reset-rate-limit` in [api-http.md](./api-http.md).
+
 #### `--resume <name>`
 
 Re-enable a paused account for load balancing.

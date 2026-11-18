@@ -21,9 +21,11 @@ import type {
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import {
-	isAllLimitedRuleEligible,
-	markAllLimitedSelection,
-	selectAllLimitedTarget,
+	collectLimitBlockedAccounts,
+	fullLimitAnswer,
+	type LocalLimitAnswer,
+	markLocalLimitAnswer,
+	selectAllLimitedAnswer,
 } from "./limit-blocked";
 import {
 	type FamilyExhaustionOrigin,
@@ -448,12 +450,13 @@ export function isComboSessionFallbackDisabled(ctx: ProxyContext): boolean {
 
 /**
  * Whether `account` should be excluded from routing for `model`'s family.
- * A standing family block (origin "family_blocked") excludes in every mode;
- * the remaining checks run only when capacity routing is on: either its
- * cached usage telemetry shows a fully exhausted (>=100%, future
- * reset) weekly_scoped cap for that family (origin "telemetry_confirmed"),
- * or the family was recently observed exhausted via an out_of_credits 429
- * (negative cache — origin as recorded by markFamilyExhausted, normally
+ * A standing family block (origin "family_blocked") excludes in every mode,
+ * and so does cached usage telemetry showing a fully exhausted (>=100%,
+ * future or unknown reset) weekly_scoped cap for that family (origin
+ * "telemetry_confirmed"): a full limit has no capacity whatever the mode.
+ * Only the reactive check runs just when capacity routing is on: the family
+ * was recently observed exhausted via an out_of_credits 429 (negative cache
+ * — origin as recorded by markFamilyExhausted, normally
  * "recent_upstream_rejection"). Telemetry is checked first: it's the
  * stronger signal and is what should surface if both happen to agree.
  */
@@ -472,9 +475,8 @@ function isAccountCapacityExcluded(
 	// of the model this account actually sends (mapModelName: the mapped
 	// primary model, or the client's model when no mapping applies or
 	// "force account model" turns mapping off).
-	const upstreamFamily =
-		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
-		family;
+	const upstreamModel = splitModelRouting(mapModelName(model, account)).model;
+	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
 	if (!upstreamFamily) return { excluded: false, resetAt: null, origin: null };
 
 	// A standing family block is an observed upstream refusal of this family
@@ -487,14 +489,15 @@ function isAccountCapacityExcluded(
 		);
 		return { excluded: true, resetAt: block.until, origin: "family_blocked" };
 	}
-	if (!family) return { excluded: false, resetAt: null, origin: null };
-	if (!capacityRoutingEnabled) {
-		return { excluded: false, resetAt: null, origin: null };
-	}
 
+	// Telemetry is read for the family the account actually sends, like the
+	// block above: an Opus request mapped to Fable spends the Fable limit. A
+	// mapping lists fallbacks after its primary; only the primary is sent
+	// first, so it is the one gated (a fallback is tried only after the
+	// primary is refused).
 	const usageResult = isAccountExhaustedForModel(
 		usageCache.get(account.id),
-		model,
+		getModelFamily(upstreamModel) ? upstreamModel : model,
 		now,
 	);
 	if (usageResult.exhausted) {
@@ -503,6 +506,9 @@ function isAccountCapacityExcluded(
 			resetAt: usageResult.resetAt,
 			origin: "telemetry_confirmed",
 		};
+	}
+	if (!capacityRoutingEnabled || !family) {
+		return { excluded: false, resetAt: null, origin: null };
 	}
 	const negativeCacheOrigin = getFamilyExhaustionOrigin(
 		account.id,
@@ -594,12 +600,12 @@ export async function getOrderedAccounts(
 		// at once and keeps a capped account from being picked, retried, and
 		// model-cycled until every model 429s.
 		//
-		// The auto-refresh scheduler's probes must still get through: that is
-		// how a capped account's window-reset is detected, and a capped account
-		// is neither `paused` nor `rate_limited_until`, so nothing else would
-		// let it back in.
-		const isAutoRefreshBypass =
-			meta.headers?.get("x-better-ccflare-bypass-session") === "true";
+		// No header lifts this filter: a full limit is final, and
+		// `x-better-ccflare-bypass-session` is client-settable. Auto-refresh
+		// probes and keepalive replays name their account with
+		// `x-better-ccflare-account-id` and take the forced-account path, which
+		// never reaches this list.
+		//
 		// Deliberately narrow: this removes ONLY usage-capped accounts. The
 		// paused / requires_reauth / rate_limited_until checks stay where they
 		// already are, inside the strategies, because some of them rely on
@@ -607,20 +613,13 @@ export async function getOrderedAccounts(
 		// account before deciding anything). Filtering those here too would
 		// silently change strategy behaviour, which is not what this fix is for.
 		const now = Date.now();
-		const candidates = isAutoRefreshBypass
-			? allAccounts
-			: allAccounts.filter((account) => {
-					const usage = usageSnapshot(account);
-					return (
-						usage === null ||
-						!isUsageExhausted(
-							usage.utilization,
-							usage.resetMs,
-							now,
-							usage.extraUsageAvailable,
-						)
-					);
-				});
+		const candidates = allAccounts.filter((account) => {
+			const usage = usageSnapshot(account);
+			return (
+				usage === null ||
+				!isUsageExhausted(usage.utilization, usage.resetMs, now)
+			);
+		});
 		// `all` stays the raw, unfiltered DB read (not `candidates`) — the
 		// cooldown-masking sweep in selectAccountsForRequest walks `all` to
 		// find accounts sidelined only by a short rate-limit cooldown, and a
@@ -751,6 +750,30 @@ export async function selectAccountsForRequest(
 					// the scheduler holds the process-local probe secret.
 					const isAutoRefreshBypass =
 						meta.headers.get("x-better-ccflare-bypass-session") === "true";
+					// A forced account at a full limit (five-hour, weekly, or the
+					// request model's family) is never served, whatever the header
+					// says: upstream would answer from extra usage. Its local 429
+					// answers the request when nothing else can (proxy.ts reads
+					// the mark on an empty selection).
+					//
+					// A probe gets that 429 at once: it is a question about this
+					// one account, so it is never answered by another one, and
+					// letting it through would spend extra usage only to learn
+					// the reset, which the usage poll's resets_at already gives.
+					// Ordinary client traffic falls back to normal selection.
+					const fullAnswer = fullLimitAnswer(forcedAccount, ctx, model);
+					if (fullAnswer) {
+						markLocalLimitAnswer(meta, fullAnswer);
+						if (isAutoRefreshBypass || isInternalAutoRefreshProbe) {
+							log.warn(
+								`Probe for ${forcedAccount.name} (${forcedAccount.id}) refused: the account is at a full limit, answering with its local 429`,
+							);
+							return [];
+						}
+						log.info(
+							`Forced account ${forcedAccount.name} is at a full limit; falling back to normal selection`,
+						);
+					}
 					const forcedUsage = usageSnapshot(forcedAccount);
 					const available = isAccountAvailable(
 						forcedAccount,
@@ -766,27 +789,21 @@ export async function selectAccountsForRequest(
 						!available &&
 						!forcedAccount.paused &&
 						!!forcedAccount.rate_limited_until;
-					// A usage-capped account is neither paused nor
-					// rate_limited_until, so without this it would fail
-					// `available` and then match none of the bypass conditions —
-					// leaving the scheduler unable to probe it and detect its
-					// window reset, the one thing the bypass exists to do.
-					const isUsageCapped =
-						!available &&
-						!forcedAccount.paused &&
-						!forcedAccount.rate_limited_until &&
-						forcedUsage !== null;
 					const isFailureThresholdPaused =
 						!!forcedAccount.paused &&
 						forcedAccount.pause_reason === "failure_threshold";
+					// The bypasses never admit an account at a full limit
+					// (fullAnswer above); a usage-capped account no longer has
+					// one of its own.
 					const allowThrough =
-						available ||
-						(isAutoRefreshBypass &&
-							!forcedAccount.requires_reauth &&
-							(isOveragePaused || isRateLimited || isUsageCapped)) ||
-						(isInternalAutoRefreshProbe &&
-							!forcedAccount.requires_reauth &&
-							isFailureThresholdPaused);
+						!fullAnswer &&
+						(available ||
+							(isAutoRefreshBypass &&
+								!forcedAccount.requires_reauth &&
+								(isOveragePaused || isRateLimited)) ||
+							(isInternalAutoRefreshProbe &&
+								!forcedAccount.requires_reauth &&
+								isFailureThresholdPaused));
 					if (allowThrough) {
 						return [forcedAccount];
 					}
@@ -948,6 +965,15 @@ export async function selectAccountsForRequest(
 					}> = [];
 					const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
 					const capacityNow = Date.now();
+					// Slots left out because their account is full for the slot's
+					// effective model, with that account's local 429. A combo whose
+					// every slot is unusable, at least one of them full, answers with
+					// the limit instead of the fallback-disabled 503.
+					const fullSlots: Array<{
+						account: Account;
+						model: string | undefined;
+						answer: LocalLimitAnswer;
+					}> = [];
 
 					// Slots are already ordered by priority ASC from the repository
 					for (const slot of combo.slots) {
@@ -958,6 +984,24 @@ export async function selectAccountsForRequest(
 							log.warn(
 								`Combo slot references unknown account ${slot.account_id}`,
 							);
+							continue;
+						}
+
+						// Full means five-hour, weekly, or the slot model's family at
+						// 100 % (the slot's own model, the request's for a passthrough
+						// slot). Such a slot is never routed; the checks below would
+						// leave it out too, but only this one keeps its answer.
+						const slotModelForLimit = slot.model || model;
+						const slotFullAnswer =
+							!account.paused && permittedAccountIds.has(account.id)
+								? fullLimitAnswer(account, ctx, slotModelForLimit, capacityNow)
+								: null;
+						if (slotFullAnswer) {
+							fullSlots.push({
+								account,
+								model: slotModelForLimit,
+								answer: slotFullAnswer,
+							});
 							continue;
 						}
 
@@ -989,8 +1033,9 @@ export async function selectAccountsForRequest(
 						// Per-slot capacity check uses the slot's own model override
 						// (not the combo family's request model), since slots can carry
 						// distinct concrete models within the same family.
-						// A family block excludes the slot even with capacity routing
-						// off; the telemetry and negative-cache checks need it on.
+						// A family block or full family telemetry excludes the slot
+						// even with capacity routing off; the negative-cache check
+						// needs it on.
 						if (
 							isAccountCapacityExcluded(
 								account,
@@ -1173,6 +1218,30 @@ export async function selectAccountsForRequest(
 						log.warn(
 							`All ${combo.slots.length} combo slots unavailable for ${combo.name}, session fallback disabled by the Combo Session Fallback setting (Settings → Advanced)`,
 						);
+						// Every slot unusable and at least one full: the local 429 of
+						// the full slot the all-limited rule ranks first (each read
+						// with its own model), not the generic 503. Nothing is sent.
+						const slotFull = fullSlots[0];
+						if (slotFull) {
+							const blocked = fullSlots.flatMap((entry) =>
+								collectLimitBlockedAccounts(
+									[entry.account],
+									ctx,
+									meta,
+									entry.model,
+									capacityNow,
+								),
+							);
+							const target =
+								blocked.length > 0 && ctx.strategy.selectWhenAllLimited
+									? ctx.strategy.selectWhenAllLimited(blocked, meta)
+									: null;
+							markLocalLimitAnswer(
+								meta,
+								fullSlots.find((entry) => entry.account.id === target?.id)
+									?.answer ?? slotFull.answer,
+							);
+						}
 						return [];
 					}
 
@@ -1189,23 +1258,22 @@ export async function selectAccountsForRequest(
 	let orderedAccounts = applyExclusions(rawOrderedAccounts);
 
 	/**
-	 * When this selection would end empty and the strategy implements
-	 * `selectWhenAllLimited`, the one account to forward to anyway (marked on
-	 * the request), or null to keep today's empty result. Never for a request
-	 * that owns its routing (isAllLimitedRuleEligible).
+	 * When this selection ends empty and the strategy implements
+	 * `selectWhenAllLimited` (rule=all-exhausted): mark the request to be
+	 * answered with the local 429 of the account the rule ranks first, the one
+	 * whose limit the answer describes. Nothing is forwarded to it: upstream
+	 * would serve a request to a full account from extra usage. A request
+	 * naming an account is left to that account's own answer.
 	 */
-	const allLimitedSelection = async (): Promise<Account[] | null> => {
-		if (!isAllLimitedRuleEligible(ctx, meta)) return null;
-		const target = await selectAllLimitedTarget(
+	const markAllLimitedAnswer = async (): Promise<void> => {
+		const answer = await selectAllLimitedAnswer(
 			ctx,
 			meta,
 			model,
 			Date.now(),
 			allAccounts,
 		);
-		if (!target) return null;
-		markAllLimitedSelection(meta, target.id);
-		return [target];
+		if (answer) markLocalLimitAnswer(meta, answer);
 	};
 
 	// "Force account model": keep only accounts that can serve the requested
@@ -1290,10 +1358,9 @@ export async function selectAccountsForRequest(
 	// The strategy left no candidate: ask the all-limited rule here, before the
 	// model-scoped capacity filter. With nothing to filter, that block returns
 	// the empty list without reaching the rule, and a request with a model
-	// would get the local pool_exhausted 503 instead of an upstream answer.
+	// would get the local pool_exhausted 503 instead of the limit 429.
 	if (orderedAccounts.length === 0) {
-		const allLimited = await allLimitedSelection();
-		if (allLimited) return allLimited;
+		await markAllLimitedAnswer();
 	}
 
 	// Model-scoped capacity filter for the non-combo (or combo-inactive/
@@ -1301,9 +1368,9 @@ export async function selectAccountsForRequest(
 	// cap for this model's family is exhausted. Only when the filter empties
 	// an otherwise non-empty candidate list do we record exhaustion info —
 	// an empty candidate list from the strategy itself is the ordinary
-	// pool_exhausted case and must not be relabeled. Family blocks apply in
-	// every mode; the telemetry and negative-cache checks only when capacity
-	// routing is on (isAccountCapacityExcluded).
+	// pool_exhausted case and must not be relabeled. Family blocks and full
+	// family telemetry apply in every mode; the negative-cache check only when
+	// capacity routing is on (isAccountCapacityExcluded).
 	if (model) {
 		const family = getModelFamily(model);
 		if (family) {
@@ -1395,8 +1462,7 @@ export async function selectAccountsForRequest(
 					}
 				}
 
-				const allLimited = await allLimitedSelection();
-				if (allLimited) return allLimited;
+				await markAllLimitedAnswer();
 
 				if (earliestCooldownResetAt != null) {
 					log.warn(
@@ -1422,6 +1488,27 @@ export async function selectAccountsForRequest(
 							? "family_blocked"
 							: "recent_upstream_rejection",
 				});
+				return [];
+			}
+			notePoolDeferrals(available);
+			return applyXaiCacheAffinity(available, meta);
+		}
+
+		// A client model with no family of its own (an alias) can still be
+		// mapped to one: drop accounts whose family block or full family
+		// telemetry covers the model they would send. There is no request
+		// family to name in a model_family_exhausted response, so an emptied
+		// list takes the all-limited rule or the ordinary empty result.
+		const now = Date.now();
+		const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
+		const available = orderedAccounts.filter(
+			(account) =>
+				!isAccountCapacityExcluded(account, model, now, capacityRoutingEnabled)
+					.excluded,
+		);
+		if (available.length < orderedAccounts.length) {
+			if (available.length === 0) {
+				await markAllLimitedAnswer();
 				return [];
 			}
 			notePoolDeferrals(available);

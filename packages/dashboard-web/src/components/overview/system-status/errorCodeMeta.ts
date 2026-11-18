@@ -124,6 +124,17 @@ const KNOWN_ERROR_META: Record<
 			"returns to service on its own as soon as credits are available.",
 		severity: "error",
 	},
+	overage_in_use: {
+		title: "Account went into extra usage",
+		description:
+			"An Anthropic response carried `overage-in-use: true`: it was served " +
+			"from extra usage, so one of the account's plan limits is spent. That " +
+			"response was served in full; the account was benched until its " +
+			"limit resets so the next request goes to another account.",
+		suggestion:
+			"Nothing to do: the account returns to service when its limit resets.",
+		severity: "warning",
+	},
 	org_permission_denied: {
 		title: "Organization forbids this account",
 		description:

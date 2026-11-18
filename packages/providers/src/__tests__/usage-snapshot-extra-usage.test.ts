@@ -1,10 +1,10 @@
 /**
- * "Use extra usage": an account whose plan window reads 100% stays routable
- * while its provider reports billed capacity beyond the plan — Codex credits,
- * Anthropic extra usage / spend — but only once the operator has switched it
- * on. The snapshot carries that as `extraUsageAvailable`, and the shared
- * `isUsageExhausted` predicate honours it, so selection, /health and the
- * pool-exhausted body all agree.
+ * Extra usage is a display fact, never capacity. An account whose plan window
+ * reads 100% is exhausted even while its provider reports billed capacity
+ * beyond the plan (Codex credits, Anthropic extra usage / spend), and even
+ * when the "use extra usage" setting is on: that setting is ignored. The
+ * snapshot carries no extra-usage flag, so selection, /health and the
+ * pool-exhausted body all see the same exhausted window.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { isUsageExhausted, setUseExtraUsage } from "@better-ccflare/core";
@@ -114,77 +114,51 @@ describe("hasExtraUsageCapacity — what each provider reports", () => {
 	});
 });
 
-describe("getRepresentativeUsageSnapshotForProvider — extra usage", () => {
+describe("getRepresentativeUsageSnapshotForProvider — extra usage is not capacity", () => {
 	const codexWithCredits = spentWeekly({
 		credits: { has_credits: true, unlimited: false, balance: "5" },
 	});
 
-	it("keeps today's behaviour while the switch is off", () => {
-		const snapshot = getRepresentativeUsageSnapshotForProvider(
-			codexWithCredits,
-			"codex",
-		);
-
-		expect(snapshot?.utilization).toBe(100);
-		expect(snapshot?.extraUsageAvailable).toBeUndefined();
-		expect(
-			isUsageExhausted(
-				snapshot?.utilization ?? null,
-				snapshot?.resetMs,
-				NOW,
-				snapshot?.extraUsageAvailable,
-			),
-		).toBe(true);
-	});
-
-	it("marks a spent window servable on extra usage once the switch is on", () => {
-		setUseExtraUsage(true);
-		const snapshot = getRepresentativeUsageSnapshotForProvider(
-			codexWithCredits,
-			"codex",
-		);
-
-		// The window itself is reported as it is — only admission changes.
+	function expectExhaustedSnapshot(data: UsageData, provider: string) {
+		const snapshot = getRepresentativeUsageSnapshotForProvider(data, provider);
+		expect(snapshot).not.toBeNull();
+		// The window is reported as it is, and nothing rides along that could
+		// let a gate treat it as usable.
 		expect(snapshot?.utilization).toBe(100);
 		expect(snapshot?.resetMs).toBe(Date.parse(WEEKLY_RESET));
-		expect(snapshot?.extraUsageAvailable).toBe(true);
+		expect(Object.keys(snapshot ?? {}).sort()).toEqual([
+			"resetMs",
+			"utilization",
+		]);
 		expect(
-			isUsageExhausted(
-				snapshot?.utilization ?? null,
-				snapshot?.resetMs,
-				NOW,
-				snapshot?.extraUsageAvailable,
-			),
-		).toBe(false);
-	});
-
-	it("does not mark an account that has no credits, even with the switch on", () => {
-		setUseExtraUsage(true);
-		const snapshot = getRepresentativeUsageSnapshotForProvider(
-			spentWeekly({
-				credits: { has_credits: false, unlimited: false, balance: "0" },
-			}),
-			"codex",
-		);
-
-		expect(snapshot?.extraUsageAvailable).toBeUndefined();
-		expect(
-			isUsageExhausted(
-				snapshot?.utilization ?? null,
-				snapshot?.resetMs,
-				NOW,
-				snapshot?.extraUsageAvailable,
-			),
+			isUsageExhausted(snapshot?.utilization ?? null, snapshot?.resetMs, NOW),
 		).toBe(true);
+	}
+
+	it("a spent Codex window with credits is exhausted, setting off", () => {
+		expectExhaustedSnapshot(codexWithCredits, "codex");
 	});
 
-	it("applies the same rule to an anthropic account with extra usage", () => {
+	it("a spent Codex window with credits is exhausted, setting on", () => {
 		setUseExtraUsage(true);
-		const snapshot = getRepresentativeUsageSnapshotForProvider(
+		expectExhaustedSnapshot(codexWithCredits, "codex");
+	});
+
+	it("a spent Anthropic window with spend room is exhausted, setting on", () => {
+		setUseExtraUsage(true);
+		expectExhaustedSnapshot(
 			spentWeekly({ spend: { enabled: true, percent: 10 } }),
 			"anthropic",
 		);
+	});
 
-		expect(snapshot?.extraUsageAvailable).toBe(true);
+	it("a spent Anthropic window with legacy extra_usage room is exhausted, setting on", () => {
+		setUseExtraUsage(true);
+		expectExhaustedSnapshot(
+			spentWeekly({
+				extra_usage: { is_enabled: true, utilization: 10, monthly_limit: 100 },
+			} as Partial<UsageData>),
+			"anthropic",
+		);
 	});
 });

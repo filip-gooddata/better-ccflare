@@ -10,7 +10,6 @@ import {
 import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, RequestMeta } from "@better-ccflare/types";
-import { markAllLimitedSelection } from "../limit-blocked";
 import { clearFamilyBlocks, getFamilyBlock } from "../model-capacity";
 import { proxyWithAccount } from "../proxy-operations";
 import type { HeldLimitRefusal, ProxyContext } from "../proxy-types";
@@ -223,11 +222,15 @@ describe("proxyWithAccount — family-scoped 429", () => {
 	});
 
 	it("blocks the family without benching the account and fails over", async () => {
-		globalThis.fetch = mock(async () => refusal());
+		// The readings land while the request is in flight: an account
+		// already full for the family is never sent to (the attempt gate).
+		globalThis.fetch = mock(async () => {
+			usageCache.set(account.id, readings as never);
+			return refusal();
+		});
 		const ctx = makeContext();
 		const account = makeAccount();
 		const readings = usage();
-		usageCache.set(account.id, readings as never);
 
 		const result = await run(ctx, account);
 
@@ -258,10 +261,14 @@ describe("proxyWithAccount — family-scoped 429", () => {
 	});
 
 	it("still benches the account for an account-wide refusal", async () => {
-		globalThis.fetch = mock(async () => refusal());
+		// The readings land while the request is in flight: an account
+		// already full for the family is never sent to (the attempt gate).
+		globalThis.fetch = mock(async () => {
+			usageCache.set(account.id, usage({ session: 100 }) as never);
+			return refusal();
+		});
 		const ctx = makeContext();
 		const account = makeAccount();
-		usageCache.set(account.id, usage({ session: 100 }) as never);
 
 		const result = await run(ctx, account);
 
@@ -296,10 +303,14 @@ describe("proxyWithAccount — family-scoped 429", () => {
 	});
 
 	it("logs one upstream_429 line with rate-limit headers only", async () => {
-		globalThis.fetch = mock(async () => refusal());
+		// The readings land while the request is in flight: an account
+		// already full for the family is never sent to (the attempt gate).
+		globalThis.fetch = mock(async () => {
+			usageCache.set(account.id, usage() as never);
+			return refusal();
+		});
 		const ctx = makeContext();
 		const account = makeAccount();
-		usageCache.set(account.id, usage() as never);
 
 		await run(ctx, account);
 
@@ -323,7 +334,12 @@ describe("proxyWithAccount — family-scoped 429", () => {
 	});
 
 	it("blocks the family when both account windows are fresh with no reset", async () => {
-		globalThis.fetch = mock(async () => refusal());
+		// The readings land while the request is in flight: an account
+		// already full for the family is never sent to (the attempt gate).
+		globalThis.fetch = mock(async () => {
+			usageCache.set(account.id, readings as never);
+			return refusal();
+		});
 		const ctx = makeContext();
 		const account = makeAccount();
 		const readings = usage();
@@ -331,7 +347,6 @@ describe("proxyWithAccount — family-scoped 429", () => {
 		readings.limits[1].resets_at = null as never;
 		readings.limits[0].percent = 0;
 		readings.limits[1].percent = 0;
-		usageCache.set(account.id, readings as never);
 
 		const result = await run(ctx, account);
 
@@ -365,16 +380,22 @@ describe("proxyWithAccount — family-scoped 429", () => {
 		const models = lines()
 			.filter((l) => l.includes(" upstream_429 "))
 			.map((l) => /model=(\S+)/.exec(l)?.[1]);
-		expect(models).toEqual(["claude-fable-5-2", "claude-opus-5-5"]);
+		// The first refusal reports the five-hour window rejected, which marks
+		// the account full at once; the fallback model is then not sent (it
+		// would be served from extra usage), so there is one 429 to log.
+		expect(models).toEqual(["claude-fable-5-2"]);
 	});
 
 	it("holds a family refusal for the all-limited replay without benching", async () => {
-		globalThis.fetch = mock(async () => refusal());
+		// The readings land while the request is in flight: an account
+		// already full for the family is never sent to (the attempt gate).
+		globalThis.fetch = mock(async () => {
+			usageCache.set(account.id, usage() as never);
+			return refusal();
+		});
 		const ctx = makeContext(true);
 		const account = makeAccount();
-		usageCache.set(account.id, usage() as never);
 		const meta = makeRequestMeta();
-		markAllLimitedSelection(meta, account.id);
 		const held: HeldLimitRefusal[] = [];
 
 		const result = await run(ctx, account, meta, (r) => held.push(r));

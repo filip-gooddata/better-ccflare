@@ -1,7 +1,6 @@
 import {
 	getModelFamily,
 	isUsageExhausted,
-	isUseExtraUsageEnabled,
 	mapModelName,
 	splitModelRouting,
 } from "@better-ccflare/core";
@@ -10,7 +9,6 @@ import {
 	extractModelFamilyWindows,
 	extractWeeklyWindow,
 	getRepresentativeUsageSnapshotForProvider,
-	hasExtraUsageCapacity,
 	usageCache,
 } from "@better-ccflare/providers";
 import type {
@@ -27,6 +25,12 @@ import {
 	isProviderExcludedBy as isProviderExcluded,
 	requestExcludedProviders,
 } from "./account-selector";
+import { holdsOverageBench } from "./header-mark-out";
+import {
+	buildLocalCooldownResponse,
+	localLimitInputForAccount,
+	localLimitResponseForAccount,
+} from "./limit-response";
 import {
 	getFamilyBlock,
 	getFamilyExhaustionOrigin,
@@ -45,19 +49,21 @@ import type { ProxyContext } from "./proxy-types";
  * Each limit mirrors the filter that removes the account today:
  * - `cooldown`: a future `rate_limited_until` (the strategies' isAccountAvailable).
  * - `five_hour` / `weekly`: the usage-cap prefilter in getOrderedAccounts,
- *   checked on BOTH windows rather than only the representative one, with the
- *   same extra-usage exception (the "use extra usage" switch AND provider
- *   capacity). A provider without those two windows falls back to the
- *   representative snapshot the prefilter uses, reported as `weekly`.
+ *   checked on BOTH windows rather than only the representative one. A full
+ *   window is always recorded: extra usage, spend and the (ignored) "use extra
+ *   usage" setting never make it usable. A provider without those two windows
+ *   falls back to the representative snapshot the prefilter uses, reported as
+ *   `weekly`.
  * - `family`: the model-family filter in selectAccountsForRequest. A standing
  *   family block counts in every mode, with the block's own end as its reset.
- *   Telemetry and the reactive 429 mark count only when capacity routing is
- *   on, with the same extra-usage exception as above
- *   (isAccountExhaustedForModel). A telemetry reset is the LATEST exhausted
- *   family row, since the account serves the family again only once every
- *   row has reset. A reactive 429 mark carries only a TTL guess, not a reset,
- *   so it counts as unknown (null) unless exhausted telemetry rows give the
- *   real one.
+ *   Full family telemetry counts in every mode too
+ *   (isAccountExhaustedForModel; extra usage plays no part there either);
+ *   only the reactive 429 mark needs capacity routing on. A telemetry reset
+ *   is the LATEST exhausted family row, since the account serves the family
+ *   again only once every row has reset, and unknown (null) when a full row
+ *   carries no usable reset. A reactive 429 mark carries only a TTL guess,
+ *   not a reset, so it counts as unknown (null) unless exhausted telemetry
+ *   rows give the real one.
  */
 export function collectLimitBlockedAccounts(
 	accounts: Account[],
@@ -105,15 +111,13 @@ function limitsInForce(
 	const provider = account.provider ?? "anthropic";
 	const usage = usageCache.get(account.id);
 	if (usage) {
-		const extraUsage =
-			isUseExtraUsageEnabled() && hasExtraUsageCapacity(usage, provider);
 		const windowLimit = (
 			kind: "five_hour" | "weekly",
 			window: StrategyUsageWindow | null,
 		): void => {
 			if (
 				window &&
-				isUsageExhausted(window.utilization, window.resetsAt, now, extraUsage)
+				isUsageExhausted(window.utilization, window.resetsAt, now)
 			) {
 				limits.push({ kind, resetAt: window.resetsAt });
 			}
@@ -128,19 +132,14 @@ function limitsInForce(
 			);
 			if (
 				snapshot &&
-				isUsageExhausted(
-					snapshot.utilization,
-					snapshot.resetMs,
-					now,
-					snapshot.extraUsageAvailable,
-				)
+				isUsageExhausted(snapshot.utilization, snapshot.resetMs, now)
 			) {
 				limits.push({ kind: "weekly", resetAt: snapshot.resetMs ?? null });
 			}
 		}
 	}
 
-	if (model && family) {
+	if (model) {
 		const familyLimit = familyLimitInForce(
 			account,
 			model,
@@ -156,22 +155,43 @@ function limitsInForce(
 function familyLimitInForce(
 	account: Account,
 	model: string,
-	family: string,
+	family: string | null,
 	capacityRoutingEnabled: boolean,
 	now: number,
+	mapToUpstream = true,
 ): AccountLimit | null {
 	// Blocks are recorded for the family upstream refused: the family of the
 	// model this account actually sends (mapModelName honors "force account
-	// model", which turns mapping off).
-	const upstreamFamily =
-		getModelFamily(splitModelRouting(mapModelName(model, account)).model) ??
-		family;
+	// model", which turns mapping off). A model already sent verbatim
+	// (mapToUpstream false) is that model.
+	const upstreamModel = splitModelRouting(
+		mapToUpstream ? mapModelName(model, account) : model,
+	).model;
+	const upstreamFamily = getModelFamily(upstreamModel) ?? family;
+	// A client alias with no family of its own still counts when the account
+	// maps it to a family.
+	if (!upstreamFamily) return null;
 	const block = getFamilyBlock(account.id, upstreamFamily, now);
 	if (block)
 		return { kind: "family", family: upstreamFamily, resetAt: block.until };
-	if (!capacityRoutingEnabled) return null;
 
+	// Telemetry is read for the family the account actually sends (the
+	// mapping's primary model), the same family the block above uses.
 	const usage = usageCache.get(account.id);
+	const telemetry = isAccountExhaustedForModel(
+		usage,
+		getModelFamily(upstreamModel) ? upstreamModel : model,
+		now,
+	);
+	if (telemetry.exhausted) {
+		return {
+			kind: "family",
+			family: upstreamFamily,
+			resetAt: telemetry.resetAt,
+		};
+	}
+	if (!capacityRoutingEnabled || !family) return null;
+
 	const exhaustedRows = usage
 		? extractModelFamilyWindows(
 				usage,
@@ -187,14 +207,6 @@ function familyLimitInForce(
 			? Math.max(...exhaustedRows.map((row) => row.resetsAt as number))
 			: null;
 
-	const telemetry = isAccountExhaustedForModel(usage, model, now);
-	if (telemetry.exhausted) {
-		return {
-			kind: "family",
-			family,
-			resetAt: latestRowReset ?? telemetry.resetAt,
-		};
-	}
 	if (getFamilyExhaustionOrigin(account.id, family, now)) {
 		return { kind: "family", family, resetAt: latestRowReset };
 	}
@@ -202,12 +214,12 @@ function familyLimitInForce(
 }
 
 /**
- * Whether the all-limited rule may route this request: the strategy has
- * `selectWhenAllLimited` and the request does not own its routing. A request
- * naming an account (`x-better-ccflare-account-id`, which auto-refresh and
- * keepalive probes send too) or bypassing session routing must reach only the
- * account it asked for, so neither selection nor failover path C may send it
- * anywhere else, and its refusals are not held.
+ * Whether failover path C may hold this request's limit refusals and answer
+ * with one: the strategy has `selectWhenAllLimited` and the request does not
+ * own its routing. A request naming an account (`x-better-ccflare-account-id`,
+ * which auto-refresh and keepalive probes send too) or bypassing session
+ * routing gets the answer of the account it reached, so its refusals are not
+ * held.
  */
 export function isAllLimitedRuleEligible(
 	ctx: ProxyContext,
@@ -221,14 +233,92 @@ export function isAllLimitedRuleEligible(
 }
 
 /**
- * The account to forward a request to when every account that could serve it
- * is out only on limits, or null when the request is not eligible for the rule
- * ({@link isAllLimitedRuleEligible}), nothing is limit-blocked, or the
- * strategy declines.
+ * Whether an empty selection may be answered with the local limit 429 of the
+ * account the all-limited rule ranks first. Nothing is forwarded on that path,
+ * so a bypass-session request is answered too. A request naming an account is
+ * not: its answer describes the account it named ({@link fullLimitAnswer}).
+ */
+function isLocalLimitAnswerEligible(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+): boolean {
+	return (
+		ctx.strategy.selectWhenAllLimited !== undefined &&
+		!meta.headers?.get("x-better-ccflare-account-id")
+	);
+}
+
+/**
+ * Whose limit a local 429 describes. `family` is set when the account is out
+ * on the request's model family; `cooldownResetMs` when it is out on nothing
+ * but a cooldown, whose end is then the reset the answer carries.
+ */
+export interface LocalLimitAnswer {
+	account: Account;
+	family: string | null;
+	familyResetMs: number | null;
+	cooldownResetMs: number | null;
+}
+
+function localLimitAnswerFor(entry: LimitBlockedAccount): LocalLimitAnswer {
+	const family = entry.limits.find((limit) => limit.kind === "family");
+	const onlyCooldown =
+		entry.limits.length > 0 &&
+		entry.limits.every((limit) => limit.kind === "cooldown");
+	const cooldownResets = entry.limits
+		.map((limit) => limit.resetAt)
+		.filter((reset): reset is number => reset !== null);
+	return {
+		account: entry.account,
+		family: family?.family ?? null,
+		familyResetMs: family?.resetAt ?? null,
+		cooldownResetMs:
+			onlyCooldown && cooldownResets.length > 0
+				? Math.max(...cooldownResets)
+				: null,
+	};
+}
+
+/**
+ * When every account that could serve the request is out only on limits, the
+ * account whose limit the local 429 describes: the one the strategy's
+ * `selectWhenAllLimited` ranks first (for session-pace, the account usable
+ * again first). Null when the request is not eligible, nothing is
+ * limit-blocked, or the strategy declines. Nothing is forwarded to it.
  *
  * `accounts` is the raw account list when the caller already holds it; it is
  * read from the database otherwise.
  */
+export async function selectAllLimitedAnswer(
+	ctx: ProxyContext,
+	meta: RequestMeta,
+	model: string | undefined,
+	now: number = Date.now(),
+	accounts?: Account[],
+): Promise<LocalLimitAnswer | null> {
+	if (
+		!ctx.strategy.selectWhenAllLimited ||
+		!isLocalLimitAnswerEligible(ctx, meta)
+	) {
+		return null;
+	}
+	const all = accounts ?? (await ctx.dbOps.getAllAccounts());
+	const blocked = collectLimitBlockedAccounts(all, ctx, meta, model, now);
+	if (blocked.length === 0) return null;
+	const target = ctx.strategy.selectWhenAllLimited(blocked, meta);
+	if (!target) return null;
+	const entry = blocked.find((b) => b.account.id === target.id);
+	return entry
+		? localLimitAnswerFor(entry)
+		: {
+				account: target,
+				family: null,
+				familyResetMs: null,
+				cooldownResetMs: null,
+			};
+}
+
+/** The account of {@link selectAllLimitedAnswer}, or null. */
 export async function selectAllLimitedTarget(
 	ctx: ProxyContext,
 	meta: RequestMeta,
@@ -236,29 +326,106 @@ export async function selectAllLimitedTarget(
 	now: number = Date.now(),
 	accounts?: Account[],
 ): Promise<Account | null> {
-	if (
-		!ctx.strategy.selectWhenAllLimited ||
-		!isAllLimitedRuleEligible(ctx, meta)
-	) {
-		return null;
+	return (
+		(await selectAllLimitedAnswer(ctx, meta, model, now, accounts))?.account ??
+		null
+	);
+}
+
+/**
+ * The local 429 answer for `account` when it is at a full limit for this
+ * request: its five-hour or weekly window, the request model's family, or an
+ * `overage_in_use` bench still ahead of its reset (the account was served
+ * from extra usage, so its limits are spent). Any other cooldown alone does
+ * not count. Null when no full limit is in force. With `upstreamModel`, `model`
+ * is the model sent upstream verbatim: its own family counts, not the family
+ * this account's mappings would turn it into.
+ */
+export function fullLimitAnswer(
+	account: Account,
+	ctx: ProxyContext,
+	model: string | undefined,
+	now: number = Date.now(),
+	options: { upstreamModel?: boolean } = {},
+): LocalLimitAnswer | null {
+	const family = model ? getModelFamily(model) : null;
+	const overageBench = holdsOverageBench(account, now);
+	const capacityRoutingEnabled = isCapacityRoutingEnabled(ctx);
+	const limits = limitsInForce(
+		account,
+		options.upstreamModel ? undefined : model,
+		family,
+		capacityRoutingEnabled,
+		now,
+	);
+	if (options.upstreamModel && model) {
+		const familyLimit = familyLimitInForce(
+			account,
+			model,
+			family,
+			capacityRoutingEnabled,
+			now,
+			false,
+		);
+		if (familyLimit) limits.push(familyLimit);
 	}
-	const all = accounts ?? (await ctx.dbOps.getAllAccounts());
-	const blocked = collectLimitBlockedAccounts(all, ctx, meta, model, now);
-	if (blocked.length === 0) return null;
-	return ctx.strategy.selectWhenAllLimited(blocked, meta);
+	const full = limits.filter(
+		(limit) => overageBench || limit.kind !== "cooldown",
+	);
+	if (full.length === 0) return null;
+	return localLimitAnswerFor({ account, limits: full });
 }
 
-const allLimitedSelections = new WeakMap<RequestMeta, string>();
+const localLimitAnswers = new WeakMap<RequestMeta, LocalLimitAnswer>();
 
-/** Record that this request's selection came from the all-limited rule. */
-export function markAllLimitedSelection(
+/**
+ * Record that an empty selection for this request is answered with the local
+ * 429 for `answer.account`. proxy.ts reads it before its other no-account
+ * answers; a selection that is not empty ignores it.
+ */
+export function markLocalLimitAnswer(
 	meta: RequestMeta,
-	accountId: string,
+	answer: LocalLimitAnswer,
 ): void {
-	allLimitedSelections.set(meta, accountId);
+	localLimitAnswers.set(meta, answer);
 }
 
-/** Whether this request's selection came from the all-limited rule. */
-export function isAllLimitedSelection(meta: RequestMeta): boolean {
-	return allLimitedSelections.has(meta);
+/** The answer recorded by {@link markLocalLimitAnswer}, if any. */
+export function getLocalLimitAnswer(
+	meta: RequestMeta,
+): LocalLimitAnswer | undefined {
+	return localLimitAnswers.get(meta);
+}
+
+/**
+ * The local 429 for `answer`: the account's cached real 429 replayed with
+ * retry-after and date rebased while its reset is ahead and its claim names
+ * the binding limit, else one built from its usage readings. An account out
+ * only on a cooldown has no full limit to claim: it gets the cooldown 429
+ * (no unified status, claim or reset; `retry-after` counted to the cooldown
+ * end; window headers from its readings), never a replayed refusal.
+ */
+export function localLimitAnswerResponse(
+	answer: LocalLimitAnswer,
+	requestId: string,
+	now: number = Date.now(),
+): Response {
+	if (answer.cooldownResetMs !== null) {
+		const response = buildLocalCooldownResponse(
+			localLimitInputForAccount(answer.account.id, {
+				now,
+				provider: answer.account.provider ?? "anthropic",
+			}),
+			answer.cooldownResetMs,
+			now,
+		);
+		response.headers.set("x-better-ccflare-request-id", requestId);
+		return response;
+	}
+	return localLimitResponseForAccount(answer.account, {
+		requestId,
+		family: answer.family,
+		familyResetMs: answer.familyResetMs,
+		now,
+	});
 }

@@ -395,25 +395,30 @@ describe("selectAccountsForRequest — model-scoped capacity filter (combo routi
 // ── force-header bypass ──────────────────────────────────────────────────────────
 
 describe("selectAccountsForRequest — model-scoped capacity filter (force-header bypass)", () => {
-	it("returns the forced account even when it is exhausted for the request's family", async () => {
+	it("does not return the forced account when it is exhausted for the request's family; normal selection serves another account", async () => {
 		const acc = makeAccount({ id: "acc-forced" });
+		const other = makeAccount({ id: "acc-other" });
 		usageCache.set(acc.id, exhaustedUsage("Fable", Date.now()));
-		const ctx = makeCtx({ accounts: [acc], capacityRoutingMode: "exhausted" });
+		const ctx = makeCtx({
+			accounts: [acc, other],
+			capacityRoutingMode: "exhausted",
+		});
 		const meta = makeRequestMeta({
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-forced" }),
 		});
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-forced");
+		expect(result.map((a) => a.id)).toEqual(["acc-other"]);
 	});
 });
 
 // ── switch off ─────────────────────────────────────────────────────────────────
 
 describe("selectAccountsForRequest — model-scoped capacity filter (switch off)", () => {
-	it("does not filter when capacity routing is off (default)", async () => {
+	// A full family limit has no capacity in any mode: telemetry excludes
+	// with the switch off too; only the reactive mark needs it on.
+	it("still excludes a full family by telemetry when capacity routing is off (default)", async () => {
 		const acc = makeAccount({ id: "acc-exhausted" });
 		usageCache.set(acc.id, exhaustedUsage("Fable", Date.now()));
 		const ctx = makeCtx({ accounts: [acc], capacityRoutingMode: "off" });
@@ -421,11 +426,13 @@ describe("selectAccountsForRequest — model-scoped capacity filter (switch off)
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result.map((a) => a.id)).toEqual(["acc-exhausted"]);
-		expect(getModelFamilyExhaustionInfo(meta)).toBeNull();
+		expect(result).toEqual([]);
+		expect(getModelFamilyExhaustionInfo(meta)?.origin).toBe(
+			"telemetry_confirmed",
+		);
 	});
 
-	it("does not filter when ctx.config is absent (defensive default)", async () => {
+	it("still excludes a full family by telemetry when ctx.config is absent", async () => {
 		const acc = makeAccount({ id: "acc-exhausted" });
 		usageCache.set(acc.id, exhaustedUsage("Fable", Date.now()));
 		const ctx = {
@@ -441,7 +448,7 @@ describe("selectAccountsForRequest — model-scoped capacity filter (switch off)
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result.map((a) => a.id)).toEqual(["acc-exhausted"]);
+		expect(result).toEqual([]);
 	});
 
 	// v3 S8: capacity routing off must leave a pre-populated negative cache
@@ -575,7 +582,7 @@ describe("selectAccountsForRequest — extra usage (integration)", () => {
 		} as never;
 	}
 
-	it("keeps an account routable when the extra-usage switch is on and overage is available (extra_usage.is_enabled=true)", async () => {
+	it("excludes a full family even with the setting on and overage available (extra_usage.is_enabled=true)", async () => {
 		setUseExtraUsage(true);
 		const acc = makeAccount({ id: "acc-overage-available" });
 		usageCache.set(
@@ -587,7 +594,7 @@ describe("selectAccountsForRequest — extra usage (integration)", () => {
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result.map((a) => a.id)).toEqual(["acc-overage-available"]);
+		expect(result).toHaveLength(0);
 	});
 
 	it("excludes an account whose overage is reported enabled while the extra-usage switch is off", async () => {

@@ -2500,16 +2500,28 @@ export async function setUsagePauseThresholds(
 	};
 }
 
+/** Limit holds a manual reset left in place, as the CLI reports them. */
+export interface CliKeptLimitHolds {
+	overageBench: { until: number; untilIso: string } | null;
+	familyBlocks: Array<{
+		family: string;
+		until: number;
+		untilIso: string;
+		source: string;
+	}>;
+}
+
 /**
  * Force reset account rate-limit state by account name.
- * Clears persisted lock fields and then best-effort notifies running local servers
- * to trigger immediate usage polling.
+ * Clears persisted lock fields except an active overage_in_use bench, then
+ * best-effort notifies running local servers, which redo the reset, keep
+ * their in-memory family blocks, and trigger immediate usage polling.
  */
 export async function forceResetRateLimit(
 	dbOps: DatabaseOperations,
 	name: string,
 	config: Config,
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; kept?: CliKeptLimitHolds }> {
 	const adapter = dbOps.getAdapter();
 	const account = await adapter.get<{ id: string; name: string }>(
 		"SELECT id, name FROM accounts WHERE name = ?",
@@ -2523,7 +2535,8 @@ export async function forceResetRateLimit(
 		};
 	}
 
-	const updated = dbOps.forceResetAccountRateLimit(account.id);
+	// Keeps an active overage_in_use bench (see clearRateLimitState).
+	const updated = await dbOps.forceResetAccountRateLimit(account.id);
 	if (!updated) {
 		return {
 			success: false,
@@ -2531,28 +2544,67 @@ export async function forceResetRateLimit(
 		};
 	}
 
-	const usagePollTriggered = await notifyServersToForceResetRateLimit(
-		account.id,
-		config,
-	);
+	const notified = await notifyServersToForceResetRateLimit(account.id, config);
 
-	return {
-		success: true,
-		message: usagePollTriggered
+	// Read after the servers answered: a recovery reading may have released the bench.
+	const benchUntil = await dbOps.getActiveOverageBenchUntil(account.id);
+	const kept: CliKeptLimitHolds = {
+		overageBench:
+			benchUntil === null
+				? null
+				: { until: benchUntil, untilIso: new Date(benchUntil).toISOString() },
+		familyBlocks: notified.familyBlocks,
+	};
+
+	const lines = [
+		notified.usagePollTriggered
 			? `Rate limit state for account '${account.name}' was reset and immediate usage polling was triggered.`
 			: `Rate limit state for account '${account.name}' was reset. No running local server accepted the usage poll trigger.`,
-	};
+	];
+	if (kept.overageBench) {
+		lines.push(
+			`Kept the overage_in_use bench until ${kept.overageBench.untilIso}: it lifts then, or earlier when a newer usage poll shows five-hour and weekly below 100%.`,
+		);
+	}
+	if (kept.familyBlocks.length > 0) {
+		lines.push(
+			`Kept family blocks on the running server: ${kept.familyBlocks
+				.map((block) => `${block.family} until ${block.untilIso}`)
+				.join(", ")}. They lift at their reset.`,
+		);
+	}
+	if (notified.answered && notified.uncheckedPorts.length > 0) {
+		lines.push(
+			`Family blocks were checked on the server at port ${notified.answeredPorts.join(", ")}; port ${notified.uncheckedPorts.join(", ")} was not checked.`,
+		);
+	}
+	if (!notified.answered) {
+		lines.push(
+			"No running local server answered, so family blocks held in a server's memory were not checked or cleared.",
+		);
+	}
+
+	return { success: true, message: lines.join(" "), kept };
 }
 
 async function notifyServersToForceResetRateLimit(
 	accountId: string,
 	config: Config,
-): Promise<boolean> {
+): Promise<{
+	usagePollTriggered: boolean;
+	answered: boolean;
+	answeredPorts: number[];
+	uncheckedPorts: number[];
+	familyBlocks: CliKeptLimitHolds["familyBlocks"];
+}> {
 	const configuredPort = config.getRuntime().port || 8080;
 	const defaultPort = 8080;
 	const testPort = 8081;
 	const ports = [...new Set([configuredPort, defaultPort, testPort])];
 	let usagePollTriggered = false;
+	const answeredPorts: number[] = [];
+	let uncheckedPorts: number[] = [];
+	const familyBlocks = new Map<string, CliKeptLimitHolds["familyBlocks"][0]>();
 
 	// The local-control-secret (issue #216) lets this notification through
 	// AuthService's HTTP gate even when API-key auth is enabled — the CLI
@@ -2560,7 +2612,7 @@ async function notifyServersToForceResetRateLimit(
 	// this never involves handling a real API key.
 	const localControlSecret = config.getLocalControlSecret();
 
-	for (const port of ports) {
+	for (const [index, port] of ports.entries()) {
 		try {
 			const response = await fetch(
 				`http://localhost:${port}/api/accounts/${accountId}/force-reset-rate-limit`,
@@ -2574,11 +2626,20 @@ async function notifyServersToForceResetRateLimit(
 			);
 
 			if (response.ok) {
+				answeredPorts.push(port);
 				const data = (await response.json()) as {
 					usagePollTriggered?: boolean;
+					kept?: { familyBlocks?: CliKeptLimitHolds["familyBlocks"] };
 				};
+				for (const block of data.kept?.familyBlocks ?? []) {
+					const seen = familyBlocks.get(block.family);
+					if (!seen || seen.until < block.until) {
+						familyBlocks.set(block.family, block);
+					}
+				}
 				if (data.usagePollTriggered) {
 					usagePollTriggered = true;
+					uncheckedPorts = ports.slice(index + 1);
 					break;
 				}
 			}
@@ -2587,7 +2648,15 @@ async function notifyServersToForceResetRateLimit(
 		}
 	}
 
-	return usagePollTriggered;
+	return {
+		usagePollTriggered,
+		answered: answeredPorts.length > 0,
+		answeredPorts,
+		uncheckedPorts,
+		familyBlocks: [...familyBlocks.values()].sort((a, b) =>
+			a.family.localeCompare(b.family),
+		),
+	};
 }
 
 /**

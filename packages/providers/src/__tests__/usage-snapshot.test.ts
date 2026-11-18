@@ -116,3 +116,90 @@ describe("getRepresentativeUsageSnapshotForProvider", () => {
 		).toBe(true);
 	});
 });
+
+// A stale full window must not hide a hard window that is still full: the
+// gates read this snapshot, and a full five-hour or weekly window is final.
+describe("getRepresentativeUsageSnapshotForProvider: a hard window still full", () => {
+	const NOW = Date.UTC(2026, 10, 18, 12, 0, 0);
+	const iso = (ms: number) => new Date(ms).toISOString();
+	const expired = NOW - 60 * 60 * 1000;
+	const weekly = NOW + 3 * 24 * 60 * 60 * 1000;
+	const later = NOW + 5 * 24 * 60 * 60 * 1000;
+
+	for (const provider of ["anthropic", "codex"]) {
+		it(`${provider}: an expired full five-hour window does not hide a full weekly window`, () => {
+			const data = {
+				five_hour: { utilization: 100, resets_at: iso(expired) },
+				seven_day: { utilization: 100, resets_at: iso(weekly) },
+			} as unknown as UsageData;
+			const snapshot = getRepresentativeUsageSnapshotForProvider(
+				data,
+				provider,
+				NOW,
+			);
+			expect(snapshot).toEqual({ utilization: 100, resetMs: weekly });
+			expect(
+				isUsageExhausted(snapshot?.utilization ?? 0, snapshot?.resetMs, NOW),
+			).toBe(true);
+		});
+	}
+
+	it("reads limits[]-only payloads the same way", () => {
+		const data = {
+			limits: [
+				{ kind: "session", percent: 100, resets_at: iso(expired) },
+				{ kind: "weekly_all", percent: 100, resets_at: iso(weekly) },
+			],
+		} as unknown as UsageData;
+		expect(
+			getRepresentativeUsageSnapshotForProvider(data, "anthropic", NOW),
+		).toEqual({ utilization: 100, resetMs: weekly });
+	});
+
+	it("reports the full window with the latest reset when several are full", () => {
+		const data = {
+			five_hour: { utilization: 130, resets_at: iso(weekly) },
+			seven_day: { utilization: 100, resets_at: iso(later) },
+		} as unknown as UsageData;
+		expect(
+			getRepresentativeUsageSnapshotForProvider(data, "anthropic", NOW),
+		).toEqual({ utilization: 100, resetMs: later });
+	});
+
+	it("reports an unknown reset when a full window has none", () => {
+		const data = {
+			five_hour: { utilization: 100, resets_at: null },
+			seven_day: { utilization: 100, resets_at: iso(later) },
+		} as unknown as UsageData;
+		const snapshot = getRepresentativeUsageSnapshotForProvider(
+			data,
+			"anthropic",
+			NOW,
+		);
+		expect(snapshot).toEqual({ utilization: 100, resetMs: null });
+		expect(isUsageExhausted(100, snapshot?.resetMs, NOW)).toBe(true);
+	});
+
+	it("keeps the usual pick when no hard window is still full", () => {
+		const data = {
+			five_hour: { utilization: 100, resets_at: iso(expired) },
+			seven_day: { utilization: 40, resets_at: iso(weekly) },
+		} as unknown as UsageData;
+		expect(
+			getRepresentativeUsageSnapshotForProvider(data, "anthropic", NOW),
+		).toEqual({ utilization: 100, resetMs: expired });
+	});
+
+	it("does not treat a spent extra_usage pool as a hard window", () => {
+		const data = {
+			seven_day: { utilization: 40, resets_at: iso(weekly) },
+			extra_usage: { is_enabled: true, utilization: 100 },
+		} as unknown as UsageData;
+		const snapshot = getRepresentativeUsageSnapshotForProvider(
+			data,
+			"anthropic",
+			NOW,
+		);
+		expect(snapshot).toEqual({ utilization: 40, resetMs: weekly });
+	});
+});

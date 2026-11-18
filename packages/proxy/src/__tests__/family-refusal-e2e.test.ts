@@ -18,6 +18,7 @@ import { Logger } from "@better-ccflare/logger";
 import { usageCache } from "@better-ccflare/providers";
 import type { Account, LoadBalancingStrategy } from "@better-ccflare/types";
 import type { ProxyContext } from "../handlers";
+import { clearLimitRefusalCache } from "../handlers/limit-response";
 import {
 	blockFamily,
 	clearFamilyBlocks,
@@ -126,6 +127,25 @@ function usage(reading: Reading) {
 		];
 	}
 	return data as never;
+}
+
+/**
+ * Usage readings that land with the upstream call: the fetch stand-in writes
+ * them to the usage cache before answering, the way a poll lags a refusal.
+ */
+const freshOnCall = new Map<string, unknown>();
+
+/**
+ * Telemetry that lags the upstream, as in the measured incident: selection
+ * reads the family at 99 % (a full family is never forwarded to), and the
+ * full reading arrives with the first upstream call to that account.
+ */
+function setLaggingUsage(account: string, reading: Reading): void {
+	const lagging: Reading = reading.fable
+		? { ...reading, fable: [Math.min(reading.fable[0], 99), reading.fable[1]] }
+		: reading;
+	usageCache.set(account, usage(lagging));
+	freshOnCall.set(account, usage(reading));
 }
 
 /** `gooddata` as measured at 11:54 CET. */
@@ -244,6 +264,11 @@ function installUpstream(handler: (call: Call) => Response) {
 		}
 		const call = { account, model };
 		calls.push(call);
+		const fresh = freshOnCall.get(account);
+		if (fresh !== undefined) {
+			usageCache.set(account, fresh as never);
+			freshOnCall.delete(account);
+		}
 		return handler(call);
 	}) as unknown as typeof fetch;
 	return calls;
@@ -376,21 +401,54 @@ async function send(ctx: ProxyContext, request: Request) {
 	}
 }
 
-/** Status, every upstream header and the body bytes reach the client unchanged. */
-async function expectUpstreamRefusal(
+const retryAfterFor = (resetAt: number) =>
+	String(Math.max(1, Math.floor(resetAt / 1000 - Date.now() / 1000)));
+
+/** A remembered real refusal answered locally: body as received, retry-after and date rebased. */
+async function expectReplayedRefusal(
 	received: Response | Error,
 	expected: Refusal,
 ) {
 	expect(received).toBeInstanceOf(Response);
 	const response = received as Response;
-	expect(response.status).toBe(expected.status);
+	expect(response.status).toBe(429);
 	for (const [name, value] of Object.entries(expected.headers)) {
-		if (HOP_BY_HOP.has(name)) continue;
+		if (HOP_BY_HOP.has(name) || name === "retry-after") continue;
 		expect([name, response.headers.get(name)]).toEqual([name, value]);
 	}
-	const text = await response.text();
-	expect(text).toBe(expected.body);
-	expect(text).not.toContain("model_family_exhausted");
+	const resetAt =
+		Number(expected.headers["anthropic-ratelimit-unified-reset"]) * 1000;
+	expect(response.headers.get("retry-after")).toBe(retryAfterFor(resetAt));
+	expect(response.headers.get("date")).toBe(new Date(Date.now()).toUTCString());
+	expect(await response.text()).toBe(expected.body);
+}
+
+/** The local 429 built from readings for an account whose limit ends at resetAt. */
+async function expectBuiltLimit429(
+	received: Response | Error,
+	resetAt: number,
+) {
+	expect(received).toBeInstanceOf(Response);
+	const response = received as Response;
+	expect(response.status).toBe(429);
+	expect(response.headers.get("x-should-retry")).toBe("true");
+	expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+		"rejected",
+	);
+	expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+		String(Math.floor(resetAt / 1000)),
+	);
+	expect(response.headers.get("retry-after")).toBe(retryAfterFor(resetAt));
+	expect(response.headers.get("x-upstream-account")).toBeNull();
+	const body = (await response.json()) as { error: { type: string } };
+	expect(body.error.type).toBe("rate_limit_error");
+}
+
+/** Upstream requests per account seen by the fake fetch. */
+function perAccount(calls: Array<{ account: string }>) {
+	const counts: Record<string, number> = {};
+	for (const { account } of calls) counts[account] = (counts[account] ?? 0) + 1;
+	return counts;
 }
 
 const logged = (pattern: string | RegExp) =>
@@ -400,6 +458,9 @@ const logged = (pattern: string | RegExp) =>
 
 beforeEach(() => {
 	logs = [];
+	// The cache of real limit refusals is process-wide; an earlier scenario's
+	// refusal must not answer a later one.
+	clearLimitRefusalCache();
 	setSystemTime(new Date(NOW));
 	setUseExtraUsage(false);
 	clearVisionCapability();
@@ -422,6 +483,7 @@ afterEach(() => {
 	setForceAccountModel(false);
 	globalThis.fetch = originalFetch;
 	usageCache.clear();
+	freshOnCall.clear();
 	clearFamilyExhaustionCache();
 	clearFamilyBlocks();
 	clearVisionCapability();
@@ -430,8 +492,8 @@ afterEach(() => {
 });
 
 describe("scenario 1: the measured incident replayed", () => {
-	it("blocks Fable on gooddata only, replays the upstream 429, keeps Opus on gooddata, sends Fable elsewhere", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+	it("blocks Fable on gooddata only, answers the local 429 of gooddata-ai, keeps Opus on gooddata, sends Fable elsewhere", async () => {
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, FIVE_HOUR_RESET_AI, "five_hour");
@@ -464,9 +526,9 @@ describe("scenario 1: the measured incident replayed", () => {
 		).toHaveLength(1);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		// gooddata-ai is usable again at 11:00Z, before the Fable reset, so the
-		// rule forwards once to it and the client gets that upstream 429 as is.
-		expect(calls.map((c) => c.account)).toEqual([GD, AI]);
-		await expectUpstreamRefusal(first, aiRefusal);
+		// rule names it; nothing more goes upstream and the 429 is built locally.
+		expect(perAccount(calls)).toEqual({ [GD]: 1 });
+		await expectBuiltLimit429(first, FIVE_HOUR_RESET_AI);
 		expect(row(GD).rate_limited_until).toBeNull();
 
 		// Opus on gooddata is untouched by the Fable block.
@@ -502,7 +564,7 @@ describe("scenario 1: the measured incident replayed", () => {
 
 describe("scenario 1b: a family 429 after the account's model list", () => {
 	it("blocks Fable without a bench when every model in the list is Fable", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, FIVE_HOUR_RESET_AI, "five_hour");
@@ -525,16 +587,21 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		);
 
 		const first = await send(ctx, makeRequest(FABLE));
+		// The first Fable refusal blocks the family on gooddata; the second
+		// Fable model in the list is then not sent (the attempt gate), since
+		// upstream would serve it from extra usage.
 		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
 			FABLE,
-			"claude-fable-5-2",
 		]);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
 		expect(
 			logged(`account=${GD} family_block family=fable`).length,
 		).toBeGreaterThan(0);
-		await expectUpstreamRefusal(first, aiRefusal);
+		// gooddata-ai is usable first; it is not asked (failover path C never
+		// re-asks), and its limit answers locally.
+		expect(calls.filter((c) => c.account === AI)).toEqual([]);
+		await expectBuiltLimit429(first, FIVE_HOUR_RESET_AI);
 
 		const opus = (await send(ctx, makeRequest(OPUS))) as Response;
 		expect(opus.status).toBe(200);
@@ -542,7 +609,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 	});
 
 	it("blocks Fable without a bench when an Opus request is mapped to two Fable models", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const calls = installUpstream(({ account, model }) => {
@@ -563,9 +630,11 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		);
 
 		await send(ctx, makeRequest(OPUS));
+		// The first Fable refusal blocks the family on gooddata; the second
+		// Fable model in the list is then not sent (the attempt gate), since
+		// upstream would serve it from extra usage.
 		expect(calls.filter((c) => c.account === GD).map((c) => c.model)).toEqual([
 			FABLE,
-			"claude-fable-5-2",
 		]);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
@@ -574,7 +643,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 		// The next mapped Opus request must not reach gooddata while the Fable
 		// block it would run into stands.
 		await send(ctx, makeRequest(OPUS));
-		expect(calls.filter((c) => c.account === GD)).toHaveLength(2);
+		expect(calls.filter((c) => c.account === GD)).toHaveLength(1);
 		expect(
 			logged(`family_blocked: excluding ${GD} for fable`).length,
 		).toBeGreaterThan(0);
@@ -609,7 +678,7 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 	});
 
 	it("still benches the account when the model list spans families", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		setLaggingUsage(GD, measuredGooddata());
 		usageCache.set(AI, usage(measuredGooddataAi()));
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		installUpstream(({ account, model }) => {
@@ -637,7 +706,12 @@ describe("scenario 1b: a family 429 after the account's model list", () => {
 
 describe("scenario 2: sticky sessions after a family 429", () => {
 	it("moves the Fable session to gooddata-ai and rebinds it; the Opus session stays on gooddata", async () => {
-		usageCache.set(GD, usage(measuredGooddata()));
+		// Fable reads 99 % while the sessions are placed; the full reading
+		// lands with the refused call.
+		usageCache.set(
+			GD,
+			usage({ ...measuredGooddata(), fable: [99, FABLE_RESET_GD] }),
+		);
 		usageCache.set(
 			AI,
 			usage({
@@ -671,6 +745,7 @@ describe("scenario 2: sticky sessions after a family 429", () => {
 		const opusSession = await placeOnGd(OPUS, "opus");
 
 		gdFableOut = true;
+		freshOnCall.set(GD, usage(measuredGooddata()));
 		const before = calls.length;
 		const moved = (await send(
 			ctx,
@@ -702,17 +777,14 @@ describe("scenario 2: sticky sessions after a family 429", () => {
 });
 
 describe("scenario 3: Fable out on every account", () => {
-	it("returns an upstream 429 unchanged, benches neither account, and still routes Opus", async () => {
+	it("replays the upstream 429 rebased, asks nothing more upstream, benches neither account, and still routes Opus", async () => {
 		const aiFableReset = NOW + 20 * HOUR;
-		usageCache.set(GD, usage(measuredGooddata()));
-		usageCache.set(
-			AI,
-			usage({
-				fiveHour: [30, NOW + 3 * HOUR],
-				weeklyAll: [60, aiFableReset],
-				fable: [100, aiFableReset],
-			}),
-		);
+		setLaggingUsage(GD, measuredGooddata());
+		setLaggingUsage(AI, {
+			fiveHour: [30, NOW + 3 * HOUR],
+			weeklyAll: [60, aiFableReset],
+			fable: [100, aiFableReset],
+		});
 		const gdRefusal = refusal(GD, FABLE_RESET_GD, null);
 		const aiRefusal = refusal(AI, aiFableReset, "seven_day_fable");
 		const calls = installUpstream(({ account, model }) => {
@@ -726,9 +798,9 @@ describe("scenario 3: Fable out on every account", () => {
 		);
 
 		const first = await send(ctx, makeRequest(FABLE));
-		// Both refuse; gooddata-ai's block ends first, so its 429 is the answer.
-		expect(new Set(calls.map((c) => c.account))).toEqual(new Set([GD, AI]));
-		await expectUpstreamRefusal(first, aiRefusal);
+		// Both refuse once; gooddata-ai's block ends first, so its 429 is the answer.
+		expect(perAccount(calls)).toEqual({ [GD]: 1, [AI]: 1 });
+		await expectReplayedRefusal(first, aiRefusal);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(getFamilyBlock(GD, "fable", Date.now())?.until).toBe(FABLE_RESET_GD);
 		expect(getFamilyBlock(AI, "fable", Date.now())?.until).toBe(aiFableReset);
@@ -736,11 +808,13 @@ describe("scenario 3: Fable out on every account", () => {
 		expect(row(AI).rate_limited_until).toBeNull();
 		expect(writes).toEqual([]);
 
-		// With both blocks standing, the next Fable request still gets an
-		// upstream 429 through the all-limited rule, not a local error.
+		// With both blocks standing, the next Fable request gets gooddata-ai's
+		// remembered 429 through the all-limited rule, with nothing sent upstream.
 		logs = [];
+		const secondBefore = calls.length;
 		const second = await send(ctx, makeRequest(FABLE));
-		await expectUpstreamRefusal(second, aiRefusal);
+		expect(perAccount(calls.slice(secondBefore))).toEqual({});
+		await expectReplayedRefusal(second, aiRefusal);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(writes).toEqual([]);
 
@@ -758,10 +832,10 @@ describe("scenario 4: an account-wide refusal", () => {
 	// five-hour window, or the poll that lands with the 429 reads 100 %.
 	for (const variant of ["claim header", "fresh usage reading"] as const) {
 		it(`benches gooddata on a five-hour 429 and stops routing Opus there (${variant})`, async () => {
-			usageCache.set(
-				GD,
-				usage({ ...measuredGooddata(), fiveHour: [97, FIVE_HOUR_RESET_GD] }),
-			);
+			setLaggingUsage(GD, {
+				...measuredGooddata(),
+				fiveHour: [97, FIVE_HOUR_RESET_GD],
+			});
 			usageCache.set(
 				AI,
 				usage({ ...measuredGooddataAi(), fiveHour: [10, NOW + 4 * HOUR] }),
@@ -896,7 +970,7 @@ describe("scenario 7: a full family known from usage, before any refusal", () =>
 	// The second measured case (2026-11-13T12:07:24.338Z): the Fable session
 	// mapped to gooddata-ai fails over while gooddata reads Fable 100 % with
 	// overage reported as enabled and spent, and no family block exists.
-	it("never sends the Fable request to gooddata, replays the 429 of gooddata-ai, still serves Opus on gooddata", async () => {
+	it("sends the Fable request nowhere, answers the local 429 of gooddata-ai, still serves Opus on gooddata", async () => {
 		const at = Date.parse("2026-11-13T12:07:24.338Z");
 		const aiOutUntil = Date.parse("2026-11-13T16:00:00.229Z");
 		setSystemTime(new Date(at - 10 * 60_000));
@@ -944,9 +1018,8 @@ describe("scenario 7: a full family known from usage, before any refusal", () =>
 		logs = [];
 		const before = calls.length;
 		const response = await send(ctx, makeRequest(FABLE, { session }));
-		expect(calls.slice(before).filter((c) => c.account === GD)).toEqual([]);
-		expect(calls.slice(before)).toEqual([{ account: AI, model: FABLE }]);
-		await expectUpstreamRefusal(response, aiRefusal);
+		expect(perAccount(calls.slice(before))).toEqual({});
+		await expectBuiltLimit429(response, aiOutUntil);
 		expect(logged("rule=all-exhausted").length).toBeGreaterThan(0);
 		expect(row(GD).rate_limited_until).toBeNull();
 		expect(writes.filter((w) => w.id === GD)).toHaveLength(gdWritesBefore);
