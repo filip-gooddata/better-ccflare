@@ -50,10 +50,13 @@ import {
 	validateProviderPath,
 } from "./handlers";
 import {
+	getLocalLimitAnswer,
 	isAllLimitedRuleEligible,
-	markAllLimitedSelection,
-	selectAllLimitedTarget,
+	type LocalLimitAnswer,
+	localLimitAnswerResponse,
+	selectAllLimitedAnswer,
 } from "./handlers/limit-blocked";
+import { rebaseLimitRefusalHeaders } from "./handlers/limit-response";
 import {
 	type HeldLimitRefusal,
 	releaseHeldLimitRefusal,
@@ -653,6 +656,14 @@ async function handleProxyRequestHolding(
 			comboName,
 		);
 
+	/** The local limit 429 for `answer`; nothing is sent upstream. */
+	const answerLocally = (answer: LocalLimitAnswer): Response => {
+		log.info(
+			`Answering locally with ${answer.account.name}'s limit 429 (family=${answer.family ?? "none"}); nothing forwarded`,
+		);
+		return localLimitAnswerResponse(answer, requestMeta.id);
+	};
+
 	const { available: accounts, throttled: throttledAccounts } =
 		applyUsageThrottling(selectedAccounts);
 
@@ -660,6 +671,15 @@ async function handleProxyRequestHolding(
 	if (accounts.length === 0) {
 		if (requestMeta.comboName && isComboSessionFallbackDisabled(ctx)) {
 			return await returnComboSessionFallbackDisabled(requestMeta.comboName, 0);
+		}
+
+		// Every account that could serve the request is at a limit (the
+		// all-limited rule), or the account the request named is at a full
+		// limit: answer with that account's limit 429 here. Nothing is
+		// forwarded, since upstream would serve it from extra usage.
+		const localLimitAnswer = getLocalLimitAnswer(requestMeta);
+		if (localLimitAnswer) {
+			return answerLocally(localLimitAnswer);
 		}
 
 		// Model-scoped capacity filter (account-selector.ts) emptied the
@@ -1613,6 +1633,11 @@ async function handleProxyRequestHolding(
 			// Same no-accounts resolver order as the initial selection (Step 7):
 			// capacity-exhaustion first (structured, actionable response instead
 			// of falling through to a generic failure), then usage-throttling.
+			const fallbackLocalAnswer = getLocalLimitAnswer(requestMeta);
+			if (fallbackLocalAnswer) {
+				cacheBodyStore.discardStaged(requestMeta.id);
+				return answerLocally(fallbackLocalAnswer);
+			}
 			const fallbackExhaustionInfo = getModelFamilyExhaustionInfo(requestMeta);
 			if (fallbackExhaustionInfo) {
 				cacheBodyStore.discardStaged(requestMeta.id);
@@ -1655,13 +1680,13 @@ async function handleProxyRequestHolding(
 	}
 
 	// Failover path C: every candidate refused, at least one of them for a
-	// limit, under a strategy with the all-limited rule. Answer with a genuine
-	// upstream limit response, never the composed 503: the refusal of the
-	// account that becomes usable first. The refusals above have just set
-	// their cooldowns, so the rule now sees them; when its pick is not the
-	// account whose refusal is held, that account is asked once more (on the
-	// rule path, so its refusal leaves the streak alone) and its answer goes
-	// to the client. Without a response from it, the held refusal does.
+	// limit, under a strategy with the all-limited rule. Answer with a limit
+	// 429, never the composed 503, and never by asking an account again
+	// (upstream would serve that from extra usage). The refusals above have
+	// just set their cooldowns, so the rule now sees them and picks the
+	// account usable first. When that is the held account, or there is no
+	// pick, the held refusal is replayed with retry-after and date rebased;
+	// when it is another account, that account's local 429 answers.
 	//
 	// This comes before the re-authentication answer: that one rests on token
 	// age alone, while a held refusal proves an account authenticated and is
@@ -1679,7 +1704,7 @@ async function handleProxyRequestHolding(
 		// objects carry them already: overlay the later cooldown onto each row.
 		// Best effort: a failed lookup answers with the held refusal.
 		const attempted = new Map(allAttemptedAccounts.map((acc) => [acc.id, acc]));
-		let target: Account | null = null;
+		let target: LocalLimitAnswer | null = null;
 		try {
 			const rows = (await ctx.dbOps.getAllAccounts()).map((row) => {
 				const seen = attempted.get(row.id);
@@ -1688,7 +1713,7 @@ async function handleProxyRequestHolding(
 					? { ...row, rate_limited_until: seen.rate_limited_until }
 					: row;
 			});
-			target = await selectAllLimitedTarget(
+			target = await selectAllLimitedAnswer(
 				ctx,
 				requestMeta,
 				effectiveModel ?? undefined,
@@ -1700,39 +1725,24 @@ async function handleProxyRequestHolding(
 				`All candidates refused for limits; could not find the account usable first, answering with ${held.account.name}'s refusal: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
-		if (target && target.id !== held.account.id) {
-			markAllLimitedSelection(requestMeta, target.id);
+		cacheBodyStore.discardStaged(requestMeta.id);
+		if (target && target.account.id !== held.account.id) {
+			// The account usable first is another one: answer with its limit,
+			// never by asking it again (upstream would serve that from extra
+			// usage).
 			log.info(
-				`All candidates refused for limits; asking ${target.name}, the account usable first, once more instead of answering with ${held.account.name}'s refusal`,
+				`All candidates refused for limits; answering with ${target.account.name}'s limit 429, the account usable first, instead of ${held.account.name}'s refusal`,
 			);
-			const extra = await proxyWithAccount(
-				req,
-				url,
-				target,
-				requestMeta,
-				finalBodyBuffer,
-				finalCreateBodyStream,
-				allAttemptedAccounts.length,
-				ctx,
-				null,
-				apiKeyId,
-				apiKeyName,
-				requestBodyContext,
-				true,
-				undefined,
-				holdLimitRefusal,
-			);
-			if (extra) {
-				releaseHeld();
-				recordServedAccount(target, extra);
-				return extra;
-			}
+			releaseHeld();
+			return answerLocally(target);
 		}
 		const answer: HeldLimitRefusal = heldSlot.refusal ?? held;
-		cacheBodyStore.discardStaged(requestMeta.id);
 		log.info(
 			`All candidates refused for limits; returning ${answer.account.name}'s upstream ${answer.status} to the client`,
 		);
+		// retry-after and date describe the moment of the refusal; recompute
+		// them from its unified reset for this answer.
+		answer.headers = rebaseLimitRefusalHeaders(answer.headers, Date.now());
 		const replay = replayLimitRefusal(answer, requestMeta.id);
 		// The replay now owns the held body: the client reads it.
 		heldSlot.refusal = undefined;

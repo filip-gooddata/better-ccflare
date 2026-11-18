@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { setUseExtraUsage } from "@better-ccflare/core";
+import { usageCache } from "@better-ccflare/providers";
+import {
+	clearLimitRefusalCache,
+	rememberLimitRefusal,
+} from "../limit-response";
 import {
 	clearFamilyExhaustionCache,
 	createModelFamilyExhaustedResponse,
@@ -588,44 +593,56 @@ describe("markFamilyExhausted / isFamilyExhausted", () => {
 
 describe("createModelFamilyExhaustedResponse", () => {
 	const NOW = Date.UTC(2026, 3, 28, 12, 0, 0);
+	const LIMIT_MESSAGE =
+		"This request would exceed your account's rate limit. Please try again later.";
 
-	// v3 Fix4 (Revision v2, codex-8): 429 (not 529), Anthropic-compatible
-	// error.type "rate_limit_error" + a separate machine-readable
-	// error.code "model_family_exhausted".
-	it("returns HTTP 429 with error.type rate_limit_error and error.code model_family_exhausted", async () => {
+	function atNow<T>(fn: () => T): T {
 		const realNow = Date.now;
 		Date.now = () => NOW;
 		try {
-			const resetAt = NOW + 90_000;
-			const response = createModelFamilyExhaustedResponse({
-				family: "fable",
-				resetAt,
-				origin: "telemetry_confirmed",
-			});
-
-			expect(response.status).toBe(429);
-			expect(response.headers.get("Retry-After")).toBe("90");
-
-			const body = (await response.json()) as {
-				type: string;
-				error: {
-					type: string;
-					code: string;
-					family: string;
-					resetAt: number | null;
-				};
-			};
-			expect(body.type).toBe("error");
-			expect(body.error.type).toBe("rate_limit_error");
-			expect(body.error.code).toBe("model_family_exhausted");
-			expect(body.error.family).toBe("fable");
-			expect(body.error.resetAt).toBe(resetAt);
+			return fn();
 		} finally {
 			Date.now = realNow;
 		}
+	}
+
+	afterEach(() => {
+		usageCache.clear();
+		clearLimitRefusalCache();
 	});
 
-	it("falls back to a default Retry-After of 60s when resetAt is unknown", async () => {
+	// The no-extra-usage local 429: Anthropic's own shape, body without the
+	// proxy's code/family/resetAt, the unified headers Claude Code reads.
+	it("returns the Anthropic-shaped local 429 for the family binding", async () => {
+		const resetAt = NOW + 90_000;
+		const response = atNow(() =>
+			createModelFamilyExhaustedResponse({
+				family: "fable",
+				resetAt,
+				origin: "telemetry_confirmed",
+			}),
+		);
+
+		expect(response.status).toBe(429);
+		expect(response.headers.get("Retry-After")).toBe("90");
+		expect(response.headers.get("content-type")).toBe("application/json");
+		expect(response.headers.get("x-should-retry")).toBe("true");
+		expect(response.headers.get("anthropic-ratelimit-unified-status")).toBe(
+			"rejected",
+		);
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBe("seven_day_fable");
+		expect(response.headers.get("anthropic-ratelimit-unified-reset")).toBe(
+			String(resetAt / 1000),
+		);
+		expect(await response.json()).toEqual({
+			type: "error",
+			error: { type: "rate_limit_error", message: LIMIT_MESSAGE },
+		});
+	});
+
+	it("falls back to a default Retry-After of 60s when resetAt is unknown", () => {
 		const response = createModelFamilyExhaustedResponse({
 			family: "sonnet",
 			resetAt: null,
@@ -633,107 +650,87 @@ describe("createModelFamilyExhaustedResponse", () => {
 		});
 		expect(response.status).toBe(429);
 		expect(response.headers.get("Retry-After")).toBe("60");
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-reset"),
+		).toBeNull();
 	});
 
-	// v3 Fix4 precise formula: max(1, min(3600, ceil((resetAt-now)/1000))).
-	describe("Retry-After clamping", () => {
-		it("clamps to 1 (never 0 or negative) when resetAt has already passed", async () => {
-			const realNow = Date.now;
-			Date.now = () => NOW;
-			try {
-				const response = createModelFamilyExhaustedResponse({
+	it("answers for the named account: replays its fresh cached 429", async () => {
+		const reset = Math.floor((Date.now() + 2 * 3_600_000) / 1000);
+		rememberLimitRefusal("acc-family", {
+			status: 429,
+			statusText: "Too Many Requests",
+			headers: new Headers({
+				"anthropic-ratelimit-unified-reset": String(reset),
+				"anthropic-ratelimit-unified-representative-claim": "five_hour",
+				"retry-after": "1",
+			}),
+			body: new TextEncoder().encode("upstream-body"),
+		});
+		const response = createModelFamilyExhaustedResponse({
+			family: "fable",
+			resetAt: Date.now() + 3_600_000,
+			origin: "family_blocked",
+			accountId: "acc-family",
+		});
+		expect(response.status).toBe(429);
+		expect(await response.text()).toBe("upstream-body");
+		expect(
+			response.headers.get("anthropic-ratelimit-unified-representative-claim"),
+		).toBe("five_hour");
+	});
+
+	describe("Retry-After", () => {
+		it("is at least 1 when resetAt has already passed", () => {
+			const response = atNow(() =>
+				createModelFamilyExhaustedResponse({
 					family: "fable",
 					resetAt: NOW - 5_000,
 					origin: "telemetry_confirmed",
-				});
-				expect(response.headers.get("Retry-After")).toBe("1");
-			} finally {
-				Date.now = realNow;
-			}
+				}),
+			);
+			expect(response.headers.get("Retry-After")).toBe("1");
 		});
 
-		it("clamps to 1 when resetAt is only a fraction of a second away", async () => {
-			const realNow = Date.now;
-			Date.now = () => NOW;
-			try {
-				const response = createModelFamilyExhaustedResponse({
+		it("is 1 when resetAt is only a fraction of a second away", () => {
+			const response = atNow(() =>
+				createModelFamilyExhaustedResponse({
 					family: "fable",
 					resetAt: NOW + 500,
 					origin: "telemetry_confirmed",
-				});
-				expect(response.headers.get("Retry-After")).toBe("1");
-			} finally {
-				Date.now = realNow;
-			}
+				}),
+			);
+			expect(response.headers.get("Retry-After")).toBe("1");
 		});
 
-		it("caps at 3600 (1h) when resetAt is multiple days away", async () => {
-			const realNow = Date.now;
-			Date.now = () => NOW;
-			try {
-				const response = createModelFamilyExhaustedResponse({
+		it("counts the whole wait when resetAt is days away, as upstream does", () => {
+			const response = atNow(() =>
+				createModelFamilyExhaustedResponse({
 					family: "fable",
 					resetAt: NOW + 3 * 24 * 60 * 60 * 1000,
 					origin: "telemetry_confirmed",
-				});
-				expect(response.headers.get("Retry-After")).toBe("3600");
-			} finally {
-				Date.now = realNow;
-			}
-		});
-
-		it("defaults to 60 when resetAt is unknown/null", async () => {
-			const response = createModelFamilyExhaustedResponse({
-				family: "fable",
-				resetAt: null,
-				origin: "recent_upstream_rejection",
-			});
-			expect(response.headers.get("Retry-After")).toBe("60");
+				}),
+			);
+			expect(response.headers.get("Retry-After")).toBe(String(3 * 24 * 3600));
 		});
 	});
 
-	// v3 S5 / Revision v2 Fix1: only telemetry-confirmed exhaustion may assert
-	// "weekly capacity exhausted"; a purely reactive (out_of_credits-derived)
-	// mark must produce a neutral message that does not claim weekly capacity.
-	describe("message wording by signal provenance", () => {
-		it("asserts weekly capacity exhaustion when origin is telemetry_confirmed", async () => {
+	// The fixed Anthropic text names no window, so no origin can misattribute
+	// a cooldown or a reactive mark to weekly capacity.
+	it("uses the same neutral message for every origin", async () => {
+		for (const origin of [
+			"telemetry_confirmed",
+			"recent_upstream_rejection",
+			"cooldown_masked",
+			"family_blocked",
+		] as const) {
 			const response = createModelFamilyExhaustedResponse({
 				family: "fable",
 				resetAt: NOW + 90_000,
-				origin: "telemetry_confirmed",
+				origin,
 			});
 			const body = (await response.json()) as { error: { message: string } };
-			expect(body.error.message.toLowerCase()).toContain("weekly");
-		});
-
-		it("uses neutral wording (no weekly-capacity claim) when origin is recent_upstream_rejection", async () => {
-			const response = createModelFamilyExhaustedResponse({
-				family: "fable",
-				resetAt: null,
-				origin: "recent_upstream_rejection",
-			});
-			const body = (await response.json()) as { error: { message: string } };
-			expect(body.error.message.toLowerCase()).not.toContain("weekly");
-			expect(body.error.message.toLowerCase()).toContain("recently rejected");
-		});
-
-		// 529-overload-cooldown-separation: an account with free capacity for
-		// the family exists but is only sidelined by a rate-limit cooldown —
-		// the message must name the real (short-lived) blocker instead of
-		// claiming weekly exhaustion or hiding it under "recently rejected
-		// upstream" (that phrase implies capacity exhaustion too).
-		it("names the cooldown as the real blocker (no weekly-capacity claim, no 'recently rejected') when origin is cooldown_masked", async () => {
-			const response = createModelFamilyExhaustedResponse({
-				family: "fable",
-				resetAt: NOW + 90_000,
-				origin: "cooldown_masked",
-			});
-			const body = (await response.json()) as { error: { message: string } };
-			expect(body.error.message.toLowerCase()).not.toContain("weekly");
-			expect(body.error.message.toLowerCase()).not.toContain(
-				"recently rejected",
-			);
-			expect(body.error.message.toLowerCase()).toContain("cooldown");
-		});
+			expect(body.error.message).toBe(LIMIT_MESSAGE);
+		}
 	});
 });

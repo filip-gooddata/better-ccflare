@@ -1,5 +1,9 @@
 import { getModelFamily } from "@better-ccflare/core";
 import type { AnyUsageData } from "@better-ccflare/providers";
+import {
+	buildLocalLimitResponse,
+	localLimitResponseForAccount,
+} from "./limit-response";
 
 export interface ModelExhaustionResult {
 	exhausted: boolean;
@@ -391,78 +395,37 @@ export interface ModelFamilyExhaustionInfo {
 	family: string;
 	resetAt: number | null;
 	origin: FamilyExhaustionOrigin;
+	/**
+	 * The account the answer describes (the one usable again first). With it
+	 * the answer is that account's local limit 429 (its cached real 429, else
+	 * one built from its usage); without it, a 429 built from the family and
+	 * `resetAt` alone.
+	 */
+	accountId?: string;
 }
 
-const DEFAULT_RETRY_AFTER_SECONDS = 60;
-const MAX_RETRY_AFTER_SECONDS = 3600;
-
 /**
- * Structured 429 returned when every candidate account for a request's
- * model family has been filtered out as capacity-exhausted, instead of
- * exhausting the normal per-account failover loop against accounts that are
- * already known to reject this model family. Anthropic-compatible shape:
- * `error.type` is the standard "rate_limit_error", with a separate
- * machine-readable `error.code` of "model_family_exhausted".
- *
- * Only a telemetry_confirmed origin may assert "weekly capacity exhausted"
- * in the message — a purely reactive (recent_upstream_rejection) mark uses
- * neutral wording, since it was never corroborated by the account's own
- * limits[] telemetry and may be misattributed to the wrong window.
+ * The 429 returned when every candidate account for a request's model family
+ * is out for that family, instead of failing over against accounts known to
+ * reject it. It is the no-extra-usage local limit 429 (limit-response.ts):
+ * Anthropic's status, unified headers and body shape, with the family as the
+ * binding limit (claim `seven_day_<family>`, an approximate name) and
+ * `retry-after` counted to `resetAt`. The body carries Anthropic's fixed
+ * rate-limit text, which names no window, so no `origin` (a cooldown, a
+ * reactive mark) is misattributed to weekly capacity; `origin` no longer
+ * changes the response.
  */
 export function createModelFamilyExhaustedResponse(
 	info: ModelFamilyExhaustionInfo,
 ): Response {
-	const retryAfterSeconds =
-		info.resetAt != null
-			? Math.max(
-					1,
-					Math.min(
-						MAX_RETRY_AFTER_SECONDS,
-						Math.ceil((info.resetAt - Date.now()) / 1000),
-					),
-				)
-			: DEFAULT_RETRY_AFTER_SECONDS;
-
-	const resetIso =
-		info.resetAt != null ? new Date(info.resetAt).toISOString() : null;
-
-	// The non-confirmed wording must stay accurate for MIXED provenance too
-	// (some accounts telemetry-filtered, some only recently rejected), so it
-	// names both possibilities instead of asserting "all recently rejected".
-	// "cooldown_masked" gets its own wording: the real blocker there is an
-	// account temporarily sidelined by a rate-limit cooldown, not weekly
-	// capacity — asserting exhaustion (or even "recently rejected upstream")
-	// would misattribute a minutes-long cooldown to a days-long weekly cap.
-	const message =
-		info.origin === "telemetry_confirmed"
-			? `All available accounts have exhausted their weekly ${info.family} capacity.` +
-				(resetIso ? ` Earliest reset at ${resetIso}.` : "")
-			: info.origin === "cooldown_masked"
-				? `An account with available ${info.family} capacity is temporarily in a rate-limit cooldown (not capacity-exhausted).` +
-					(resetIso ? ` Retry after ${resetIso}.` : "")
-				: info.origin === "family_blocked"
-					? `Upstream refused the ${info.family} model family on every available account until its limit resets.` +
-						(resetIso ? ` Earliest reset at ${resetIso}.` : "")
-					: `All available accounts are temporarily unavailable for the ${info.family} model family (capacity exhausted or recently rejected upstream).` +
-						(resetIso ? ` Retry after ${resetIso}.` : "");
-
-	return new Response(
-		JSON.stringify({
-			type: "error",
-			error: {
-				type: "rate_limit_error",
-				code: "model_family_exhausted",
-				message,
-				family: info.family,
-				resetAt: info.resetAt,
-			},
-		}),
-		{
-			status: 429,
-			headers: {
-				"Content-Type": "application/json",
-				"Retry-After": String(retryAfterSeconds),
-			},
-		},
-	);
+	if (info.accountId) {
+		return localLimitResponseForAccount(
+			{ id: info.accountId },
+			{ family: info.family, familyResetMs: info.resetAt },
+		);
+	}
+	return buildLocalLimitResponse({
+		binding: { kind: "family", family: info.family },
+		resetMs: info.resetAt,
+	});
 }

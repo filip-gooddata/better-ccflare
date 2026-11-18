@@ -21,9 +21,9 @@ import type {
 } from "@better-ccflare/types";
 import { getKnownCodexModels } from "../codex-model-catalog";
 import {
-	isAllLimitedRuleEligible,
-	markAllLimitedSelection,
-	selectAllLimitedTarget,
+	fullLimitAnswer,
+	markLocalLimitAnswer,
+	selectAllLimitedAnswer,
 } from "./limit-blocked";
 import {
 	type FamilyExhaustionOrigin,
@@ -748,6 +748,30 @@ export async function selectAccountsForRequest(
 					// the scheduler holds the process-local probe secret.
 					const isAutoRefreshBypass =
 						meta.headers.get("x-better-ccflare-bypass-session") === "true";
+					// A forced account at a full limit (five-hour, weekly, or the
+					// request model's family) is never served, whatever the header
+					// says: upstream would answer from extra usage. Its local 429
+					// answers the request when nothing else can (proxy.ts reads
+					// the mark on an empty selection).
+					//
+					// A probe gets that 429 at once: it is a question about this
+					// one account, so it is never answered by another one, and
+					// letting it through would spend extra usage only to learn
+					// the reset, which the usage poll's resets_at already gives.
+					// Ordinary client traffic falls back to normal selection.
+					const fullAnswer = fullLimitAnswer(forcedAccount, ctx, model);
+					if (fullAnswer) {
+						markLocalLimitAnswer(meta, fullAnswer);
+						if (isAutoRefreshBypass || isInternalAutoRefreshProbe) {
+							log.warn(
+								`Probe for ${forcedAccount.name} (${forcedAccount.id}) refused: the account is at a full limit, answering with its local 429`,
+							);
+							return [];
+						}
+						log.info(
+							`Forced account ${forcedAccount.name} is at a full limit; falling back to normal selection`,
+						);
+					}
 					const forcedUsage = usageSnapshot(forcedAccount);
 					const available = isAccountAvailable(
 						forcedAccount,
@@ -763,27 +787,21 @@ export async function selectAccountsForRequest(
 						!available &&
 						!forcedAccount.paused &&
 						!!forcedAccount.rate_limited_until;
-					// A usage-capped account is neither paused nor
-					// rate_limited_until, so without this it would fail
-					// `available` and then match none of the bypass conditions —
-					// leaving the scheduler unable to probe it and detect its
-					// window reset, the one thing the bypass exists to do.
-					const isUsageCapped =
-						!available &&
-						!forcedAccount.paused &&
-						!forcedAccount.rate_limited_until &&
-						forcedUsage !== null;
 					const isFailureThresholdPaused =
 						!!forcedAccount.paused &&
 						forcedAccount.pause_reason === "failure_threshold";
+					// The bypasses never admit an account at a full limit
+					// (fullAnswer above); a usage-capped account no longer has
+					// one of its own.
 					const allowThrough =
-						available ||
-						(isAutoRefreshBypass &&
-							!forcedAccount.requires_reauth &&
-							(isOveragePaused || isRateLimited || isUsageCapped)) ||
-						(isInternalAutoRefreshProbe &&
-							!forcedAccount.requires_reauth &&
-							isFailureThresholdPaused);
+						!fullAnswer &&
+						(available ||
+							(isAutoRefreshBypass &&
+								!forcedAccount.requires_reauth &&
+								(isOveragePaused || isRateLimited)) ||
+							(isInternalAutoRefreshProbe &&
+								!forcedAccount.requires_reauth &&
+								isFailureThresholdPaused));
 					if (allowThrough) {
 						return [forcedAccount];
 					}
@@ -1187,23 +1205,22 @@ export async function selectAccountsForRequest(
 	let orderedAccounts = applyExclusions(rawOrderedAccounts);
 
 	/**
-	 * When this selection would end empty and the strategy implements
-	 * `selectWhenAllLimited`, the one account to forward to anyway (marked on
-	 * the request), or null to keep today's empty result. Never for a request
-	 * that owns its routing (isAllLimitedRuleEligible).
+	 * When this selection ends empty and the strategy implements
+	 * `selectWhenAllLimited` (rule=all-exhausted): mark the request to be
+	 * answered with the local 429 of the account the rule ranks first, the one
+	 * whose limit the answer describes. Nothing is forwarded to it: upstream
+	 * would serve a request to a full account from extra usage. A request
+	 * naming an account is left to that account's own answer.
 	 */
-	const allLimitedSelection = async (): Promise<Account[] | null> => {
-		if (!isAllLimitedRuleEligible(ctx, meta)) return null;
-		const target = await selectAllLimitedTarget(
+	const markAllLimitedAnswer = async (): Promise<void> => {
+		const answer = await selectAllLimitedAnswer(
 			ctx,
 			meta,
 			model,
 			Date.now(),
 			allAccounts,
 		);
-		if (!target) return null;
-		markAllLimitedSelection(meta, target.id);
-		return [target];
+		if (answer) markLocalLimitAnswer(meta, answer);
 	};
 
 	// "Force account model": keep only accounts that can serve the requested
@@ -1288,10 +1305,9 @@ export async function selectAccountsForRequest(
 	// The strategy left no candidate: ask the all-limited rule here, before the
 	// model-scoped capacity filter. With nothing to filter, that block returns
 	// the empty list without reaching the rule, and a request with a model
-	// would get the local pool_exhausted 503 instead of an upstream answer.
+	// would get the local pool_exhausted 503 instead of the limit 429.
 	if (orderedAccounts.length === 0) {
-		const allLimited = await allLimitedSelection();
-		if (allLimited) return allLimited;
+		await markAllLimitedAnswer();
 	}
 
 	// Model-scoped capacity filter for the non-combo (or combo-inactive/
@@ -1393,8 +1409,7 @@ export async function selectAccountsForRequest(
 					}
 				}
 
-				const allLimited = await allLimitedSelection();
-				if (allLimited) return allLimited;
+				await markAllLimitedAnswer();
 
 				if (earliestCooldownResetAt != null) {
 					log.warn(
@@ -1440,8 +1455,7 @@ export async function selectAccountsForRequest(
 		);
 		if (available.length < orderedAccounts.length) {
 			if (available.length === 0) {
-				const allLimited = await allLimitedSelection();
-				if (allLimited) return allLimited;
+				await markAllLimitedAnswer();
 				return [];
 			}
 			notePoolDeferrals(available);

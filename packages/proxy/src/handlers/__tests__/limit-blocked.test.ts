@@ -23,8 +23,6 @@ import {
 } from "../account-selector";
 import {
 	collectLimitBlockedAccounts,
-	isAllLimitedSelection,
-	markAllLimitedSelection,
 	selectAllLimitedTarget,
 } from "../limit-blocked";
 import {
@@ -518,16 +516,6 @@ describe("collectLimitBlockedAccounts", () => {
 	});
 });
 
-describe("all-limited selection mark", () => {
-	it("is set only on the marked request", () => {
-		const marked = makeMeta();
-		const other = makeMeta();
-		markAllLimitedSelection(marked, "a");
-		expect(isAllLimitedSelection(marked)).toBe(true);
-		expect(isAllLimitedSelection(other)).toBe(false);
-	});
-});
-
 describe("selectAllLimitedTarget", () => {
 	it("returns null under a strategy without selectWhenAllLimited", async () => {
 		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
@@ -706,7 +694,7 @@ describe("selectAccountsForRequest: a full limit is never a candidate", () => {
 });
 
 describe("selectAccountsForRequest with the all-limited rule", () => {
-	it("returns the strategy's target and marks the request when every account is out on limits", async () => {
+	it("returns no account to forward when every account is out on limits", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 		const b = makeAccount("b");
@@ -716,10 +704,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			strategy: availabilityStrategy(pick.fn),
 		});
 		const meta = makeMeta();
-		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(true);
-		expect(pick.calls[0].map((e) => e.account.id).sort()).toEqual(["a", "b"]);
+		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 	});
 
 	it("keeps today's empty result under a strategy without the method", async () => {
@@ -727,7 +712,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const ctx = makeCtx({ accounts: [a], strategy: availabilityStrategy() });
 		const meta = makeMeta();
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 	});
 
 	it("does not fire while any account is selectable", async () => {
@@ -742,11 +726,10 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const meta = makeMeta();
 		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
 		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
-	it("forwards a family-exhausted request instead of setting the family side channel", async () => {
+	it("returns no account to forward for a family-exhausted request", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a");
 		usageCache.set(
@@ -759,13 +742,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			capacityRouting: true,
 		});
 		const meta = makeMeta();
-		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(true);
-		expect(getModelFamilyExhaustionInfo(meta)).toBeNull();
-		expect(pick.calls[0][0].limits).toEqual([
-			{ kind: "family", family: "opus", resetAt: NOW + 10 * HOUR },
-		]);
+		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 	});
 
 	it("keeps the family side channel under a strategy without the method", async () => {
@@ -799,11 +776,10 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			headers: { "x-better-ccflare-account-id": "a" },
 		});
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
-	it("keeps an auto-refresh bypass request out of the rule", async () => {
+	it("returns no account to forward for a bypass-session request without a forced account", async () => {
 		const pick = recordingPick();
 		const a = makeAccount("a", { rate_limited_until: NOW + HOUR });
 		const ctx = makeCtx({
@@ -814,7 +790,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			headers: { "x-better-ccflare-bypass-session": "true" },
 		});
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(pick.calls).toHaveLength(0);
 	});
 
 	it("leaves a combo with session fallback disabled at today's empty result", async () => {
@@ -846,7 +821,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		});
 		const meta = makeMeta();
 		expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
@@ -862,7 +836,6 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 		const meta = makeMeta();
 		const selected = await selectAccountsForRequest(meta, ctx, MODEL);
 		expect(selected.map((x) => x.id)).toEqual(["a"]);
-		expect(isAllLimitedSelection(meta)).toBe(false);
 		expect(pick.calls).toHaveLength(0);
 	});
 
@@ -877,16 +850,14 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 			return { strategy, ctx: makeCtx({ accounts, strategy }) };
 		}
 
-		it("sends the request to the 5-hour account over the weekly one", async () => {
+		it("forwards to neither the 5-hour account nor the weekly one", async () => {
 			const a = makeAccount("a");
 			const b = makeAccount("b");
 			usageCache.set("a", usage({ sevenDay: win(100, NOW + 30 * HOUR) }));
 			usageCache.set("b", usage({ fiveHour: win(100, NOW + 2 * HOUR) }));
 			const { ctx } = paceCtx([a, b]);
 			const meta = makeMeta({ session: "s1" });
-			const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-			expect(selected.map((x) => x.id)).toEqual(["b"]);
-			expect(isAllLimitedSelection(meta)).toBe(true);
+			expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 		});
 
 		it("applies to mapped, new and no-session requests alike", async () => {
@@ -903,9 +874,7 @@ describe("selectAccountsForRequest with the all-limited rule", () => {
 
 			for (const session of ["mapped", "new", null]) {
 				const meta = makeMeta({ session });
-				const selected = await selectAccountsForRequest(meta, ctx, MODEL);
-				expect(selected.map((x) => x.id)).toEqual(["b"]);
-				expect(isAllLimitedSelection(meta)).toBe(true);
+				expect(await selectAccountsForRequest(meta, ctx, MODEL)).toEqual([]);
 			}
 		});
 	});

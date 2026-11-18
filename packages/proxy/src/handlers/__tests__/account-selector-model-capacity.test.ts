@@ -395,18 +395,21 @@ describe("selectAccountsForRequest — model-scoped capacity filter (combo routi
 // ── force-header bypass ──────────────────────────────────────────────────────────
 
 describe("selectAccountsForRequest — model-scoped capacity filter (force-header bypass)", () => {
-	it("returns the forced account even when it is exhausted for the request's family", async () => {
+	it("does not return the forced account when it is exhausted for the request's family; normal selection serves another account", async () => {
 		const acc = makeAccount({ id: "acc-forced" });
+		const other = makeAccount({ id: "acc-other" });
 		usageCache.set(acc.id, exhaustedUsage("Fable", Date.now()));
-		const ctx = makeCtx({ accounts: [acc], capacityRoutingMode: "exhausted" });
+		const ctx = makeCtx({
+			accounts: [acc, other],
+			capacityRoutingMode: "exhausted",
+		});
 		const meta = makeRequestMeta({
 			headers: new Headers({ "x-better-ccflare-account-id": "acc-forced" }),
 		});
 
 		const result = await selectAccountsForRequest(meta, ctx, "claude-fable-5");
 
-		expect(result).toHaveLength(1);
-		expect(result[0]?.id).toBe("acc-forced");
+		expect(result.map((a) => a.id)).toEqual(["acc-other"]);
 	});
 });
 
