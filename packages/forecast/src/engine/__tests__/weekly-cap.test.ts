@@ -14,7 +14,12 @@ import type { ForecastBlock } from "../../types";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import { planForecast } from "../planner";
 import { buildResponse } from "../response";
-import { buildInput, prague, replay1113Fixture } from "./fixtures-engine";
+import {
+	buildInput,
+	FIXED_N_ENGINE,
+	prague,
+	replay1113Fixture,
+} from "./fixtures-engine";
 
 const MIN = 60_000;
 const A_RESET = prague(13, 14) + 663;
@@ -107,7 +112,7 @@ describe("weekly cap: 2026-11-13 13:45 without the cooldown, live calibration", 
 describe("weekly cap in the forecast inputs", () => {
 	test("each account carries r = k5 / kW and whether the cap binds at computedAt; each limit the age of its readings", async () => {
 		// Fixture calibration r = 2 / 0.15: acct-a with 1 % weekly left counts 13.3 of its 18 left.
-		const result = await createForecastEngine().compute(
+		const result = await createForecastEngine(FIXED_N_ENGINE).compute(
 			input1345({ "acct-a": 99, "acct-b": 50 }),
 		);
 		if (!result.available || !result.inputs) throw new Error("unavailable");

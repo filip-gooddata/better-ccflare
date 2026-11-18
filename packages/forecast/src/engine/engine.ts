@@ -4,6 +4,11 @@
  * sums), horizon, scenarios (smoothed bootstrap), planner (receding-horizon search),
  * response. Yields to the event loop between stages; the stages yield inside.
  */
+
+import {
+	createForecastWorkerRunner,
+	type ForecastWorkerRunner,
+} from "../service/forecast-worker-runner";
 import type {
 	AccountId,
 	AccountLimits,
@@ -45,8 +50,16 @@ import type {
 } from "./model";
 import { applyPace, buildPaceSeries, type PaceNow, plainPace } from "./pace";
 import { capBinds, capRatio } from "./past";
-import { planForecast } from "./planner";
+import {
+	PLAN_BUDGET_MS,
+	PLAN_JOB_TIMEOUT_MS,
+	type PlanJobResult,
+	planJobContext,
+	planJobTransfer,
+	type ScenarioLadderOverride,
+} from "./plan-job";
 import { buildResponse, unavailableResponse } from "./response";
+import { SCENARIO_LADDER_TOP } from "./scenario-count";
 import { buildScenarios, resolveNoiseMode } from "./scenarios";
 import { yieldToEventLoop } from "./yield";
 
@@ -57,7 +70,23 @@ const HOUR_MS = 3_600_000;
  * shrunk kernel (the service's only mode), false is plain resampling. `unshrunk` and `off`
  * exist for measurement.
  */
-export type ForecastEngineOptions = NoiseOptions;
+export interface ForecastEngineOptions extends NoiseOptions {
+	/**
+	 * Runs the planner off the calling thread. Absent: each computation gets its own forecast
+	 * worker runner, so computations stay independent of each other.
+	 */
+	planRunner?: ForecastWorkerRunner;
+	/**
+	 * Tests only: a fixed scenario ladder and plan budget, so a test's values do not depend on the
+	 * machine's load. Production uses SCENARIO_LADDER_START..SCENARIO_LADDER_TOP and PLAN_BUDGET_MS.
+	 */
+	planJob?: PlanJobOverride;
+}
+
+export interface PlanJobOverride {
+	ladder?: ScenarioLadderOverride;
+	budgetMs?: number;
+}
 
 export function createForecastEngine(
 	options: ForecastEngineOptions = {},
@@ -66,7 +95,13 @@ export function createForecastEngine(
 	return {
 		async compute(input: ForecastInput): Promise<ForecastResult> {
 			try {
-				return await computeForecast(input, noiseMode);
+				const runner = options.planRunner ?? createForecastWorkerRunner();
+				return await computeForecast(
+					input,
+					noiseMode,
+					runner,
+					options.planJob ?? {},
+				);
 			} catch {
 				return unavailable(input, "error");
 			}
@@ -133,10 +168,14 @@ export async function prepareEngineContext(
 	return "rule" in prepared ? "insufficient_history" : prepared;
 }
 
-/** The context, or the rule that answered insufficient_history with its numbers. */
+/**
+ * The context, or the rule that answered insufficient_history with its numbers. `scenarioDays`
+ * set: that many simulated days (the scenario ladder's top); absent: settings.simulatedDays.
+ */
 async function prepare(
 	input: ForecastInput,
 	options: NoiseOptions,
+	scenarioDays?: number,
 ): Promise<EngineContext | UnavailableDetail> {
 	checkInput(input);
 	const counted = input.accounts.filter((a) => a.counted);
@@ -154,7 +193,14 @@ async function prepare(
 	await yieldToEventLoop();
 
 	const pace = currentPace(input);
-	const scenarios = await buildScenarios(input, table, horizon, options, pace);
+	const scenarios = await buildScenarios(
+		input,
+		table,
+		horizon,
+		options,
+		pace,
+		scenarioDays === undefined ? undefined : { from: 0, to: scenarioDays },
+	);
 	await yieldToEventLoop();
 	const workStart = workStartMinute(
 		table,
@@ -260,14 +306,50 @@ function poolName(
 	return own >= MIN_POOL_DAYS || type === "weekend" ? type : "weekdays";
 }
 
+/**
+ * The planner in the forecast worker, under the spacing-derived budget and timeout. The scenario
+ * buffers move to the worker; ctx keeps everything buildResponse reads. A failed job throws, so
+ * the computation reports `error` as any other engine failure does.
+ */
+async function planInWorker(
+	ctx: EngineContext,
+	runner: ForecastWorkerRunner,
+	override: PlanJobOverride,
+): Promise<PlanJobResult> {
+	const outcome = await runner.run(
+		"plan",
+		{
+			ctx: planJobContext(ctx),
+			budgetMs: override.budgetMs ?? PLAN_BUDGET_MS,
+			...(override.ladder ? { ladder: override.ladder } : {}),
+		},
+		{ timeoutMs: PLAN_JOB_TIMEOUT_MS, transfer: planJobTransfer(ctx) },
+	);
+	if (outcome.status !== "ok")
+		throw new Error(
+			`plan job ${outcome.status === "timeout" ? "timeout" : outcome.reason}`,
+		);
+	return outcome.result;
+}
+
 async function computeForecast(
 	input: ForecastInput,
 	noiseMode: NoiseMode,
+	runner: ForecastWorkerRunner,
+	override: PlanJobOverride,
 ): Promise<ForecastResult> {
-	const ctx = await prepare(input, { noiseMode });
+	// The ladder's top rung of scenario days, built here once; the job picks N among them (row 21).
+	const ctx = await prepare(
+		input,
+		{ noiseMode },
+		override.ladder?.top ?? SCENARIO_LADDER_TOP,
+	);
 	if ("rule" in ctx) return unavailable(input, "insufficient_history", ctx);
-	const { plan, result, score, baseline } = await planForecast(ctx);
-	await yieldToEventLoop();
+	const { plan, result, score, baseline } = await planInWorker(
+		ctx,
+		runner,
+		override,
+	);
 
 	const response = buildResponse(ctx, result);
 	checkBlock(response.day);

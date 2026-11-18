@@ -26,6 +26,7 @@ import {
 	type PrewarmScheduler,
 	plannedOpenings,
 } from "../prewarm/scheduler";
+import { FORECAST_MIN_SPACING_MS } from "../spacing";
 import type {
 	AccountId,
 	AccountLimits,
@@ -57,8 +58,8 @@ import {
 export const FORECAST_STALE_POLLS = 3;
 /** Wait after a usage snapshot before computing, so a burst of snapshots gives one computation. */
 export const FORECAST_POLL_SETTLE_MS = 5_000;
-/** Two computations start at least this far apart. */
-export const FORECAST_MIN_SPACING_MS = 30_000;
+/** Two computations start at least this far apart (defined in ../spacing.ts for the engine). */
+export { FORECAST_MIN_SPACING_MS };
 
 const DAY_MS = 24 * 60 * 60_000;
 

@@ -8,7 +8,7 @@ import { calibrateWithEvidence } from "../calibration";
 import { buildDayTable, poolFor } from "../days";
 import { createForecastEngine, prepareEngineContext } from "../engine";
 import { plainPace } from "../pace";
-import { buildInput, replayFixture } from "./fixtures-engine";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 
 /** Smallest daily total whose share of the summed weight, counting it and every smaller total, reaches q. */
 function lowerWeightedQuantile(
@@ -33,7 +33,10 @@ function lowerWeightedQuantile(
 describe("forecast inputs from the engine (amendment 4, D2)", () => {
 	test("compute() carries the pace, pool quantiles, work start and every k with its evidence", async () => {
 		const input = buildInput(replayFixture());
-		const result = await createForecastEngine({ noise: false }).compute(input);
+		const result = await createForecastEngine({
+			...FIXED_N_ENGINE,
+			noise: false,
+		}).compute(input);
 		if (!result.available) throw new Error(result.reason);
 		const inputs = result.inputs;
 		if (!inputs) throw new Error("no inputs on an available result");

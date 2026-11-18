@@ -1,4 +1,5 @@
 import { fitPaceModel } from "../engine/pace";
+import { planReplyTransfer, runPlanJob } from "../engine/plan-job";
 import type {
 	ForecastJobName,
 	ForecastWorkerJobs,
@@ -13,22 +14,48 @@ import type {
  */
 declare const self: Worker;
 
+/** Each job: its result, or a promise of it, and the result buffers moved back to the caller. */
 const handlers: {
-	[J in ForecastJobName]: (
-		payload: ForecastWorkerJobs[J]["payload"],
-	) => ForecastWorkerJobs[J]["result"];
+	[J in ForecastJobName]: {
+		run: (
+			payload: ForecastWorkerJobs[J]["payload"],
+		) =>
+			| ForecastWorkerJobs[J]["result"]
+			| Promise<ForecastWorkerJobs[J]["result"]>;
+		transfer?: (result: ForecastWorkerJobs[J]["result"]) => Transferable[];
+	};
 } = {
-	refit: ({ start, units, censored, timeZone, now }) =>
-		fitPaceModel({ start, units, censored, timeZone }, now),
+	refit: {
+		run: ({ start, units, censored, timeZone, now }) =>
+			fitPaceModel({ start, units, censored, timeZone }, now),
+	},
+	plan: {
+		// The deadline is on this worker's clock: performance.now has a per-thread origin.
+		run: ({ ctx, budgetMs, ladder }) =>
+			runPlanJob(ctx, {
+				deadline: performance.now() + budgetMs,
+				now: () => performance.now(),
+				ladder,
+			}),
+		transfer: planReplyTransfer,
+	},
 };
 
-self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
+self.onmessage = async (event: MessageEvent<ForecastWorkerRequest>) => {
 	const { id, job, payload } = event.data;
 	let reply: ForecastWorkerReply;
+	let transfer: Transferable[] = [];
 	try {
-		const handler = handlers[job];
+		const handler = handlers[job] as
+			| {
+					run: (payload: unknown) => unknown;
+					transfer?: (result: unknown) => Transferable[];
+			  }
+			| undefined;
 		if (!handler) throw new TypeError("forecast-worker: unknown job");
-		reply = { id, ok: true, result: handler(payload) };
+		const result = await handler.run(payload);
+		transfer = handler.transfer?.(result) ?? [];
+		reply = { id, ok: true, result };
 	} catch (error) {
 		reply = {
 			id,
@@ -36,5 +63,5 @@ self.onmessage = (event: MessageEvent<ForecastWorkerRequest>) => {
 			error: error instanceof Error ? error.name : typeof error,
 		};
 	}
-	self.postMessage(reply);
+	self.postMessage(reply, transfer);
 };

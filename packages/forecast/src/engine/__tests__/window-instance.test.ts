@@ -8,8 +8,9 @@ import type {
 } from "../../types";
 import * as calibration from "../calibration";
 import { createForecastEngine } from "../engine";
-import { buildInput, replayFixture } from "./fixtures-engine";
+import { buildInput, FIXED_N_ENGINE, replayFixture } from "./fixtures-engine";
 import { settings } from "./fixtures-sim";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const { calibrate } = calibration;
 
@@ -181,14 +182,18 @@ describe("window instance (amendment 3, C1)", () => {
 });
 
 describe("engine with jittered reset times (amendment 3, C3)", () => {
-	const engine = createForecastEngine();
+	const engine = createForecastEngine(FIXED_N_ENGINE);
 
-	test("the replay fixture with exact reset times has a forecast", async () => {
-		const result = await engine.compute(
-			buildInput({ ...replayFixture(), resetJitter: false }),
-		);
-		expect(result.available).toBe(true);
-	});
+	test(
+		"the replay fixture with exact reset times has a forecast",
+		async () => {
+			const result = await engine.compute(
+				buildInput({ ...replayFixture(), resetJitter: false }),
+			);
+			expect(result.available).toBe(true);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 
 	test("the same fixture with jittered reset times has one too", async () => {
 		const input = buildInput(replayFixture());

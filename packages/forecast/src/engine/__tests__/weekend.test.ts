@@ -11,9 +11,11 @@ import {
 	buildInput,
 	defaultSettings,
 	type EngineFixture,
+	FIXED_N_ENGINE,
 	prague,
 	replayFixture,
 } from "./fixtures-engine";
+import { FULL_GRID_TIMEOUT_MS } from "./plan-timeout";
 
 const BUCKET_MS = 5 * 60_000;
 const SATURDAY_0900 = prague(14, 9);
@@ -39,16 +41,20 @@ function meanUnits(sc: Scenarios, from: EpochMs, to: EpochMs): number {
 }
 
 describe("Saturday morning", () => {
-	test("the response conforms to the contract", async () => {
-		const result = await createForecastEngine().compute(
-			buildInput(saturdayFixture()),
-		);
-		if (!result.available) throw new Error(result.reason);
-		expect(validateForecastResponse(result.response)).toEqual([]);
-		expect(result.response.week).not.toBeNull();
-		// the week block ends at acct-b's weekly reset, Tuesday 03:00 (horizon.ts)
-		expect(result.response.week?.times.at(-1)).toBe(prague(17, 3));
-	});
+	test(
+		"the response conforms to the contract",
+		async () => {
+			const result = await createForecastEngine(FIXED_N_ENGINE).compute(
+				buildInput(saturdayFixture()),
+			);
+			if (!result.available) throw new Error(result.reason);
+			expect(validateForecastResponse(result.response)).toEqual([]);
+			expect(result.response.week).not.toBeNull();
+			// the week block ends at acct-b's weekly reset, Tuesday 03:00 (horizon.ts)
+			expect(result.response.week?.times.at(-1)).toBe(prague(17, 3));
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 
 	test("the weekend pool is drawn: Saturday's demand is far below the following Monday's over the same hours", async () => {
 		const ctx = await prepareEngineContext(buildInput(saturdayFixture()), {
@@ -75,15 +81,19 @@ describe("Saturday morning", () => {
 		expect(ctx.workStartMinute).toBe(8 * 60 + 15);
 	});
 
-	test("with pre-warm on nothing is opened ahead on a weekend morning: no demand needs it before Monday", async () => {
-		const result = await createForecastEngine().compute(
-			buildInput(
-				saturdayFixture({ settings: defaultSettings({ prewarm: true }) }),
-			),
-		);
-		if (!result.available) throw new Error(result.reason);
-		expect(result.plan.openAt).toEqual({ "acct-a": null, "acct-b": null });
-		const day = result.response.day as ForecastBlock;
-		expect(day.stops.heavy).toEqual([]);
-	});
+	test(
+		"with pre-warm on nothing is opened ahead on a weekend morning: no demand needs it before Monday",
+		async () => {
+			const result = await createForecastEngine(FIXED_N_ENGINE).compute(
+				buildInput(
+					saturdayFixture({ settings: defaultSettings({ prewarm: true }) }),
+				),
+			);
+			if (!result.available) throw new Error(result.reason);
+			expect(result.plan.openAt).toEqual({ "acct-a": null, "acct-b": null });
+			const day = result.response.day as ForecastBlock;
+			expect(day.stops.heavy).toEqual([]);
+		},
+		FULL_GRID_TIMEOUT_MS,
+	);
 });
