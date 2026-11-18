@@ -16,6 +16,47 @@ export function sanitizeProxyHeaders(original: Headers): Headers {
 }
 
 /**
+ * Set only on a 429 the proxy builds itself. The proxy's own code
+ * (`LOCAL_429_HEADER` in @better-ccflare/proxy) re-exports this name; it is
+ * defined here so upstream responses can be cleaned of it without an import
+ * cycle.
+ */
+export const LOCAL_429_MARKER_HEADER = "x-better-ccflare-local-429";
+
+/**
+ * Removes the headers only the proxy may set from an upstream response's
+ * headers, in place, so an upstream (or anything in between) cannot pass one
+ * off as the proxy's own. Returns whether anything was removed.
+ */
+export function stripProxyOnlyHeaders(headers: Headers): boolean {
+	if (!headers.has(LOCAL_429_MARKER_HEADER)) return false;
+	headers.delete(LOCAL_429_MARKER_HEADER);
+	return true;
+}
+
+/**
+ * An upstream response without the headers only the proxy may set. The same
+ * response when it carries none; otherwise its headers are cleaned in place,
+ * or, where the runtime keeps them immutable, a copy with the same status and
+ * body is returned.
+ */
+export function withoutProxyOnlyHeaders(res: Response): Response {
+	if (!res.headers.has(LOCAL_429_MARKER_HEADER)) return res;
+	try {
+		stripProxyOnlyHeaders(res.headers);
+		return res;
+	} catch {
+		const headers = new Headers(res.headers);
+		stripProxyOnlyHeaders(headers);
+		return new Response(res.body, {
+			status: res.status,
+			statusText: res.statusText,
+			headers,
+		});
+	}
+}
+
+/**
  * Removes hop-by-hop + compression negotiation headers and sensitive auth
  * headers from the ORIGINAL client request before it is persisted for
  * analytics.

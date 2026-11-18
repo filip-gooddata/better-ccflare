@@ -17,6 +17,8 @@ import {
 } from "@better-ccflare/core";
 import {
 	sanitizeProxyHeaders,
+	stripProxyOnlyHeaders,
+	withoutProxyOnlyHeaders,
 	withSanitizedProxyHeaders,
 } from "@better-ccflare/http-common";
 import { Logger } from "@better-ccflare/logger";
@@ -37,6 +39,7 @@ import {
 } from "@better-ccflare/providers";
 import type {
 	Account,
+	AccountLimit,
 	LimitBlockedAccount,
 	RateLimitReason,
 	RequestMeta,
@@ -1359,14 +1362,16 @@ export function releaseHeldLimitRefusal(held: HeldLimitRefusal): void {
 /**
  * Rebuild a held refusal for the client: the upstream status, body bytes and
  * headers, minus the ones every proxied response loses (Bun already decoded
- * the body, see sanitizeProxyHeaders), plus the request-id tag every proxied
- * response carries.
+ * the body, see sanitizeProxyHeaders) and the proxy-only local-429 marker (an
+ * upstream refusal is not the proxy's own), plus the request-id tag every
+ * proxied response carries.
  */
 export function replayLimitRefusal(
 	held: HeldLimitRefusal,
 	requestId: string,
 ): Response {
 	const headers = sanitizeProxyHeaders(held.headers);
+	stripProxyOnlyHeaders(headers);
 	headers.set("x-better-ccflare-request-id", requestId);
 	return new Response(held.body, {
 		status: held.status,
@@ -1519,14 +1524,76 @@ function gatedBlockedEntry(
 	return limits.length > 0 ? [{ account: entry.account, limits }] : [];
 }
 
+/** A limit that binds every route of an account, whatever model it sends. */
+function isAccountWideLimit(limit: AccountLimit): boolean {
+	return limit.kind !== "family";
+}
+
+/**
+ * When a set of limits lets go: the latest reset; null when any is unknown.
+ * The all-limited rule reads an account's limits the same way.
+ */
+function latestReset(limits: AccountLimit[]): number | null {
+	let latest = Number.NEGATIVE_INFINITY;
+	for (const limit of limits) {
+		if (limit.resetAt === null) return null;
+		latest = Math.max(latest, limit.resetAt);
+	}
+	return latest;
+}
+
+/** One way the request could reach an account: a model it would send. */
+interface AccountRoute {
+	/** The limits only this route stands on (its model family). */
+	own: AccountLimit[];
+	answer: LocalLimitAnswer | null;
+}
+
+interface AccountRoutes {
+	account: Account;
+	/** Limits on the whole account (five-hour, weekly, cooldown), deduplicated. */
+	shared: AccountLimit[];
+	routes: AccountRoute[];
+}
+
+/**
+ * The account's earliest usable route: per route the latest of the shared
+ * limits and its own; across routes the earliest, an unknown reset last, the
+ * first skipped on a tie. Returned with the limits it stands on, as the
+ * all-limited rule should rank the account.
+ */
+function bindingRoute(entry: AccountRoutes): {
+	blocked: LimitBlockedAccount;
+	answer: LocalLimitAnswer | null;
+} {
+	let best: { limits: AccountLimit[]; at: number; route: AccountRoute } | null =
+		null;
+	for (const route of entry.routes) {
+		const limits = [...entry.shared, ...route.own];
+		const at = latestReset(limits) ?? Number.POSITIVE_INFINITY;
+		if (best === null || at < best.at) best = { limits, at, route };
+	}
+	return {
+		blocked: {
+			account: entry.account,
+			limits: best?.limits ?? [...entry.shared],
+		},
+		answer: best?.route.answer ?? null,
+	};
+}
+
 /**
  * The local 429 for a request whose sends the gate skipped: the account the
  * strategy's all-limited rule ranks first (for session-pace, the account
  * usable again first) among the skipped accounts and the accounts this
  * request did ask that are now limit-blocked (a cooldown its own refusal or
- * error set counts). Each account's limits are merged across its skips and
- * read with the model it would have sent. The first skipped answer when the
- * strategy has no rule or declines; null when nothing was skipped.
+ * error set counts). An account skipped on several models (a model and its
+ * fallbacks) is usable again as soon as any of those routes is: per account
+ * each skip is a route, read with the model it would have sent; the routes
+ * combine as the earliest usable one, while the account-wide limits
+ * (five-hour, weekly, cooldown) bind every route. The account is ranked, and
+ * answered, by that route. The first skipped answer when the strategy has no
+ * rule or declines; null when nothing was skipped.
  */
 export async function rankFullLimitAnswers(
 	entries: GatedAttempt[],
@@ -1542,26 +1609,38 @@ export async function rankFullLimitAnswers(
 	if (!first) return null;
 	if (!ctx.strategy.selectWhenAllLimited) return first.answer;
 
-	const byAccount = new Map<string, LimitBlockedAccount>();
-	const answers = new Map<string, LocalLimitAnswer>();
-	const add = (blocked: LimitBlockedAccount) => {
-		const known = byAccount.get(blocked.account.id);
-		if (known) known.limits.push(...blocked.limits);
-		else
-			byAccount.set(blocked.account.id, {
-				account: blocked.account,
-				limits: [...blocked.limits],
-			});
-	};
-	for (const entry of entries) {
-		for (const blocked of gatedBlockedEntry(entry, ctx, meta, now)) {
-			add(blocked);
+	const byAccount = new Map<string, AccountRoutes>();
+	const add = (
+		blocked: LimitBlockedAccount,
+		answer: LocalLimitAnswer | null,
+	) => {
+		let known = byAccount.get(blocked.account.id);
+		if (!known) {
+			known = { account: blocked.account, shared: [], routes: [] };
+			byAccount.set(blocked.account.id, known);
 		}
-		answers.set(entry.account.id, entry.answer);
+		const own: AccountLimit[] = [];
+		for (const limit of blocked.limits) {
+			if (!isAccountWideLimit(limit)) own.push(limit);
+			else if (
+				!known.shared.some(
+					(s) => s.kind === limit.kind && s.resetAt === limit.resetAt,
+				)
+			)
+				known.shared.push(limit);
+		}
+		known.routes.push({ own, answer });
+	};
+	const skipped = new Set<string>();
+	for (const entry of entries) {
+		skipped.add(entry.account.id);
+		for (const blocked of gatedBlockedEntry(entry, ctx, meta, now)) {
+			add(blocked, entry.answer);
+		}
 	}
 	const others = new Map<string, Account>();
 	for (const account of attempted.accounts) {
-		if (!answers.has(account.id)) others.set(account.id, account);
+		if (!skipped.has(account.id)) others.set(account.id, account);
 	}
 	for (const blocked of collectLimitBlockedAccounts(
 		[...others.values()],
@@ -1570,10 +1649,16 @@ export async function rankFullLimitAnswers(
 		attempted.model,
 		now,
 	)) {
-		add(blocked);
+		add(blocked, null);
 	}
 
-	const blocked = [...byAccount.values()];
+	const answers = new Map<string, LocalLimitAnswer>();
+	const blocked: LimitBlockedAccount[] = [];
+	for (const entry of byAccount.values()) {
+		const binding = bindingRoute(entry);
+		blocked.push(binding.blocked);
+		if (binding.answer) answers.set(entry.account.id, binding.answer);
+	}
 	const target =
 		blocked.length > 0
 			? ctx.strategy.selectWhenAllLimited(blocked, meta)
@@ -1770,7 +1855,11 @@ export async function proxyWithAccount(
 						signal,
 					);
 				},
-			).then((response) => {
+			).then((upstream) => {
+				// Only a 429 the proxy builds itself carries the local-429
+				// marker: one arriving from upstream is dropped before anything
+				// classifies, caches or forwards this response.
+				const response = withoutProxyOnlyHeaders(upstream);
 				// Every upstream answer, before any classification or forwarding:
 				// a response that shows the account out marks it for the next
 				// request. Headers only; the body is left to the caller.

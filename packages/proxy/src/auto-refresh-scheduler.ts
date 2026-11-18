@@ -76,12 +76,15 @@ function isLimitRefusal(response: Response): boolean {
 /**
  * When a limit refusal lets the account be probed again: its unified reset,
  * or for the proxy's own cooldown answer (no unified reset) its retry-after,
- * which counts to the cooldown end.
+ * which counts to the cooldown end. Null when no reset is known: a local
+ * limit answer without a unified reset, or a cooldown answer with an unknown
+ * end, carries only the default retry-after, which is no reset at all; the
+ * uncounted-failure ladder spaces those probes instead.
  */
 function limitRefusalHoldUntil(response: Response, now: number): number | null {
 	const resetMs = limitRefusalResetMs(response.headers);
 	if (resetMs !== null) return resetMs;
-	if (!response.headers.has(LOCAL_429_HEADER)) return null;
+	if (response.headers.get(LOCAL_429_HEADER) !== "cooldown") return null;
 	const retryAfterS = Number(response.headers.get("retry-after"));
 	return Number.isFinite(retryAfterS) && retryAfterS > 0
 		? now + retryAfterS * 1000
