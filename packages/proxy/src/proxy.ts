@@ -58,7 +58,9 @@ import {
 } from "./handlers/limit-blocked";
 import { rebaseLimitRefusalHeaders } from "./handlers/limit-response";
 import {
+	getGatedAttempts,
 	type HeldLimitRefusal,
+	rankFullLimitAnswers,
 	releaseHeldLimitRefusal,
 	replayLimitRefusal,
 } from "./handlers/proxy-operations";
@@ -664,22 +666,32 @@ async function handleProxyRequestHolding(
 		return localLimitAnswerResponse(answer, requestMeta.id);
 	};
 
+	/**
+	 * The local 429 for the sends the attempt gate (proxyWithAccount) skipped
+	 * because their account was full by then, ranked by the all-limited rule;
+	 * null when it skipped none.
+	 */
+	const gatedLocalAnswer = (): LocalLimitAnswer | null =>
+		rankFullLimitAnswers(getGatedAttempts(requestMeta), ctx, requestMeta);
+
 	const { available: accounts, throttled: throttledAccounts } =
 		applyUsageThrottling(selectedAccounts);
 
 	// 7. Handle no accounts case
 	if (accounts.length === 0) {
-		if (requestMeta.comboName && isComboSessionFallbackDisabled(ctx)) {
-			return await returnComboSessionFallbackDisabled(requestMeta.comboName, 0);
-		}
-
 		// Every account that could serve the request is at a limit (the
-		// all-limited rule), or the account the request named is at a full
-		// limit: answer with that account's limit 429 here. Nothing is
-		// forwarded, since upstream would serve it from extra usage.
+		// all-limited rule), the account the request named is at a full limit,
+		// or every combo slot is full: answer with that account's limit 429
+		// here. Nothing is forwarded, since upstream would serve it from extra
+		// usage. This outranks the combo fallback-disabled 503, which stays for
+		// a combo emptied for any other reason.
 		const localLimitAnswer = getLocalLimitAnswer(requestMeta);
 		if (localLimitAnswer) {
 			return answerLocally(localLimitAnswer);
+		}
+
+		if (requestMeta.comboName && isComboSessionFallbackDisabled(ctx)) {
+			return await returnComboSessionFallbackDisabled(requestMeta.comboName, 0);
 		}
 
 		// Model-scoped capacity filter (account-selector.ts) emptied the
@@ -1450,6 +1462,13 @@ async function handleProxyRequestHolding(
 			// capability cache already knows them blind, so a pool that might have
 			// served the image keeps the retryable config-level answer.
 			if (everyEligibleRouteIsBlind()) return await visionRefusal();
+			// A slot skipped because its account filled up after selection is
+			// a limit, not a broken combo: its local 429 answers.
+			const comboGatedAnswer = gatedLocalAnswer();
+			if (comboGatedAnswer) {
+				cacheBodyStore.discardStaged(requestMeta.id);
+				return answerLocally(comboGatedAnswer);
+			}
 			return await returnComboSessionFallbackDisabled(
 				filteredComboInfo.comboName,
 				accounts.length,
@@ -1748,6 +1767,16 @@ async function handleProxyRequestHolding(
 		heldSlot.refusal = undefined;
 		recordServedAccount(answer.account, replay);
 		return replay;
+	}
+
+	// The attempt gate skipped a send because its account was full by then
+	// (it filled up after selection, or a fallback model's family is full),
+	// and nothing else served the request: answer with the local 429 of the
+	// account usable first, as an empty selection would. Nothing is forwarded.
+	const gatedAnswer = gatedLocalAnswer();
+	if (gatedAnswer) {
+		cacheBodyStore.discardStaged(requestMeta.id);
+		return answerLocally(gatedAnswer);
 	}
 
 	if (needsReauth.length > 0) {

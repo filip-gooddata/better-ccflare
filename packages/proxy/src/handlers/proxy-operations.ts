@@ -56,6 +56,11 @@ import { isModelRewrite } from "../worker-messages";
 import { applyAccountRequestTransformer } from "./account-request-transformer";
 import { getComboSlotInfo, getXaiConvId } from "./account-selector";
 import { classifyRefusalScope, rateLimitHeaderSummary } from "./family-refusal";
+import {
+	collectLimitBlockedAccounts,
+	fullLimitAnswer,
+	type LocalLimitAnswer,
+} from "./limit-blocked";
 import { blockFamily, markFamilyExhausted } from "./model-capacity";
 import {
 	DEFAULT_MODEL_COOLDOWN_TTL_MS,
@@ -1445,6 +1450,49 @@ export function systemSuspectScan(bodyText: string | undefined): string {
 	}
 }
 
+/** A candidate skipped right before an upstream send because it was full. */
+export interface GatedAttempt {
+	account: Account;
+	/** The model the skipped send would have asked for. */
+	model: string | undefined;
+	answer: LocalLimitAnswer;
+}
+
+const gatedAttempts = new WeakMap<RequestMeta, GatedAttempt[]>();
+
+/** Every send this request skipped at the attempt gate, in order. */
+export function getGatedAttempts(meta: RequestMeta): GatedAttempt[] {
+	return gatedAttempts.get(meta) ?? [];
+}
+
+/**
+ * Of several full-limit answers, the one the strategy's all-limited rule ranks
+ * first (for session-pace, the account usable again first), each account read
+ * with its own model. The first answer when the strategy has no rule or
+ * declines.
+ */
+export function rankFullLimitAnswers(
+	entries: GatedAttempt[],
+	ctx: ProxyContext,
+	meta: RequestMeta,
+	now: number = Date.now(),
+): LocalLimitAnswer | null {
+	const first = entries[0];
+	if (!first) return null;
+	if (!ctx.strategy.selectWhenAllLimited) return first.answer;
+	const blocked = entries.flatMap((entry) =>
+		collectLimitBlockedAccounts([entry.account], ctx, meta, entry.model, now),
+	);
+	const target =
+		blocked.length > 0
+			? ctx.strategy.selectWhenAllLimited(blocked, meta)
+			: null;
+	return (
+		entries.find((entry) => entry.account.id === target?.id)?.answer ??
+		first.answer
+	);
+}
+
 /**
  * Whether this account has another combo slot, in the request's current
  * combo DEFINITION, carrying a DIFFERENT model than `model`. Only then is a 429
@@ -1734,6 +1782,34 @@ export async function proxyWithAccount(
 			(modelOverride ? modelOverride : baseBodyContext.getModel()) ?? "";
 
 		/**
+		 * The model the attempt gate reads: the slot's pin or the request's own
+		 * model, as selection reads it (limit-blocked maps it to what this
+		 * account sends), until model cycling sends a fallback model verbatim.
+		 */
+		let gateModel: string | undefined = visionKeyModel || undefined;
+
+		/**
+		 * The gate before every upstream send of this attempt: true when the
+		 * account is at a full limit for `model` (five-hour, weekly, or the
+		 * model's family), whatever the extra-usage setting says. Selection
+		 * already left full accounts out; this catches an account that filled up
+		 * since (a response of this request, another request, a usage poll) and
+		 * a fallback model whose family is full. A skipped send is recorded so
+		 * the proxy can answer with the local 429 when nothing else serves.
+		 */
+		const fullBeforeSend = (model: string | undefined): boolean => {
+			const answer = fullLimitAnswer(account, ctx, model);
+			if (!answer) return false;
+			const skipped = gatedAttempts.get(requestMeta) ?? [];
+			skipped.push({ account, model, answer });
+			gatedAttempts.set(requestMeta, skipped);
+			log.warn(
+				`Not sending to ${account.name} for model "${model ?? "none"}": the account is at a full limit (family=${answer.family ?? "none"}); skipping it`,
+			);
+			return true;
+		};
+
+		/**
 		 * Whether this attempt's image refusal must NOT reach the vision
 		 * capability cache: the effective outgoing body carries a `provider`
 		 * routing object that did not come from the slot's routing suffix.
@@ -1987,6 +2063,13 @@ export async function proxyWithAccount(
 			);
 		}
 
+		if (
+			!isSyntheticProviderResponse(outgoing.request) &&
+			fullBeforeSend(gateModel)
+		) {
+			return null;
+		}
+
 		// Make the request (or unwrap a synthetic provider response)
 		let rawResponse = isSyntheticProviderResponse(outgoing.request)
 			? materializeSyntheticResponse(outgoing.request)
@@ -2017,6 +2100,7 @@ export async function proxyWithAccount(
 					recoveredBodyText,
 				);
 				cancelDiscardedResponseBody(rawResponse);
+				if (fullBeforeSend(gateModel)) return null;
 				rawResponse = await forwardUpstream(outgoing.request);
 			}
 		}
@@ -2074,6 +2158,12 @@ export async function proxyWithAccount(
 
 				// Make the retry request (or unwrap a synthetic provider response)
 				cancelDiscardedResponseBody(rawResponse);
+				if (
+					!isSyntheticProviderResponse(retryTransformedRequest) &&
+					fullBeforeSend(gateModel)
+				) {
+					return null;
+				}
 				rawResponse = isSyntheticProviderResponse(retryTransformedRequest)
 					? materializeSyntheticResponse(retryTransformedRequest)
 					: await forwardUpstream(retryTransformedRequest);
@@ -2119,6 +2209,12 @@ export async function proxyWithAccount(
 					signal: req.signal,
 				});
 				cancelDiscardedResponseBody(rawResponse);
+				if (
+					!isSyntheticProviderResponse(retryRequest) &&
+					fullBeforeSend(gateModel)
+				) {
+					return null;
+				}
 				rawResponse = isSyntheticProviderResponse(retryRequest)
 					? materializeSyntheticResponse(retryRequest)
 					: await forwardUpstream(retryRequest);
@@ -3270,6 +3366,11 @@ export async function proxyWithAccount(
 					// provider.
 					const nextSplit = splitModelRouting(nextModel);
 					const nextBareModel = nextSplit.model;
+					// A fallback model whose family (or the account) is full is not
+					// sent: upstream would serve it from extra usage. The next entry
+					// may still be usable; when none is, the previous refusal fails
+					// over below.
+					if (fullBeforeSend(nextBareModel)) continue;
 					const patchedContext = patchModelAndRouting(
 						effectiveBodyContext,
 						nextBareModel,
@@ -3381,6 +3482,7 @@ export async function proxyWithAccount(
 					// From here on, every response belongs to `nextModel`, not to the
 					// model the request asked for. See `modelCycledTo`.
 					modelCycledTo = true;
+					gateModel = nextBareModel;
 
 					rawResponse = await checkZai1305(
 						rawResponse,
@@ -3719,6 +3821,9 @@ export async function proxyWithAccount(
 						// fails over without ever reaching a drain placed after
 						// the await. That left the whole 529 body holding its
 						// off-heap backing store until GC — issue #273.
+						// Re-check right before the re-issue: the account may have
+						// filled up during the backoff. The 529 then stands.
+						if (fullBeforeSend(gateModel)) break;
 						cancelDiscardedResponseBody(response);
 						const retryResponse = await reissueRequestInPlace();
 						response = retryResponse;
@@ -3831,6 +3936,9 @@ export async function proxyWithAccount(
 					// 529 loop above: a rejecting re-issue must not strand this
 					// body. Only the body is consumed — the `x-should-retry`
 					// header read at the top of the next iteration still works.
+					// Re-check right before the re-issue: the account may have
+					// filled up during the backoff. The server error then stands.
+					if (fullBeforeSend(gateModel)) break;
 					cancelDiscardedResponseBody(response);
 					const retryResponse = await reissueRequestInPlace();
 					response = retryResponse;
