@@ -83,9 +83,10 @@ export interface PlanJobResult {
 
 /**
  * The plan simulations the search always runs, for the climb's cost estimate: the baseline,
- * every stage-1 single of each closed account, and the final simulation of the chosen plan. A
- * heuristic: it leaves out stage 2, the preference and placement plans, combinations, refinement
- * and moves, whose number depends on the scores; the deadline cuts all of them but stage 2.
+ * every stage-1 single of each closed account, and the final simulation of the chosen plan. An
+ * optimistic heuristic: it leaves out the plans whose number depends on the scores. Of those,
+ * stage 2, the preference and the placement plans always run; the deadline cuts combinations,
+ * refinement and moves.
  */
 export function planSearchSize(ctx: EngineContext): number {
 	const closed = ctx.accounts.filter((_, j) => !isOpenNow(ctx, j)).length;
