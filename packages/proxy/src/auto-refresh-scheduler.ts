@@ -34,6 +34,7 @@ import {
 	INTERNAL_PROBE_SECRET_HEADER,
 	LOCAL_REFUSAL_ERROR_TYPES,
 } from "./handlers";
+import { limitRefusalResetMs } from "./handlers/limit-response";
 import {
 	flushPendingRotation,
 	getPendingRotation,
@@ -51,6 +52,19 @@ const log = new Logger("AutoRefreshScheduler");
  * its reset is unknown or still in the future.
  */
 const UNKNOWN_USAGE_RESET = 0;
+
+/**
+ * Whether a failed probe was refused because the account is at a full limit:
+ * a 429 with unified status `rejected`. The proxy's own local 429 for a full
+ * account carries it, and so does upstream's real one. Either way the account
+ * is full, not broken. A 429 without it is not a limit refusal.
+ */
+function isLimitRefusal(response: Response): boolean {
+	return (
+		response.status === 429 &&
+		response.headers.get("anthropic-ratelimit-unified-status") === "rejected"
+	);
+}
 
 /**
  * Whether a failed probe's response is better-ccflare's own refusal rather
@@ -102,6 +116,10 @@ export class AutoRefreshScheduler {
 	private refreshMutexResolver: (() => void) | null = null;
 	// Track consecutive failure counts for accounts to identify consistently failing ones
 	private consecutiveFailures: Map<string, number> = new Map();
+	// accountId -> reset (epoch ms) of the full limit a probe was refused for.
+	// No probe goes to the account before it: the usage poll's resets_at says
+	// when the account is usable again, a probe could only be refused again.
+	private limitRefusedUntil: Map<string, number> = new Map();
 	// Threshold for marking an account as needing re-authentication
 	private readonly FAILURE_THRESHOLD = 5;
 	// Timestamp (ms) of the last probe sent to a failure_threshold-paused account.
@@ -192,6 +210,7 @@ export class AutoRefreshScheduler {
 		// Clear the tracking maps to free memory
 		this.lastRefreshResetTime.clear();
 		this.consecutiveFailures.clear();
+		this.limitRefusedUntil.clear();
 		this.lastFailureProbeAt.clear();
 		for (const accountId of this.uncountedProbeFailures.keys()) {
 			clearProbeBackoff(accountId);
@@ -845,6 +864,23 @@ export class AutoRefreshScheduler {
 				// cooldown instead: the prompt this probe just spent is locked for
 				// 24 hours whether the account was overloaded or not.
 				this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+				return false;
+			}
+
+			// A full account is not a broken one: never count its limit refusal
+			// toward the pause. Hold probes off until the refusal's reset; with
+			// no reset to go by, the uncounted-failure ladder spaces them.
+			if (isLimitRefusal(response)) {
+				const resetMs = limitRefusalResetMs(response.headers);
+				const now = Date.now();
+				log.warn(
+					`Auto-refresh probe for ${accountRow.name} was refused for a full limit${resetMs !== null ? ` until ${new Date(resetMs).toISOString()}` : ""} — not counting toward the ${this.FAILURE_THRESHOLD}-failure pause threshold`,
+				);
+				if (resetMs !== null && resetMs > now) {
+					this.limitRefusedUntil.set(accountRow.id, resetMs);
+				} else {
+					this.recordUncountedProbeFailure(accountRow.id, accountRow.name);
+				}
 				return false;
 			}
 
@@ -1539,6 +1575,13 @@ export class AutoRefreshScheduler {
 				}
 			}
 
+			// And the holds of accounts refused for a full limit
+			for (const accountId of this.limitRefusedUntil.keys()) {
+				if (!activeAccountIdSet.has(accountId)) {
+					this.limitRefusedUntil.delete(accountId);
+				}
+			}
+
 			// And what has already been announced about an exhausted usage window
 			for (const accountId of this.usageExhaustedAnnouncedFor.keys()) {
 				if (!activeAccountIdSet.has(accountId)) {
@@ -1783,6 +1826,18 @@ export class AutoRefreshScheduler {
 				);
 				return false;
 			}
+		}
+
+		// A probe was refused for a full limit whose reset is still ahead.
+		const refusedUntil = this.limitRefusedUntil.get(account.id);
+		if (refusedUntil !== undefined) {
+			if (now < refusedUntil) {
+				log.debug(
+					`Skipping probe for account ${account.name} — refused for a full limit until ${new Date(refusedUntil).toISOString()}`,
+				);
+				return false;
+			}
+			this.limitRefusedUntil.delete(account.id);
 		}
 
 		// Nothing to refresh while the usage window is spent. Checked ahead of the
