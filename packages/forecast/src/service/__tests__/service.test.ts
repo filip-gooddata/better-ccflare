@@ -248,6 +248,7 @@ class FakeTracker implements SessionTrackerLike {
 					coldAt: null,
 					contextTokens: 10,
 					recentUnits: 1,
+					warmUnits: 1,
 				}
 			: null;
 	}
